@@ -35,6 +35,10 @@ pull:
 psql:
     {{compose}} exec postgres psql -U {{db_user}} -d {{db_name}}
 
+# Load the fixed Phase 0 POC PostGIS source.
+load-poc-fixture:
+    {{compose}} exec -T postgres psql -U {{db_user}} -d {{db_name}} -f - < fixtures/postgis/poc_buildings.sql
+
 # Stop services and delete volumes.
 clean:
     {{compose}} down --volumes --remove-orphans

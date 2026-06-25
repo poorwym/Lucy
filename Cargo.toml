@@ -1,11 +1,12 @@
-[package]
-name = "Lucy"
+[workspace]
+members = ["crates/lucy-poc"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
-axum = "0.8.9"
-deadpool-postgres = "0.14.1"
-tokio = "1.52.3"
-tokio-postgres = "0.7.18"
-tower-http = "0.7.0"
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
