@@ -1,6 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
+use lucy_poc::tile::TileCoord;
 use lucy_poc::{DEFAULT_CONFIG_PATH, SourceCatalog};
 
 fn main() -> ExitCode {
@@ -35,6 +36,13 @@ fn main() -> ExitCode {
                     source.max_level,
                     source.subtree_levels
                 );
+
+                match TileCoord::root().tiles_region(&source.bounds) {
+                    Ok(region) => println!("{source_id}: root_region={:?}", region.as_array()),
+                    Err(error) => {
+                        eprintln!("{source_id}: failed to calculate root region: {error}")
+                    }
+                }
             }
 
             ExitCode::SUCCESS

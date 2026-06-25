@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+pub mod tile;
+
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +157,10 @@ pub struct SourceBounds {
 }
 
 impl SourceBounds {
+    pub fn validate_region(&self, source_id: &str) -> Result<(), ConfigError> {
+        self.validate(source_id)
+    }
+
     fn validate(&self, source_id: &str) -> Result<(), ConfigError> {
         if self.west >= self.east {
             return Err(ConfigError::Validation(format!(
