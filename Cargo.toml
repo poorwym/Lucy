@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = "0.8.9"
+deadpool-postgres = "0.14.1"
+tokio = "1.52.3"
+tokio-postgres = "0.7.18"
+tower-http = "0.7.0"
