@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+pub mod postgis;
 pub mod subtree;
 pub mod tile;
 pub mod tileset;
@@ -83,6 +84,14 @@ impl SourceConfig {
 
         if let Some(base_height_column) = &self.base_height_column {
             require_identifier(base_height_column, "base_height_column")?;
+        }
+
+        for attribute in &self.attributes {
+            require_identifier(attribute, "attribute")?;
+        }
+
+        if let Some(color_column) = &self.material.color_column {
+            require_identifier(color_column, "material.color_column")?;
         }
 
         if self.connection.trim().is_empty() {
