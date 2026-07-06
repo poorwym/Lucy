@@ -97,6 +97,21 @@ minimum z: 0 m
 maximum z: 100 m
 ```
 
+## WKB-to-Mesh Assumptions
+
+Phase 0 mesh conversion accepts OGC 2D WKB `Polygon` and `MultiPolygon`
+footprints from `ST_AsBinary`. EWKB type flags for Z, M, or embedded SRID are
+not interpreted. Polygon interior rings, points, lines, geometry collections,
+curves, and solids are intentionally unsupported until the basic footprint path
+is complete.
+
+The WKB coordinates are interpreted as EPSG:4326 `[longitude, latitude]`
+decimal degrees. The internal footprint mesh projects those positions into a
+local tangent meter frame centered on the configured source bounds, using an
+equirectangular approximation suitable for the small POC fixture extent. Mesh
+vertices are emitted as `[east_m, north_m, up_m]` with `up_m = 0.0`; extrusion
+from `base_height_m` to `base_height_m + height_m` is a separate step.
+
 ## Minimal Source Config
 
 The POC source config is `config/poc-sources.yaml`:
