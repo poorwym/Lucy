@@ -10,15 +10,14 @@ const WKB_MULTIPOLYGON: u32 = 6;
 const MIN_RING_POINTS: usize = 4;
 const EPSILON: f64 = 1e-12;
 
-/// Internal triangle mesh for a Phase 0 footprint.
+/// Internal triangle mesh for a Phase 0 footprint or extruded footprint.
 ///
 /// Coordinate assumptions:
 /// - WKB input is OGC WKB, not EWKB, with 2D EPSG:4326 `[longitude, latitude]`
 ///   positions in decimal degrees.
 /// - Vertices are converted to a local tangent meter frame using an
 ///   equirectangular approximation about `MeshFrame`.
-/// - `z` is set to `0.0`; Phase 0 extrusion from `base_height_m` to
-///   `base_height_m + height_m` is a later step.
+/// - `z` is local up in meters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriangleMesh {
     pub vertices: Vec<MeshVertex>,
@@ -71,9 +70,7 @@ impl MeshFrame {
 }
 
 pub fn wkb_footprint_to_mesh(wkb: &[u8], frame: MeshFrame) -> Result<TriangleMesh, MeshError> {
-    let mut reader = WkbReader::new(wkb);
-    let geometry = reader.read_geometry()?;
-    reader.expect_finished()?;
+    let geometry = read_wkb_geometry(wkb)?;
 
     let mut mesh = TriangleMesh::new();
     match geometry {
@@ -94,6 +91,49 @@ pub fn wkb_footprint_to_mesh(wkb: &[u8], frame: MeshFrame) -> Result<TriangleMes
     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
         return Err(MeshError::InvalidGeometry(
             "WKB geometry produced an empty mesh".to_string(),
+        ));
+    }
+
+    Ok(mesh)
+}
+
+pub fn wkb_footprint_to_extruded_mesh(
+    wkb: &[u8],
+    frame: MeshFrame,
+    base_height_m: f32,
+    height_m: f32,
+) -> Result<TriangleMesh, MeshError> {
+    validate_extrusion_heights(base_height_m, height_m)?;
+    let geometry = read_wkb_geometry(wkb)?;
+    let top_height_m = base_height_m + height_m;
+
+    let mut mesh = TriangleMesh::new();
+    match geometry {
+        Geometry::Polygon(polygon) => {
+            append_extruded_polygon_mesh(&mut mesh, &polygon, frame, base_height_m, top_height_m)?
+        }
+        Geometry::MultiPolygon(polygons) => {
+            if polygons.is_empty() {
+                return Err(MeshError::InvalidGeometry(
+                    "MultiPolygon must contain at least one polygon".to_string(),
+                ));
+            }
+
+            for polygon in polygons {
+                append_extruded_polygon_mesh(
+                    &mut mesh,
+                    &polygon,
+                    frame,
+                    base_height_m,
+                    top_height_m,
+                )?;
+            }
+        }
+    }
+
+    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        return Err(MeshError::InvalidGeometry(
+            "WKB geometry produced an empty extruded mesh".to_string(),
         ));
     }
 
@@ -146,6 +186,29 @@ impl fmt::Display for MeshError {
 }
 
 impl std::error::Error for MeshError {}
+
+fn read_wkb_geometry(wkb: &[u8]) -> Result<Geometry, MeshError> {
+    let mut reader = WkbReader::new(wkb);
+    let geometry = reader.read_geometry()?;
+    reader.expect_finished()?;
+    Ok(geometry)
+}
+
+fn validate_extrusion_heights(base_height_m: f32, height_m: f32) -> Result<(), MeshError> {
+    if !base_height_m.is_finite() || !height_m.is_finite() {
+        return Err(MeshError::InvalidGeometry(
+            "extrusion heights must be finite".to_string(),
+        ));
+    }
+
+    if height_m <= 0.0 {
+        return Err(MeshError::InvalidGeometry(
+            "extrusion height_m must be greater than zero".to_string(),
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Geometry {
@@ -339,6 +402,81 @@ fn append_polygon_mesh(
     Ok(())
 }
 
+fn append_extruded_polygon_mesh(
+    mesh: &mut TriangleMesh,
+    polygon: &Polygon,
+    frame: MeshFrame,
+    base_height_m: f32,
+    top_height_m: f32,
+) -> Result<(), MeshError> {
+    if polygon.rings.len() > 1 {
+        return Err(MeshError::UnsupportedGeometry(
+            "Polygon interior rings are not supported in Phase 0".to_string(),
+        ));
+    }
+
+    let ring =
+        normalized_exterior_ring(polygon.rings.first().ok_or_else(|| {
+            MeshError::InvalidGeometry("Polygon has no exterior ring".to_string())
+        })?)?;
+    let top_triangles = triangulate_simple_ring(&ring)?;
+    let bottom_base = u32::try_from(mesh.vertices.len()).map_err(|_| {
+        MeshError::InvalidGeometry("mesh has too many vertices for u32 indices".to_string())
+    })?;
+    let top_base = bottom_base
+        .checked_add(u32::try_from(ring.len()).map_err(|_| {
+            MeshError::InvalidGeometry("ring has too many vertices for u32 indices".to_string())
+        })?)
+        .ok_or_else(|| MeshError::InvalidGeometry("mesh index overflowed u32".to_string()))?;
+
+    for point in &ring {
+        let mut position = frame.project(point.x, point.y)?;
+        position[2] = base_height_m;
+        mesh.vertices.push(MeshVertex { position });
+    }
+
+    for point in &ring {
+        let mut position = frame.project(point.x, point.y)?;
+        position[2] = top_height_m;
+        mesh.vertices.push(MeshVertex { position });
+    }
+
+    for [a, b, c] in &top_triangles {
+        mesh.indices.extend_from_slice(&[
+            top_base + *a as u32,
+            top_base + *b as u32,
+            top_base + *c as u32,
+        ]);
+    }
+
+    for [a, b, c] in &top_triangles {
+        mesh.indices.extend_from_slice(&[
+            bottom_base + *c as u32,
+            bottom_base + *b as u32,
+            bottom_base + *a as u32,
+        ]);
+    }
+
+    for edge_start in 0..ring.len() {
+        let edge_end = (edge_start + 1) % ring.len();
+        let bottom_start = bottom_base + edge_start as u32;
+        let bottom_end = bottom_base + edge_end as u32;
+        let top_start = top_base + edge_start as u32;
+        let top_end = top_base + edge_end as u32;
+
+        mesh.indices.extend_from_slice(&[
+            bottom_start,
+            bottom_end,
+            top_end,
+            bottom_start,
+            top_end,
+            top_start,
+        ]);
+    }
+
+    Ok(())
+}
+
 fn normalized_exterior_ring(ring: &[Point2]) -> Result<Vec<Point2>, MeshError> {
     if ring.len() < MIN_RING_POINTS {
         return Err(MeshError::InvalidGeometry(format!(
@@ -378,6 +516,12 @@ fn normalized_exterior_ring(ring: &[Point2]) -> Result<Vec<Point2>, MeshError> {
 fn triangulate_simple_ring(points: &[Point2]) -> Result<Vec<[usize; 3]>, MeshError> {
     if points.len() == 3 {
         return Ok(vec![[0, 1, 2]]);
+    }
+
+    if is_convex_ring(points) {
+        return Ok((1..points.len() - 1)
+            .map(|index| [0, index, index + 1])
+            .collect());
     }
 
     let ccw = signed_area(points) > 0.0;
@@ -444,6 +588,19 @@ fn is_convex(a: Point2, b: Point2, c: Point2, ccw: bool) -> bool {
     } else {
         cross < -EPSILON
     }
+}
+
+fn is_convex_ring(points: &[Point2]) -> bool {
+    if points.len() < 3 || signed_area(points) <= EPSILON {
+        return false;
+    }
+
+    (0..points.len()).all(|index| {
+        let prev = points[(index + points.len() - 1) % points.len()];
+        let curr = points[index];
+        let next = points[(index + 1) % points.len()];
+        cross(prev, curr, next) > EPSILON
+    })
 }
 
 fn point_in_triangle(p: Point2, a: Point2, b: Point2, c: Point2) -> bool {
@@ -538,6 +695,7 @@ mod tests {
 
         assert_eq!(mesh.vertices.len(), 4);
         assert_eq!(mesh.indices.len(), 6);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3]);
         assert!(
             mesh.vertices
                 .iter()
@@ -554,6 +712,41 @@ mod tests {
 
         assert_eq!(mesh.vertices.len(), 4);
         assert_eq!(mesh.indices.len(), 6);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3]);
+    }
+
+    #[test]
+    fn fixture_multipolygon_wkb_extrudes_to_building_mesh() {
+        let wkb = little_endian_multipolygon_wkb(&[sansome_office_ring()]);
+        let mesh = wkb_footprint_to_extruded_mesh(&wkb, fixture_frame(), 4.0, 96.0)
+            .expect("extruded mesh should build");
+
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len(), 36);
+        assert_eq!(&mesh.indices[0..6], &[4, 5, 6, 4, 6, 7]);
+        assert_eq!(&mesh.indices[6..12], &[2, 1, 0, 3, 2, 0]);
+        assert!(
+            mesh.vertices[0..4]
+                .iter()
+                .all(|vertex| vertex.position[2] == 4.0)
+        );
+        assert!(
+            mesh.vertices[4..8]
+                .iter()
+                .all(|vertex| vertex.position[2] == 100.0)
+        );
+    }
+
+    #[test]
+    fn extruded_mesh_rejects_non_positive_height() {
+        let wkb = little_endian_multipolygon_wkb(&[sansome_office_ring()]);
+        let error = wkb_footprint_to_extruded_mesh(&wkb, fixture_frame(), 0.0, 0.0)
+            .expect_err("zero height should fail");
+
+        assert!(
+            error.to_string().contains("height_m"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

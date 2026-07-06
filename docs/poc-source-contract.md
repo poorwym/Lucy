@@ -108,9 +108,9 @@ is complete.
 The WKB coordinates are interpreted as EPSG:4326 `[longitude, latitude]`
 decimal degrees. The internal footprint mesh projects those positions into a
 local tangent meter frame centered on the configured source bounds, using an
-equirectangular approximation suitable for the small POC fixture extent. Mesh
-vertices are emitted as `[east_m, north_m, up_m]` with `up_m = 0.0`; extrusion
-from `base_height_m` to `base_height_m + height_m` is a separate step.
+equirectangular approximation suitable for the small POC fixture extent. GLB
+content extrudes each footprint from `base_height_m` to
+`base_height_m + height_m` and emits vertices as `[east_m, north_m, up_m]`.
 
 ## GLB Content Tile Assumptions
 
@@ -120,8 +120,9 @@ primitive. The binary buffer stores little-endian `UNSIGNED_INT` triangle
 indices followed by tightly packed `FLOAT` `VEC3` positions. The GLB contains
 one scene, one node, and one mesh primitive with mode `TRIANGLES`. Materials,
 feature metadata, batch/structural metadata, normals, texture coordinates, and
-extrusion wall geometry are intentionally deferred until the single-content-tile
-path is stable.
+per-feature primitives are intentionally deferred until the single-content-tile
+path is stable. The POC emits roof, bottom, and wall triangles for each extruded
+fixture footprint.
 
 ## Minimal Source Config
 

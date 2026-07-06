@@ -6,8 +6,8 @@ use std::path::Path;
 use tokio_postgres::NoTls;
 
 use crate::glb::{GlbError, encode_content_tile_glb};
-use crate::mesh::{MeshError, MeshFrame, wkb_footprint_to_mesh};
-use crate::postgis::{TileQueryError, query_tile_geometry_wkb};
+use crate::mesh::{MeshError, MeshFrame, wkb_footprint_to_extruded_mesh};
+use crate::postgis::{TileFeatureWkb, TileQueryError, query_tile_geometry_wkb};
 use crate::subtree::generate_root_subtree_bytes;
 use crate::tile::{TileCoord, TileCoordError};
 use crate::tileset::{TilesetOptions, generate_tileset_json};
@@ -179,7 +179,13 @@ async fn content_tile_response(
     let frame = MeshFrame::from_source_bounds(&source.bounds);
     let mut meshes = Vec::with_capacity(features.len());
     for feature in features {
-        meshes.push(wkb_footprint_to_mesh(&feature.geometry_wkb, frame)?);
+        let (base_height_m, height_m) = feature_heights(&feature)?;
+        meshes.push(wkb_footprint_to_extruded_mesh(
+            &feature.geometry_wkb,
+            frame,
+            base_height_m,
+            height_m,
+        )?);
     }
 
     Ok(PocHttpResponse::new(
@@ -188,6 +194,44 @@ async fn content_tile_response(
         "model/gltf-binary",
         encode_content_tile_glb(&meshes)?,
     ))
+}
+
+fn feature_heights(feature: &TileFeatureWkb) -> Result<(f32, f32), PocRouteError> {
+    let base_height_m = parse_optional_feature_f32(feature, "base_height_m")?.unwrap_or(0.0);
+    let height_m = parse_required_feature_f32(feature, "height_m")?;
+    Ok((base_height_m, height_m))
+}
+
+fn parse_required_feature_f32(
+    feature: &TileFeatureWkb,
+    attribute: &str,
+) -> Result<f32, PocRouteError> {
+    parse_optional_feature_f32(feature, attribute)?.ok_or_else(|| {
+        PocRouteError::Config(ConfigError::Validation(format!(
+            "feature {} is missing required attribute {attribute}",
+            feature.id
+        )))
+    })
+}
+
+fn parse_optional_feature_f32(
+    feature: &TileFeatureWkb,
+    attribute: &str,
+) -> Result<Option<f32>, PocRouteError> {
+    let Some(value) = feature
+        .attributes
+        .get(attribute)
+        .and_then(|value| value.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    value.parse::<f32>().map(Some).map_err(|error| {
+        PocRouteError::Config(ConfigError::Validation(format!(
+            "feature {} attribute {attribute}={value:?} is not a valid f32: {error}",
+            feature.id
+        )))
+    })
 }
 
 fn resolve_connection_string(connection: &str) -> Result<String, PocRouteError> {
@@ -273,6 +317,11 @@ fn cesium_smoke_html(source: &SourceConfig) -> String {
       imageryProvider: false,
       baseLayer: false
     }});
+    viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
+      url: "https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",
+      maximumLevel: 19,
+      credit: "© OpenStreetMap contributors"
+    }}));
     viewer.scene.globe.show = true;
     (async () => {{
       try {{
@@ -508,6 +557,7 @@ mod tests {
         );
         assert_eq!(smoke.status_code, 200);
         assert!(String::from_utf8_lossy(&smoke.body).contains("Cesium3DTileset.fromUrl"));
+        assert!(String::from_utf8_lossy(&smoke.body).contains("UrlTemplateImageryProvider"));
 
         let report = handle_poc_http_request(
             "GET /phase-0-report.md HTTP/1.1\r\n\r\n",

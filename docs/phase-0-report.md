@@ -9,7 +9,8 @@ The Phase 0 path is implemented as a minimal Rust POC:
 - Generates a binary root `.subtree`.
 - Queries one tile bbox from PostGIS as WKB.
 - Converts supported WKB `Polygon` and `MultiPolygon` footprints into internal triangle meshes.
-- Encodes one GLB content tile from one or more feature meshes.
+- Extrudes feature meshes from `base_height_m` to `base_height_m + height_m`.
+- Encodes one GLB content tile from one or more extruded feature meshes.
 - Serves POC routes for CesiumJS smoke testing.
 
 ## POC Routes
@@ -81,12 +82,14 @@ Expected behavior:
 - CesiumJS requests `/tileset.json`.
 - CesiumJS requests `/subtrees/0/0/0.subtree`.
 - CesiumJS can resolve `/content/0/0/0.glb` from the content URI template.
-- The root tile contains non-empty GLB geometry from the PostGIS fixture.
+- The root tile contains non-empty extruded GLB geometry from the PostGIS fixture.
 - The root tile transform places local meter geometry at the configured San Francisco block.
+- The smoke scene includes a basic OpenStreetMap imagery layer for visual context.
 
-The smoke page uses CesiumJS from the public Cesium CDN, so browser execution
-requires network access to that CDN. The Rust test suite validates the generated
-tileset, subtree, WKB-to-mesh, and GLB structure locally without that CDN.
+The smoke page uses CesiumJS from the public Cesium CDN and OpenStreetMap tile
+imagery, so browser execution requires network access to those hosts. The Rust
+test suite validates the generated tileset, subtree, WKB-to-mesh, and GLB
+structure locally without that CDN.
 
 ## Validation
 
@@ -116,7 +119,6 @@ External glTF validator status:
 
 ## Known Phase 1 Gaps
 
-- The content mesh is a footprint surface only; wall and roof extrusion are not implemented yet.
 - Feature metadata, picking IDs, batch tables, and 3D Tiles structural metadata are not emitted.
 - The root subtree currently marks availability broadly for the POC instead of deriving sparse availability from PostGIS.
 - Empty child content routes return 404; sparse availability should prevent Cesium from requesting those tiles.
