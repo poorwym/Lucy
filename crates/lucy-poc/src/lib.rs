@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub mod glb;
 pub mod mesh;
 pub mod postgis;
+pub mod server;
 pub mod subtree;
 pub mod tile;
 pub mod tileset;

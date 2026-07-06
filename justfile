@@ -3,6 +3,8 @@ set dotenv-load
 compose := "docker compose"
 db_user := env_var_or_default("POSTGRES_USER", "lucy")
 db_name := env_var_or_default("POSTGRES_DB", "lucy")
+poc_database_url := env_var_or_default("DATABASE_URL", "postgres://lucy:lucy@localhost:5432/lucy")
+poc_addr := env_var_or_default("POC_ADDR", "127.0.0.1:8080")
 
 default:
     just --list
@@ -38,6 +40,10 @@ psql:
 # Load the fixed Phase 0 POC PostGIS source.
 load-poc-fixture:
     {{compose}} exec -T postgres psql -U {{db_user}} -d {{db_name}} -f - < fixtures/postgis/poc_buildings.sql
+
+# Run the Phase 0 POC HTTP server.
+poc-server config="config/poc-sources.yaml" addr=poc_addr:
+    DATABASE_URL={{poc_database_url}} cargo run -p lucy-poc -- serve {{config}} {{addr}}
 
 # Stop services and delete volumes.
 clean:

@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::tile::TileCoord;
-use crate::{ConfigError, SourceConfig};
+use crate::{ConfigError, SourceBounds, SourceConfig};
 
 pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
@@ -54,6 +54,7 @@ pub fn generate_tileset(
     require_template(&options.subtree_uri_template, "subtree_uri_template")?;
 
     let root_region = TileCoord::root().tiles_region(&source.bounds)?.as_array();
+    let root_transform = east_north_up_transform(&source.bounds)?;
     let available_levels = u32::from(source.max_level) + 1;
 
     Ok(Tileset {
@@ -65,6 +66,7 @@ pub fn generate_tileset(
             bounding_volume: BoundingVolume {
                 region: root_region,
             },
+            transform: root_transform,
             geometric_error: options.root_geometric_error_m,
             refine: Refine::Replace,
             content: TileContent {
@@ -99,6 +101,7 @@ pub struct Asset {
 #[serde(rename_all = "camelCase")]
 pub struct Tile {
     pub bounding_volume: BoundingVolume,
+    pub transform: [f64; 16],
     pub geometric_error: f64,
     pub refine: Refine,
     pub content: TileContent,
@@ -157,6 +160,46 @@ fn require_template(template: &str, field: &str) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn east_north_up_transform(bounds: &SourceBounds) -> Result<[f64; 16], ConfigError> {
+    bounds.validate_region("tileset transform bounds")?;
+
+    const WGS84_A: f64 = 6_378_137.0;
+    const WGS84_F: f64 = 1.0 / 298.257_223_563;
+
+    let longitude = ((bounds.west + bounds.east) / 2.0).to_radians();
+    let latitude = ((bounds.south + bounds.north) / 2.0).to_radians();
+    let height = bounds.min_height_m;
+
+    let sin_lon = longitude.sin();
+    let cos_lon = longitude.cos();
+    let sin_lat = latitude.sin();
+    let cos_lat = latitude.cos();
+    let e2 = WGS84_F * (2.0 - WGS84_F);
+    let prime_vertical_radius = WGS84_A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    let origin_x = (prime_vertical_radius + height) * cos_lat * cos_lon;
+    let origin_y = (prime_vertical_radius + height) * cos_lat * sin_lon;
+    let origin_z = (prime_vertical_radius * (1.0 - e2) + height) * sin_lat;
+
+    Ok([
+        -sin_lon,
+        cos_lon,
+        0.0,
+        0.0,
+        -sin_lat * cos_lon,
+        -sin_lat * sin_lon,
+        cos_lat,
+        0.0,
+        cos_lat * cos_lon,
+        cos_lat * sin_lon,
+        sin_lat,
+        0.0,
+        origin_x,
+        origin_y,
+        origin_z,
+        1.0,
+    ])
 }
 
 #[cfg(test)]

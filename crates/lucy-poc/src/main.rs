@@ -1,15 +1,40 @@
 use std::env;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
+use lucy_poc::server::{DEFAULT_POC_ADDR, run_poc_server};
 use lucy_poc::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_poc::tile::TileCoord;
 use lucy_poc::tileset::{TilesetOptions, generate_tileset_json};
 use lucy_poc::{DEFAULT_CONFIG_PATH, SourceCatalog};
 
 fn main() -> ExitCode {
-    let config_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+    let mut args = env::args().skip(1);
+    let first_arg = args.next();
+
+    if first_arg.as_deref() == Some("serve") {
+        let config_path = args
+            .next()
+            .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+        let addr_text = args.next().unwrap_or_else(|| DEFAULT_POC_ADDR.to_string());
+        let addr = match addr_text.parse::<SocketAddr>() {
+            Ok(addr) => addr,
+            Err(error) => {
+                eprintln!("invalid listen address {addr_text}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        return match run_poc_server(&config_path, addr) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let config_path = first_arg.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
 
     match SourceCatalog::load(&config_path) {
         Ok(catalog) => {
