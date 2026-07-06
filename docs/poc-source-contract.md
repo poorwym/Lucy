@@ -112,6 +112,17 @@ equirectangular approximation suitable for the small POC fixture extent. Mesh
 vertices are emitted as `[east_m, north_m, up_m]` with `up_m = 0.0`; extrusion
 from `base_height_m` to `base_height_m + height_m` is a separate step.
 
+## GLB Content Tile Assumptions
+
+Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
+tile. One or more internal feature meshes are concatenated into one mesh
+primitive. The binary buffer stores little-endian `UNSIGNED_INT` triangle
+indices followed by tightly packed `FLOAT` `VEC3` positions. The GLB contains
+one scene, one node, and one mesh primitive with mode `TRIANGLES`. Materials,
+feature metadata, batch/structural metadata, normals, texture coordinates, and
+extrusion wall geometry are intentionally deferred until the single-content-tile
+path is stable.
+
 ## Minimal Source Config
 
 The POC source config is `config/poc-sources.yaml`:

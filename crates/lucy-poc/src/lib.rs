@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+pub mod glb;
 pub mod mesh;
 pub mod postgis;
 pub mod subtree;
