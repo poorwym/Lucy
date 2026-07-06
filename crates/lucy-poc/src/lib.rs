@@ -5,7 +5,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+pub mod subtree;
 pub mod tile;
+pub mod tileset;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 
