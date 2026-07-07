@@ -5,8 +5,6 @@ import { useEffect, useRef, useState } from "react";
 import * as Cesium from "cesium";
 
 const TILESET_URL = "/tileset.json";
-const OSM_TEMPLATE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-const OSM_CREDIT = "OpenStreetMap contributors";
 
 function App() {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -21,29 +19,13 @@ function App() {
     let viewer: Cesium.Viewer | undefined;
     let cancelled = false;
 
+    Cesium.Ion.defaultAccessToken =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMGYzYTM2Yi0yOGIwLTQ4ZGUtOWQ2NC03ZGE2MGQ1NTQzOWYiLCJpZCI6Mjg0ODk3LCJpYXQiOjE3NDIxODM0OTV9.AVIChWRSQIPf82NfHfz9K88x2nbo7PF3EQUb-z_-r1w";
+
     const loadScene = async () => {
       try {
-        viewer = new Cesium.Viewer(container, {
-          animation: false,
-          baseLayer: false,
-          baseLayerPicker: false,
-          fullscreenButton: false,
-          geocoder: false,
-          homeButton: false,
-          infoBox: false,
-          navigationHelpButton: false,
-          sceneModePicker: false,
-          selectionIndicator: false,
-          timeline: false,
-        });
+        viewer = new Cesium.Viewer(container, {});
 
-        viewer.imageryLayers.addImageryProvider(
-          new Cesium.UrlTemplateImageryProvider({
-            url: OSM_TEMPLATE_URL,
-            maximumLevel: 19,
-            credit: OSM_CREDIT,
-          }),
-        );
         viewer.scene.globe.show = true;
 
         const tileset = await Cesium.Cesium3DTileset.fromUrl(TILESET_URL);
