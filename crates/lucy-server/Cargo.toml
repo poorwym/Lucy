@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum = "0.8.9"
 lucy-core = { path = "../lucy-core" }
 serde_yaml.workspace = true
 tokio.workspace = true
