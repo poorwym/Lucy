@@ -3,8 +3,8 @@ use std::fmt;
 
 use tokio_postgres::GenericClient;
 
-use crate::tile::{GeographicRegionDegrees, TileCoord};
-use crate::{ConfigError, SourceConfig};
+use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
+use lucy_core::{ConfigError, SourceConfig};
 
 /// One PostGIS feature intersecting a requested tile bbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,12 +204,13 @@ mod tests {
     use tokio_postgres::NoTls;
 
     use super::*;
-    use crate::SourceCatalog;
+    use lucy_core::SourceCatalog;
 
     fn fixture_source() -> SourceConfig {
         let config_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
-        let mut catalog = SourceCatalog::load(config_path).expect("fixture config should load");
+        let raw = std::fs::read_to_string(config_path).expect("fixture config should read");
+        let mut catalog = SourceCatalog::from_yaml_str(&raw).expect("fixture config should load");
         catalog
             .sources
             .remove("poc_buildings")

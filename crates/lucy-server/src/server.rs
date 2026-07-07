@@ -5,13 +5,15 @@ use std::path::Path;
 
 use tokio_postgres::NoTls;
 
-use crate::glb::{GlbError, encode_content_tile_glb};
-use crate::mesh::{MeshError, MeshFrame, wkb_footprint_to_extruded_mesh};
+use lucy_core::glb::{GlbError, encode_content_tile_glb};
+use lucy_core::mesh::{MeshError, MeshFrame, wkb_footprint_to_extruded_mesh};
+use lucy_core::subtree::generate_root_subtree_bytes;
+use lucy_core::tile::{TileCoord, TileCoordError};
+use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
+use lucy_core::{ConfigError, SourceCatalog, SourceConfig};
+
+use crate::ConfigLoadError;
 use crate::postgis::{TileFeatureWkb, TileQueryError, query_tile_geometry_wkb};
-use crate::subtree::generate_root_subtree_bytes;
-use crate::tile::{TileCoord, TileCoordError};
-use crate::tileset::{TilesetOptions, generate_tileset_json};
-use crate::{ConfigError, SourceCatalog, SourceConfig};
 
 pub const DEFAULT_POC_ADDR: &str = "127.0.0.1:8080";
 const PHASE_0_REPORT: &str = include_str!("../../../docs/phase-0-report.md");
@@ -21,7 +23,7 @@ pub fn run_poc_server(
     addr: SocketAddr,
 ) -> Result<(), PocServerError> {
     let config_path = config_path.as_ref().to_path_buf();
-    let catalog = SourceCatalog::load(&config_path)?;
+    let catalog = crate::load_source_catalog(&config_path)?;
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| PocServerError::Runtime(format!("failed to create runtime: {error}")))?;
     let listener = TcpListener::bind(addr)?;
@@ -353,6 +355,7 @@ fn cesium_smoke_html(source: &SourceConfig) -> String {
 #[derive(Debug)]
 pub enum PocServerError {
     Config(ConfigError),
+    ConfigLoad(ConfigLoadError),
     Io(std::io::Error),
     Request(String),
     Runtime(String),
@@ -362,6 +365,7 @@ impl fmt::Display for PocServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PocServerError::Config(error) => write!(f, "{error}"),
+            PocServerError::ConfigLoad(error) => write!(f, "{error}"),
             PocServerError::Io(error) => write!(f, "{error}"),
             PocServerError::Request(message) => write!(f, "invalid HTTP request: {message}"),
             PocServerError::Runtime(message) => write!(f, "{message}"),
@@ -374,6 +378,12 @@ impl std::error::Error for PocServerError {}
 impl From<ConfigError> for PocServerError {
     fn from(error: ConfigError) -> Self {
         Self::Config(error)
+    }
+}
+
+impl From<ConfigLoadError> for PocServerError {
+    fn from(error: ConfigLoadError) -> Self {
+        Self::ConfigLoad(error)
     }
 }
 
@@ -528,7 +538,7 @@ mod tests {
     fn fixture_catalog() -> SourceCatalog {
         let config_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
-        SourceCatalog::load(config_path).expect("fixture config should load")
+        crate::load_source_catalog(config_path).expect("fixture config should load")
     }
 
     #[test]

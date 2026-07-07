@@ -637,15 +637,7 @@ fn wkb_type_name(type_code: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::Path;
-
-    use tokio_postgres::NoTls;
-
     use super::*;
-    use crate::SourceCatalog;
-    use crate::postgis::query_tile_geometry_wkb;
-    use crate::tile::TileCoord;
 
     fn fixture_frame() -> MeshFrame {
         MeshFrame {
@@ -794,47 +786,5 @@ mod tests {
             error.to_string().contains("interior rings"),
             "unexpected error: {error}"
         );
-    }
-
-    #[tokio::test]
-    async fn postgis_fixture_geometry_wkb_produces_non_empty_mesh() {
-        let Ok(database_url) = env::var("DATABASE_URL") else {
-            return;
-        };
-
-        let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
-            .await
-            .expect("connect to PostGIS fixture database");
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("PostGIS connection error: {error}");
-            }
-        });
-
-        client
-            .batch_execute(include_str!("../../../fixtures/postgis/poc_buildings.sql"))
-            .await
-            .expect("load fixture data");
-
-        let config_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
-        let mut catalog = SourceCatalog::load(config_path).expect("fixture config should load");
-        let source = catalog
-            .sources
-            .remove("poc_buildings")
-            .expect("poc source should exist");
-        let features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
-            .await
-            .expect("root tile should query");
-        let first_feature = features.first().expect("fixture has at least one feature");
-
-        let mesh = wkb_footprint_to_mesh(
-            &first_feature.geometry_wkb,
-            MeshFrame::from_source_bounds(&source.bounds),
-        )
-        .expect("fixture WKB should build a mesh");
-
-        assert!(!mesh.vertices.is_empty());
-        assert!(!mesh.indices.is_empty());
     }
 }

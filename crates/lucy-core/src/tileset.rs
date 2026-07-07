@@ -204,15 +204,13 @@ fn east_north_up_transform(bounds: &SourceBounds) -> Result<[f64; 16], ConfigErr
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::SourceCatalog;
 
     fn fixture_source() -> SourceConfig {
-        let config_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
-        let mut catalog = SourceCatalog::load(config_path).expect("fixture config should load");
+        let mut catalog =
+            SourceCatalog::from_yaml_str(include_str!("../../../config/poc-sources.yaml"))
+                .expect("fixture config should load");
         catalog
             .sources
             .remove("poc_buildings")

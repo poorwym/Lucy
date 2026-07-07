@@ -267,11 +267,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "lucy-poc"
+name = "lucy-core"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "lucy-poc"
+version = "0.1.0"
+dependencies = [
+ "lucy-core",
+ "lucy-server",
+]
+
+[[package]]
+name = "lucy-server"
+version = "0.1.0"
+dependencies = [
+ "lucy-core",
  "serde_yaml",
  "tokio",
  "tokio-postgres",

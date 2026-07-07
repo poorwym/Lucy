@@ -1,9 +1,11 @@
 [package]
-name = "lucy-poc"
+name = "lucy-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 lucy-core = { path = "../lucy-core" }
-lucy-server = { path = "../lucy-server" }
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
