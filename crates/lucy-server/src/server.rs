@@ -114,7 +114,11 @@ fn route_poc_path(
             )))?;
 
     match path {
-        "/" => Ok(PocHttpResponse::redirect("/cesium-smoke.html")),
+        "/" => Ok(PocHttpResponse::plain(
+            200,
+            "OK",
+            "Lucy tile server is running. Use /tileset.json, /subtrees/0/0/0.subtree, or /content/{level}/{x}/{y}.glb.",
+        )),
         "/tileset.json" => {
             let json = generate_tileset_json(source, &TilesetOptions::default())?;
             Ok(PocHttpResponse::new(
@@ -129,12 +133,6 @@ fn route_poc_path(
             "OK",
             "application/octet-stream",
             generate_root_subtree_bytes(source)?,
-        )),
-        "/cesium-smoke.html" => Ok(PocHttpResponse::new(
-            200,
-            "OK",
-            "text/html; charset=utf-8",
-            cesium_smoke_html(source).into_bytes(),
         )),
         "/phase-0-report.md" => Ok(PocHttpResponse::new(
             200,
@@ -284,74 +282,6 @@ fn parse_u32(value: &str, field: &str) -> Result<u32, PocRouteError> {
     })
 }
 
-fn cesium_smoke_html(source: &SourceConfig) -> String {
-    let center_lon = (source.bounds.west + source.bounds.east) / 2.0;
-    let center_lat = (source.bounds.south + source.bounds.north) / 2.0;
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lucy Phase 0 Cesium Smoke</title>
-  <script src="https://cesium.com/downloads/cesiumjs/releases/1.120/Build/Cesium/Cesium.js"></script>
-  <link href="https://cesium.com/downloads/cesiumjs/releases/1.120/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
-  <style>
-    html, body, #cesiumContainer {{ width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }}
-    #status {{ position: absolute; left: 12px; top: 12px; z-index: 1; padding: 8px 10px; background: rgba(0,0,0,0.72); color: white; font: 13px system-ui, sans-serif; }}
-  </style>
-</head>
-<body>
-  <div id="cesiumContainer"></div>
-  <div id="status">Loading Lucy Phase 0 tileset...</div>
-  <script>
-    const status = document.getElementById("status");
-    Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMGYzYTM2Yi0yOGIwLTQ4ZGUtOWQ2NC03ZGE2MGQ1NTQzOWYiLCJpZCI6Mjg0ODk3LCJpYXQiOjE3NDIxODM0OTV9.AVIChWRSQIPf82NfHfz9K88x2nbo7PF3EQUb-z_-r1w";
-    const viewer = new Cesium.Viewer("cesiumContainer", {{
-      animation: false,
-      baseLayerPicker: false,
-      geocoder: false,
-      homeButton: false,
-      sceneModePicker: false,
-      timeline: false,
-      navigationHelpButton: false,
-      fullscreenButton: false,
-      imageryProvider: false,
-      baseLayer: false
-    }});
-    viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
-      url: "https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",
-      maximumLevel: 19,
-      credit: "© OpenStreetMap contributors"
-    }}));
-    viewer.scene.globe.show = true;
-    (async () => {{
-      try {{
-        const tileset = await Cesium.Cesium3DTileset.fromUrl("/tileset.json");
-        viewer.scene.primitives.add(tileset);
-        await tileset.readyPromise;
-        viewer.camera.flyTo({{
-          destination: Cesium.Cartesian3.fromDegrees({center_lon}, {center_lat}, 450),
-          orientation: {{
-            heading: 0,
-            pitch: Cesium.Math.toRadians(-65),
-            roll: 0
-          }},
-          duration: 0
-        }});
-        status.textContent = "Loaded /tileset.json; inspect console for 3D Tiles errors.";
-      }} catch (error) {{
-        console.error(error);
-        status.textContent = "Cesium smoke failed: " + error;
-      }}
-    }})();
-  </script>
-</body>
-</html>
-"#
-    )
-}
-
 #[derive(Debug)]
 pub enum PocServerError {
     Config(ConfigError),
@@ -494,14 +424,6 @@ impl PocHttpResponse {
         )
     }
 
-    fn redirect(location: &'static str) -> Self {
-        let mut response = Self::plain(302, "Found", "redirecting");
-        response
-            .extra_headers
-            .push(("Location", location.to_string()));
-        response
-    }
-
     fn without_body(mut self) -> Self {
         self.body.clear();
         self
@@ -542,9 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn routes_tileset_subtree_report_and_smoke_page() {
+    fn routes_tileset_subtree_report_and_root_status() {
         let catalog = fixture_catalog();
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        let root = handle_poc_http_request("GET / HTTP/1.1\r\n\r\n", &catalog, &runtime);
+        assert_eq!(root.status_code, 200);
+        assert!(String::from_utf8_lossy(&root.body).contains("Lucy tile server"));
 
         let tileset =
             handle_poc_http_request("GET /tileset.json HTTP/1.1\r\n\r\n", &catalog, &runtime);
@@ -559,15 +485,6 @@ mod tests {
         );
         assert_eq!(subtree.status_code, 200);
         assert_eq!(&subtree.body[0..4], b"subt");
-
-        let smoke = handle_poc_http_request(
-            "GET /cesium-smoke.html HTTP/1.1\r\n\r\n",
-            &catalog,
-            &runtime,
-        );
-        assert_eq!(smoke.status_code, 200);
-        assert!(String::from_utf8_lossy(&smoke.body).contains("Cesium3DTileset.fromUrl"));
-        assert!(String::from_utf8_lossy(&smoke.body).contains("UrlTemplateImageryProvider"));
 
         let report = handle_poc_http_request(
             "GET /phase-0-report.md HTTP/1.1\r\n\r\n",
