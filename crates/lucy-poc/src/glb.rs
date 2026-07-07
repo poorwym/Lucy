@@ -70,7 +70,7 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
     }
     binary.extend(std::iter::repeat_n(0, position_byte_offset - binary.len()));
     for vertex in &mesh.vertices {
-        for component in vertex.position {
+        for component in gltf_position(vertex.position) {
             binary.extend_from_slice(&component.to_le_bytes());
         }
     }
@@ -232,17 +232,23 @@ fn validate_mesh(mesh: &TriangleMesh) -> Result<(), GlbError> {
 }
 
 fn position_bounds(vertices: &[MeshVertex]) -> PositionBounds {
-    let mut min = vertices[0].position;
-    let mut max = vertices[0].position;
+    let mut min = gltf_position(vertices[0].position);
+    let mut max = min;
 
     for vertex in vertices.iter().skip(1) {
+        let position = gltf_position(vertex.position);
         for component in 0..POSITION_COMPONENTS {
-            min[component] = min[component].min(vertex.position[component]);
-            max[component] = max[component].max(vertex.position[component]);
+            min[component] = min[component].min(position[component]);
+            max[component] = max[component].max(position[component]);
         }
     }
 
     PositionBounds { min, max }
+}
+
+fn gltf_position(enu_position: [f32; 3]) -> [f32; 3] {
+    let [east, north, up] = enu_position;
+    [east, up, -north]
 }
 
 fn append_chunk(glb: &mut Vec<u8>, chunk_type: u32, chunk: &[u8]) -> Result<(), GlbError> {
@@ -321,11 +327,11 @@ mod tests {
         assert_eq!(parsed.document["accessors"][1]["count"], 4);
         assert_eq!(
             parsed.document["accessors"][1]["min"],
-            json!([0.0, 0.0, 0.0])
+            json!([0.0, 0.0, -1.0])
         );
         assert_eq!(
             parsed.document["accessors"][1]["max"],
-            json!([1.0, 1.0, 0.0])
+            json!([1.0, 0.0, -0.0])
         );
     }
 
@@ -346,7 +352,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             positions,
-            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+            vec![
+                0.0, 0.0, -0.0, 1.0, 0.0, -0.0, 1.0, 0.0, -1.0, 0.0, 0.0, -1.0
+            ]
         );
     }
 

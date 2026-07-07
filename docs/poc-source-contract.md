@@ -111,18 +111,20 @@ local tangent meter frame centered on the configured source bounds, using an
 equirectangular approximation suitable for the small POC fixture extent. GLB
 content extrudes each footprint from `base_height_m` to
 `base_height_m + height_m` and emits vertices as `[east_m, north_m, up_m]`.
+When encoded into GLB, those internal ENU positions are converted to glTF's
+Y-up convention as `[east_m, up_m, -north_m]`.
 
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
 tile. One or more internal feature meshes are concatenated into one mesh
 primitive. The binary buffer stores little-endian `UNSIGNED_INT` triangle
-indices followed by tightly packed `FLOAT` `VEC3` positions. The GLB contains
-one scene, one node, and one mesh primitive with mode `TRIANGLES`. Materials,
-feature metadata, batch/structural metadata, normals, texture coordinates, and
-per-feature primitives are intentionally deferred until the single-content-tile
-path is stable. The POC emits roof, bottom, and wall triangles for each extruded
-fixture footprint.
+indices followed by tightly packed glTF Y-up `FLOAT` `VEC3` positions. The GLB
+contains one scene, one node, and one mesh primitive with mode `TRIANGLES`.
+Materials, feature metadata, batch/structural metadata, normals, texture
+coordinates, and per-feature primitives are intentionally deferred until the
+single-content-tile path is stable. The POC emits roof, bottom, and wall
+triangles for each extruded fixture footprint.
 
 ## Minimal Source Config
 
