@@ -32,7 +32,6 @@ pub fn build_app_with_settings(
         .route("/", get(routes::root_status))
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
-        .route("/phase-0-report.md", get(routes::phase_zero_report))
         .route(
             "/sources/{source_id}/tileset.json",
             get(routes::source_tileset),
