@@ -436,9 +436,12 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "lucy-core",
+ "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tokio-postgres",
+ "tower",
 ]
 
 [[package]]

@@ -2,10 +2,30 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+pub mod error;
 pub mod postgis;
+mod response;
+pub mod routes;
 pub mod server;
+pub mod settings;
+pub mod state;
 
-pub use server::{DEFAULT_POC_ADDR, PocServerError, run_poc_server};
+pub use error::{RouteError, ServerError};
+pub use server::{
+    DEFAULT_ADDR, build_app, build_app_with_settings, run_server, run_server_blocking,
+};
+pub use settings::ServerSettings;
+pub use state::AppState;
+
+pub const DEFAULT_POC_ADDR: &str = DEFAULT_ADDR;
+pub type PocServerError = ServerError;
+
+pub fn run_poc_server(
+    config_path: impl AsRef<Path>,
+    addr: std::net::SocketAddr,
+) -> Result<(), ServerError> {
+    run_server_blocking(config_path, addr)
+}
 
 pub fn load_source_catalog(
     path: impl AsRef<Path>,

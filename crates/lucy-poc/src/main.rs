@@ -6,8 +6,7 @@ use lucy_core::DEFAULT_CONFIG_PATH;
 use lucy_core::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_core::tile::TileCoord;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
-use lucy_server::load_source_catalog;
-use lucy_server::server::{DEFAULT_POC_ADDR, run_poc_server};
+use lucy_server::{DEFAULT_ADDR, load_source_catalog, run_server_blocking};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -17,7 +16,7 @@ fn main() -> ExitCode {
         let config_path = args
             .next()
             .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
-        let addr_text = args.next().unwrap_or_else(|| DEFAULT_POC_ADDR.to_string());
+        let addr_text = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
         let addr = match addr_text.parse::<SocketAddr>() {
             Ok(addr) => addr,
             Err(error) => {
@@ -26,7 +25,7 @@ fn main() -> ExitCode {
             }
         };
 
-        return match run_poc_server(&config_path, addr) {
+        return match run_server_blocking(&config_path, addr) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

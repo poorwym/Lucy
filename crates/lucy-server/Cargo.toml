@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 axum = "0.8.9"
 lucy-core = { path = "../lucy-core" }
+serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

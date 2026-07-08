@@ -11,7 +11,7 @@ pub mod tileset;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SourceCatalog {
     pub sources: BTreeMap<String, SourceConfig>,
 }
@@ -40,7 +40,7 @@ impl SourceCatalog {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SourceConfig {
     pub connection: String,
     pub schema: String,
@@ -135,19 +135,19 @@ impl SourceConfig {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceModel {
     ExtrudedFootprint,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum GeometryType {
     Polygon,
     MultiPolygon,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SourceBounds {
     pub west: f64,
     pub south: f64,
@@ -185,7 +185,7 @@ impl SourceBounds {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct MaterialConfig {
     pub color_column: Option<String>,
     pub default_base_color: [f32; 4],
