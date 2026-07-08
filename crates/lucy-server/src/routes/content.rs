@@ -3,9 +3,9 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use tokio_postgres::NoTls;
 
-use lucy_core::SourceConfig;
 use lucy_core::glb::encode_content_tile_glb;
 use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh};
+use lucy_core::source::SourceConfig;
 use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
@@ -13,7 +13,7 @@ use crate::postgis::{TileFeatureWkb, query_tile_geometry_wkb};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::tile_path::parse_tile_path;
+use super::util::parse_tile_path;
 
 pub(crate) async fn source_content(
     State(state): State<AppState>,

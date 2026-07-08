@@ -9,7 +9,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 
-use lucy_core::SourceCatalog;
+use lucy_core::source::SourceCatalog;
 
 use crate::error::ServerError;
 use crate::routes;

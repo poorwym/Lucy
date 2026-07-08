@@ -1,3 +1,4 @@
+use lucy_core::source::{ConfigError, SourceCatalog};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -27,16 +28,14 @@ pub fn run_poc_server(
     run_server_blocking(config_path, addr)
 }
 
-pub fn load_source_catalog(
-    path: impl AsRef<Path>,
-) -> Result<lucy_core::SourceCatalog, ConfigLoadError> {
+pub fn load_source_catalog(path: impl AsRef<Path>) -> Result<SourceCatalog, ConfigLoadError> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path).map_err(|source| ConfigLoadError::Read {
         path: path.display().to_string(),
         source,
     })?;
 
-    lucy_core::SourceCatalog::from_yaml_str(&raw).map_err(|source| ConfigLoadError::Parse {
+    SourceCatalog::from_yaml_str(&raw).map_err(|source| ConfigLoadError::Parse {
         path: path.display().to_string(),
         source,
     })
@@ -50,7 +49,7 @@ pub enum ConfigLoadError {
     },
     Parse {
         path: String,
-        source: lucy_core::ConfigError,
+        source: ConfigError,
     },
 }
 

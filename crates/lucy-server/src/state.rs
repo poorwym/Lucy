@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lucy_core::{ConfigError, SourceCatalog, SourceConfig};
+use lucy_core::source::{ConfigError, SourceCatalog, SourceConfig};
 
 use crate::error::{RouteError, ServerError};
 use crate::settings::ServerSettings;

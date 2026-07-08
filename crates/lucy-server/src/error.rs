@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
-use lucy_core::ConfigError;
+use lucy_core::source::ConfigError;
 use lucy_core::glb::GlbError;
 use lucy_core::mesh::MeshError;
 use lucy_core::tile::TileCoordError;

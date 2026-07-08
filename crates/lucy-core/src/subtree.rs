@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{ConfigError, SourceConfig};
+use crate::source::{ConfigError, SourceConfig};
 
 const SUBTREE_MAGIC: &[u8; 4] = b"subt";
 const SUBTREE_VERSION: u32 = 1;
@@ -154,7 +154,7 @@ fn padded_len(length: usize, alignment: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SourceCatalog;
+    use crate::source::SourceCatalog;
 
     fn fixture_source() -> SourceConfig {
         let mut catalog =

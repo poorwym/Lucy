@@ -2,7 +2,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use lucy_core::SourceConfig;
+use lucy_core::source::SourceConfig;
 use lucy_core::subtree::generate_root_subtree_bytes;
 use lucy_core::tile::TileCoord;
 
@@ -10,7 +10,7 @@ use crate::error::RouteError;
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::tile_path::parse_tile_path;
+use super::util::parse_tile_path;
 
 pub(crate) async fn source_subtree(
     State(state): State<AppState>,

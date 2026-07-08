@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{ConfigError, SourceBounds};
+use crate::source::{ConfigError, SourceBounds};
 
 /// Phase 0 QUADTREE math.
 ///

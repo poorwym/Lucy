@@ -2,7 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use lucy_core::DEFAULT_CONFIG_PATH;
+use lucy_core::source::DEFAULT_CONFIG_PATH;
 use lucy_core::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_core::tile::TileCoord;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};

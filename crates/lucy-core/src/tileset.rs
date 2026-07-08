@@ -1,7 +1,7 @@
 use serde::Serialize;
 
+use crate::source::{ConfigError, SourceBounds, SourceConfig};
 use crate::tile::TileCoord;
-use crate::{ConfigError, SourceBounds, SourceConfig};
 
 pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
@@ -205,7 +205,7 @@ fn east_north_up_transform(bounds: &SourceBounds) -> Result<[f64; 16], ConfigErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SourceCatalog;
+    use crate::source::SourceCatalog;
 
     fn fixture_source() -> SourceConfig {
         let mut catalog =

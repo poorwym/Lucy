@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::SourceBounds;
+use crate::source::SourceBounds;
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const WKB_POINT: u32 = 1;

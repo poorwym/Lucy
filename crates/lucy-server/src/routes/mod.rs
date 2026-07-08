@@ -1,8 +1,8 @@
 mod content;
 mod status;
 mod subtree;
-mod tile_path;
 mod tileset;
+mod util;
 
 pub(crate) use content::{default_content, source_content};
 pub(crate) use status::{health, metrics, root_status};
@@ -17,7 +17,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Request, StatusCode, header};
     use axum::response::Response;
-    use lucy_core::SourceCatalog;
+    use lucy_core::source::SourceCatalog;
     use serde_json::Value;
     use tower::ServiceExt;
 

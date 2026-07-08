@@ -3,8 +3,8 @@ use std::fmt;
 
 use tokio_postgres::GenericClient;
 
+use lucy_core::source::{ConfigError, SourceConfig};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
-use lucy_core::{ConfigError, SourceConfig};
 
 /// One PostGIS feature intersecting a requested tile bbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +204,7 @@ mod tests {
     use tokio_postgres::NoTls;
 
     use super::*;
-    use lucy_core::SourceCatalog;
+    use lucy_core::source::SourceCatalog;
 
     fn fixture_source() -> SourceConfig {
         let config_path =

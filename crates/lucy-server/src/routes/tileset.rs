@@ -2,7 +2,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use lucy_core::SourceConfig;
+use lucy_core::source::SourceConfig;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
 
 use crate::error::RouteError;
