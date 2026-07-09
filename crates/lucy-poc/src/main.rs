@@ -6,9 +6,10 @@ use lucy_core::source::DEFAULT_CONFIG_PATH;
 use lucy_core::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_core::tile::TileCoord;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
-use lucy_server::{DEFAULT_ADDR, load_source_catalog, run_server_blocking};
+use lucy_server::{DEFAULT_ADDR, load_source_catalog, run_server};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let first_arg = args.next();
 
@@ -25,7 +26,7 @@ fn main() -> ExitCode {
             }
         };
 
-        return match run_server_blocking(&config_path, addr) {
+        return match run_server(&config_path, addr).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

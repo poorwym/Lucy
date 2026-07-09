@@ -76,15 +76,6 @@ pub async fn run_server(
     Ok(())
 }
 
-pub fn run_server_blocking(
-    config_path: impl AsRef<Path>,
-    addr: SocketAddr,
-) -> Result<(), ServerError> {
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| ServerError::Runtime(format!("failed to create runtime: {error}")))?;
-    runtime.block_on(run_server(config_path, addr))
-}
-
 async fn add_cors(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     response.headers_mut().insert(

@@ -428,6 +428,7 @@ version = "0.1.0"
 dependencies = [
  "lucy-core",
  "lucy-server",
+ "tokio",
 ]
 
 [[package]]
