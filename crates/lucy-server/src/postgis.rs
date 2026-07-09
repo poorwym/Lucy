@@ -123,8 +123,9 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         format!("ST_AsBinary(t.{geometry_column}, 'NDR') AS geometry_wkb"),
     ];
 
-    let mut attributes = Vec::with_capacity(source.attributes.len());
-    for (index, attribute) in source.attributes.iter().enumerate() {
+    let query_attributes = source.content_query_attributes();
+    let mut attributes = Vec::with_capacity(query_attributes.len());
+    for (index, attribute) in query_attributes.iter().enumerate() {
         let attribute_column = quote_identifier(attribute, "attribute")?;
         select_columns.push(format!("t.{attribute_column}::text AS attr_{index}"));
         attributes.push(attribute.clone());
@@ -244,6 +245,23 @@ mod tests {
             error.to_string().contains("attribute"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn tile_wkb_query_includes_configured_height_columns() {
+        let mut source = fixture_source();
+        source.attributes = vec!["name".to_string()];
+        source.base_height_column = Some("custom_base_m".to_string());
+        source.height_column = "custom_height_m".to_string();
+
+        let plan = build_tile_wkb_query(&source).expect("query should build");
+
+        assert_eq!(
+            plan.attributes,
+            vec!["name", "custom_base_m", "custom_height_m"]
+        );
+        assert!(plan.sql.contains("t.\"custom_base_m\"::text AS attr_1"));
+        assert!(plan.sql.contains("t.\"custom_height_m\"::text AS attr_2"));
     }
 
     #[tokio::test]

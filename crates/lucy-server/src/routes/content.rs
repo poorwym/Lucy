@@ -5,7 +5,7 @@ use tokio_postgres::NoTls;
 
 use lucy_core::glb::encode_content_tile_glb;
 use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh};
-use lucy_core::source::SourceConfig;
+use lucy_core::source::{DEFAULT_BASE_HEIGHT_M, SourceConfig};
 use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
@@ -54,7 +54,7 @@ async fn content_tile_response(
     let frame = MeshFrame::from_source_bounds(&source.bounds);
     let mut meshes = Vec::with_capacity(features.len());
     for feature in features {
-        let (base_height_m, height_m) = feature_heights(&feature)?;
+        let (base_height_m, height_m) = feature_heights(source, &feature)?;
         meshes.push(wkb_footprint_to_extruded_mesh(
             &feature.geometry_wkb,
             frame,
@@ -70,9 +70,17 @@ async fn content_tile_response(
     ))
 }
 
-fn feature_heights(feature: &TileFeatureWkb) -> Result<(f32, f32), RouteError> {
-    let base_height_m = parse_optional_feature_f32(feature, "base_height_m")?.unwrap_or(0.0);
-    let height_m = parse_required_feature_f32(feature, "height_m")?;
+fn feature_heights(
+    source: &SourceConfig,
+    feature: &TileFeatureWkb,
+) -> Result<(f32, f32), RouteError> {
+    let base_height_m = match source.base_height_column_or_default() {
+        Some(attribute) => {
+            parse_optional_feature_f32(feature, attribute)?.unwrap_or(DEFAULT_BASE_HEIGHT_M)
+        }
+        None => DEFAULT_BASE_HEIGHT_M,
+    };
+    let height_m = parse_required_feature_f32(feature, &source.height_column)?;
     Ok((base_height_m, height_m))
 }
 
@@ -118,5 +126,63 @@ fn resolve_connection_string(connection: &str) -> Result<String, RouteError> {
         })
     } else {
         Ok(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use lucy_core::source::SourceCatalog;
+
+    use super::*;
+
+    fn fixture_source() -> SourceConfig {
+        let mut catalog =
+            SourceCatalog::from_yaml_str(include_str!("../../../../config/poc-sources.yaml"))
+                .expect("fixture config should load");
+        catalog
+            .sources
+            .remove("poc_buildings")
+            .expect("poc source should exist")
+    }
+
+    #[test]
+    fn feature_heights_use_configured_column_names() {
+        let mut source = fixture_source();
+        source.base_height_column = Some("bottom_m".to_string());
+        source.height_column = "height_delta_m".to_string();
+
+        let feature = TileFeatureWkb {
+            id: "42".to_string(),
+            geometry_wkb: Vec::new(),
+            attributes: BTreeMap::from([
+                ("bottom_m".to_string(), Some("7.5".to_string())),
+                ("height_delta_m".to_string(), Some("12.25".to_string())),
+            ]),
+        };
+
+        assert_eq!(
+            feature_heights(&source, &feature).expect("heights should parse"),
+            (7.5, 12.25)
+        );
+    }
+
+    #[test]
+    fn feature_heights_default_missing_base_height_to_zero() {
+        let mut source = fixture_source();
+        source.base_height_column = None;
+        source.height_column = "height_delta_m".to_string();
+
+        let feature = TileFeatureWkb {
+            id: "42".to_string(),
+            geometry_wkb: Vec::new(),
+            attributes: BTreeMap::from([("height_delta_m".to_string(), Some("12.25".to_string()))]),
+        };
+
+        assert_eq!(
+            feature_heights(&source, &feature).expect("heights should parse"),
+            (DEFAULT_BASE_HEIGHT_M, 12.25)
+        );
     }
 }

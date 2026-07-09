@@ -83,7 +83,7 @@ west:  -122.40130
 south:   37.79245
 east:  -122.39975
 north:   37.79375
-min height: 18 m
+min height: 0 m
 max height: 100 m
 ```
 
@@ -166,6 +166,57 @@ sources:
       color_column: color
       default_base_color: [0.72, 0.70, 0.65, 1.0]
 ```
+
+## Runtime Usage Map
+
+This section records the Phase 1.2.5 comparison between
+`config/poc-sources.yaml`, this contract, and the current `lucy-core` /
+`lucy-server` implementation. Values below should come from source config
+unless explicitly listed as a retained Phase 0 constraint.
+
+| Config field | Runtime usage |
+| --- | --- |
+| Source id map key | Selected from the loaded `SourceCatalog`; source-scoped routes use `/sources/{source_id}/...`, and legacy routes use the first configured source as the default. |
+| `connection` | Resolved by `lucy-server` content routes. Literal connection strings are used as-is; the POC `${DATABASE_URL}` placeholder is resolved from the process environment. |
+| `schema`, `table` | Quoted after identifier validation and used to build the PostGIS tile query target. |
+| `geometry_column` | Quoted after identifier validation and used for bbox filtering, intersection tests, and `ST_AsBinary(..., 'NDR')`. |
+| `id_column` | Quoted after identifier validation, selected as the feature id, and used for stable ordering. |
+| `srid` | Bound into `ST_MakeEnvelope($1, $2, $3, $4, $5)`; Phase 0 validation still restricts this to `4326`. |
+| `source_model` | Validated as `extruded_footprint`; selects the footprint extrusion path. |
+| `vertical_reference` | Parsed and retained as source metadata; no alternate vertical reference behavior exists yet. |
+| `base_height_column` | If present, automatically selected by the PostGIS tile query and used as the extrusion base. Missing or NULL values default to `0.0`. |
+| `height_column` | Automatically selected by the PostGIS tile query and required as positive extrusion height input. |
+| `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
+| `bounds` | Drives root tileset region, tile coordinate bbox mapping, local mesh frame origin, tileset transform origin, and vertical bounding interval. |
+| `min_level` | Validated and currently required to be `0` by root tileset/subtree generation. |
+| `max_level` | Drives implicit tileset `availableLevels` and root subtree child-subtree availability. |
+| `subtree_levels` | Drives implicit tileset `subtreeLevels` and subtree availability calculations. |
+| `max_features_per_tile` | Bound as the PostGIS tile query `LIMIT`. |
+| `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
+| `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |
+| `material.default_base_color` | Parsed, but not consumed by GLB generation yet because Phase 0 emits position-only GLB meshes. |
+
+## Retained Phase 0 Constraints and P1.3 Follow-up
+
+The following assumptions remain deliberate constraints until P1.3 source
+introspection and later rendering work:
+
+1. SRID validation only accepts `4326`, even though the query path binds the
+   configured SRID. P1.3 should verify table SRID at startup and decide whether
+   non-4326 reprojection is in scope.
+2. `min_level` must be `0`; non-root implicit subtree generation is still a
+   follow-up.
+3. Runtime geometry filtering does not yet push `geometry_types` into SQL.
+   P1.3 should validate table geometry types during startup and return clear
+   source errors before tile requests.
+4. `vertical_reference` has one effective behavior:
+   `local_ground_meters`.
+5. `material` is validated as config but not reflected in GLB output. Material
+   color and feature metadata are deferred until the content-tile schema is
+   expanded beyond position-only meshes.
+6. PostGIS pooling and startup introspection are not implemented here; P1.3
+   owns pool registry setup, schema/table/column checks, bounds fallback, SRID
+   checks, and GiST index warnings.
 
 Startup validation for this fixed source should check:
 

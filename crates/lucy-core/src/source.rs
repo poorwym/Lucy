@@ -4,6 +4,7 @@ use std::fmt;
 use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
+pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceCatalog {
@@ -127,6 +128,21 @@ impl SourceConfig {
     pub fn base_height_column_or_default(&self) -> Option<&str> {
         self.base_height_column.as_deref()
     }
+
+    pub fn content_query_attributes(&self) -> Vec<String> {
+        let mut attributes = Vec::new();
+
+        for attribute in &self.attributes {
+            push_unique_attribute(&mut attributes, attribute);
+        }
+
+        if let Some(base_height_column) = &self.base_height_column {
+            push_unique_attribute(&mut attributes, base_height_column);
+        }
+        push_unique_attribute(&mut attributes, &self.height_column);
+
+        attributes
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -225,6 +241,12 @@ fn require_identifier(value: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn push_unique_attribute(attributes: &mut Vec<String>, attribute: &str) {
+    if !attributes.iter().any(|existing| existing == attribute) {
+        attributes.push(attribute.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +266,52 @@ mod tests {
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column, "height_m");
+    }
+
+    #[test]
+    fn content_query_attributes_include_configured_height_columns() {
+        let raw = r#"
+sources:
+  custom_buildings:
+    connection: ${CUSTOM_DATABASE_URL}
+    schema: public
+    table: custom_buildings
+    geometry_column: footprint
+    id_column: feature_id
+    srid: 4326
+    source_model: extruded_footprint
+    vertical_reference: local_ground_meters
+    base_height_column: bottom_m
+    height_column: top_delta_m
+    geometry_types:
+      - Polygon
+    bounds:
+      west: -1.0
+      south: -1.0
+      east: 1.0
+      north: 1.0
+      min_height_m: 0.0
+      max_height_m: 10.0
+    min_level: 0
+    max_level: 1
+    subtree_levels: 1
+    max_features_per_tile: 10
+    attributes:
+      - name
+      - top_delta_m
+    material:
+      color_column: color
+      default_base_color: [1.0, 1.0, 1.0, 1.0]
+"#;
+        let catalog = SourceCatalog::from_yaml_str(raw).expect("config should load");
+        let source = catalog
+            .sources
+            .get("custom_buildings")
+            .expect("source should exist");
+
+        assert_eq!(
+            source.content_query_attributes(),
+            vec!["name", "top_delta_m", "bottom_m"]
+        );
     }
 }
