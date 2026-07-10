@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use tokio_postgres::NoTls;
 
-use lucy_core::glb::encode_content_tile_glb;
+use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
 use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh};
 use lucy_core::source::{DEFAULT_BASE_HEIGHT_M, SourceConfig};
 use lucy_core::tile::TileCoord;
@@ -53,22 +55,85 @@ async fn content_tile_response(
     }
 
     let frame = MeshFrame::from_source_bounds(&source.bounds);
-    let mut meshes = Vec::with_capacity(features.len());
+    let mut content_features = Vec::with_capacity(features.len());
     for feature in features {
         let (base_height_m, height_m) = feature_heights(source, &feature)?;
-        meshes.push(wkb_footprint_to_extruded_mesh(
-            &feature.geometry_wkb,
-            frame,
-            base_height_m,
-            height_m,
-        )?);
+        let mesh =
+            wkb_footprint_to_extruded_mesh(&feature.geometry_wkb, frame, base_height_m, height_m)?;
+        let base_color = feature_base_color(source, &feature)?;
+        let properties = source
+            .attributes
+            .iter()
+            .map(|attribute| {
+                (
+                    attribute.clone(),
+                    feature.attributes.get(attribute).cloned().unwrap_or(None),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        content_features.push(ContentFeature {
+            id: feature.id,
+            mesh,
+            base_color,
+            properties,
+        });
     }
 
     Ok(bytes_response(
         StatusCode::OK,
         "model/gltf-binary",
-        encode_content_tile_glb(&meshes)?,
+        encode_feature_content_tile_glb(&content_features)?,
     ))
+}
+
+fn feature_base_color(
+    source: &SourceConfig,
+    feature: &TileFeatureWkb,
+) -> Result<[f32; 4], RouteError> {
+    let Some(color_column) = source.material.color_column.as_deref() else {
+        return Ok(source.material.default_base_color);
+    };
+    let Some(value) = feature
+        .attributes
+        .get(color_column)
+        .and_then(Option::as_deref)
+    else {
+        return Ok(source.material.default_base_color);
+    };
+
+    parse_hex_color(value).map_err(|message| {
+        RouteError::config(format!(
+            "feature {} material color {color_column}={value:?} is invalid: {message}",
+            feature.id
+        ))
+    })
+}
+
+fn parse_hex_color(value: &str) -> Result<[f32; 4], &'static str> {
+    let value = value.trim();
+    let hex = value
+        .strip_prefix('#')
+        .ok_or("expected #RRGGBB or #RRGGBBAA")?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return Err("expected #RRGGBB or #RRGGBBAA");
+    }
+
+    let parse_channel = |offset: usize| {
+        u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .map(|channel| f32::from(channel) / 255.0)
+            .map_err(|_| "color contains a non-hexadecimal channel")
+    };
+
+    Ok([
+        parse_channel(0)?,
+        parse_channel(2)?,
+        parse_channel(4)?,
+        if hex.len() == 8 {
+            parse_channel(6)?
+        } else {
+            1.0
+        },
+    ])
 }
 
 fn feature_heights(
@@ -171,6 +236,53 @@ mod tests {
         assert_eq!(
             feature_heights(&source, &feature).expect("heights should parse"),
             (DEFAULT_BASE_HEIGHT_M, 12.25)
+        );
+    }
+
+    #[test]
+    fn feature_color_uses_configured_hex_and_optional_alpha() {
+        let source = fixture_source();
+        let feature = TileFeatureWkb {
+            id: "42".to_string(),
+            geometry_wkb: Vec::new(),
+            attributes: BTreeMap::from([("color".to_string(), Some("#80402080".to_string()))]),
+        };
+
+        let color = feature_base_color(&source, &feature).expect("color should parse");
+        assert_eq!(
+            color,
+            [128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0, 128.0 / 255.0]
+        );
+    }
+
+    #[test]
+    fn feature_color_falls_back_to_configured_default() {
+        let source = fixture_source();
+        let feature = TileFeatureWkb {
+            id: "42".to_string(),
+            geometry_wkb: Vec::new(),
+            attributes: BTreeMap::from([("color".to_string(), None)]),
+        };
+
+        assert_eq!(
+            feature_base_color(&source, &feature).expect("default should apply"),
+            source.material.default_base_color
+        );
+    }
+
+    #[test]
+    fn feature_color_rejects_malformed_source_values() {
+        let source = fixture_source();
+        let feature = TileFeatureWkb {
+            id: "42".to_string(),
+            geometry_wkb: Vec::new(),
+            attributes: BTreeMap::from([("color".to_string(), Some("orange".to_string()))]),
+        };
+
+        assert!(feature_base_color(&source, &feature).is_err());
+        assert_eq!(
+            parse_hex_color("orange"),
+            Err("expected #RRGGBB or #RRGGBBAA")
         );
     }
 }

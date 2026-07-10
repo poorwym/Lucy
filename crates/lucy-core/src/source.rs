@@ -10,6 +10,7 @@ pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
 pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
 pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree";
+pub const MAX_PICKABLE_FEATURES_PER_TILE: u32 = 1 << 24;
 pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -81,11 +82,17 @@ impl SourceConfig {
 
         for attribute in &self.attributes {
             require_identifier(attribute, "attribute")?;
+            if attribute == "featureId" {
+                return Err(ConfigError::Validation(format!(
+                    "{source_id}: attribute featureId is reserved for source feature identifiers"
+                )));
+            }
         }
 
         if let Some(color_column) = &self.material.color_column {
             require_identifier(color_column, "material.color_column")?;
         }
+        self.material.validate(source_id)?;
 
         if self.connection.trim().is_empty() {
             return Err(ConfigError::Validation(format!(
@@ -147,6 +154,12 @@ impl SourceConfig {
             )));
         }
 
+        if self.max_features_per_tile > MAX_PICKABLE_FEATURES_PER_TILE {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: max_features_per_tile must be <= {MAX_PICKABLE_FEATURES_PER_TILE} for exact FLOAT feature IDs"
+            )));
+        }
+
         self.tileset
             .validate(source_id, self.max_level > self.min_level)?;
 
@@ -163,6 +176,10 @@ impl SourceConfig {
 
         for attribute in &self.attributes {
             push_unique_attribute(&mut attributes, attribute);
+        }
+
+        if let Some(color_column) = &self.material.color_column {
+            push_unique_attribute(&mut attributes, color_column);
         }
 
         if let Some(base_height_column) = &self.base_height_column {
@@ -228,6 +245,20 @@ impl SourceBounds {
 pub struct MaterialConfig {
     pub color_column: Option<String>,
     pub default_base_color: [f32; 4],
+}
+
+impl MaterialConfig {
+    fn validate(&self, source_id: &str) -> Result<(), ConfigError> {
+        for (component, value) in self.default_base_color.iter().copied().enumerate() {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::Validation(format!(
+                    "{source_id}: material.default_base_color component {component} must be finite and within 0..=1"
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -428,7 +459,7 @@ sources:
 
         assert_eq!(
             source.content_query_attributes(),
-            vec!["name", "top_delta_m", "bottom_m"]
+            vec!["name", "top_delta_m", "color", "bottom_m"]
         );
         assert_eq!(
             source.tileset,
@@ -509,5 +540,35 @@ sources:
             assert!(error.to_string().contains(field));
             assert!(error.to_string().contains("must contain"));
         }
+    }
+
+    #[test]
+    fn validates_default_material_color_components() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replace(
+            "default_base_color: [0.72, 0.70, 0.65, 1.0]",
+            "default_base_color: [0.72, 1.20, 0.65, 1.0]",
+        );
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("material.default_base_color component 1")
+        );
+    }
+
+    #[test]
+    fn limits_feature_counts_to_exact_float_picking_ids() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replace(
+            "max_features_per_tile: 1000",
+            "max_features_per_tile: 16777217",
+        );
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("max_features_per_tile must be <= 16777216")
+        );
     }
 }

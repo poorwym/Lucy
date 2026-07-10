@@ -204,12 +204,28 @@ metadata.
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
 tile. One or more internal feature meshes are concatenated into one mesh
 primitive. The binary buffer stores little-endian `UNSIGNED_INT` triangle
-indices followed by tightly packed glTF Y-up `FLOAT` `VEC3` positions. The GLB
-contains one scene, one node, and one mesh primitive with mode `TRIANGLES`.
-Materials, feature metadata, batch/structural metadata, normals, texture
-coordinates, and per-feature primitives are intentionally deferred until the
-single-content-tile path is stable. The POC emits roof, bottom, and wall
-triangles for each extruded fixture footprint.
+indices, tightly packed glTF Y-up `FLOAT` `VEC3` positions, per-vertex
+`COLOR_0`, and per-vertex `_FEATURE_ID_0`. The GLB contains one scene, one node,
+one material, and one mesh primitive with mode `TRIANGLES`; feature separation
+does not add draw calls.
+
+The material uses a white PBR `baseColorFactor`, so vertex colors carry the
+configured feature color. A non-NULL `material.color_column` value accepts
+`#RRGGBB` or `#RRGGBBAA` and normalizes each channel to `0..=1`. Missing or NULL
+values use `material.default_base_color`. Malformed source colors fail the
+content request explicitly. If any alpha is below `1`, the material uses
+`BLEND`; otherwise it uses `OPAQUE`.
+
+[`EXT_mesh_features`](https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_mesh_features)
+maps `_FEATURE_ID_0` to row indices in one embedded
+[`EXT_structural_metadata`](https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_structural_metadata)
+property table. The table preserves the source feature id as `featureId` and
+every field listed in `attributes` as a STRING column, enabling Cesium feature
+picking and property inspection. NULL values use a NUL-string `noData`
+sentinel; PostgreSQL text cannot contain NUL, so real empty strings remain
+distinct. Both extensions are optional in `extensionsUsed`, leaving core glTF
+geometry and color as a rendering fallback. Normals, textures, and typed
+non-string metadata remain deferred.
 
 ## Minimal Source Config
 
@@ -280,13 +296,13 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `min_level` | Validated as the retained implicit-root constraint `0`; tile-addressed routes reject requests below the configured bound before database work. |
 | `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, final-partial clipping, terminal overflow detection, and child-subtree availability. |
 | `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
-| `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
+| `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; capped at `2^24` so FLOAT picking IDs remain exact, and overflow returns `tile_overflow` instead of silently truncating content. |
 | `tileset.root_geometric_error_m` | Drives both emitted root error values and the implicit `root / 2^level` LOD sequence; defaults to `512.0`. |
 | `tileset.content_uri_template` | Emitted as the implicit content URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in content route. |
 | `tileset.subtree_uri_template` | Emitted as the subtree URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in subtree route. |
-| `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
-| `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |
-| `material.default_base_color` | Parsed, but not consumed by GLB generation yet because Phase 0 emits position-only GLB meshes. |
+| `attributes` | Selected from PostGIS and written as STRING columns in the GLB structural metadata table; height columns are still selected for extrusion even when omitted from this list. |
+| `material.color_column` | Selected automatically, parsed as `#RRGGBB` or `#RRGGBBAA`, and emitted through per-vertex `COLOR_0`; missing/NULL values fall back to the default. |
+| `material.default_base_color` | Validated as four finite `0..=1` components and emitted when no per-feature color is available. |
 
 ## Retained Phase 0 Constraints and P1.3 Follow-up
 
@@ -304,9 +320,9 @@ introspection and later rendering work:
    source errors before tile requests.
 4. `vertical_reference` has one effective behavior:
    `local_ground_meters`.
-5. `material` is validated as config but not reflected in GLB output. Material
-   color and feature metadata are deferred until the content-tile schema is
-   expanded beyond position-only meshes.
+5. GLB output includes material color, picking IDs, and STRING structural
+   metadata. Normals, textures, and native numeric metadata column types remain
+   deferred.
 6. PostGIS pooling and startup introspection are not implemented here; P1.3
    owns pool registry setup, schema/table/column checks, bounds fallback, SRID
    checks, and GiST index warnings.

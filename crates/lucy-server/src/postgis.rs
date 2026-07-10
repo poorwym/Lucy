@@ -460,7 +460,13 @@ mod tests {
         assert!(!plan.sql.contains("37.79245"));
         assert_eq!(
             plan.attributes,
-            vec!["name", "building_type", "base_height_m", "height_m"]
+            vec![
+                "name",
+                "building_type",
+                "base_height_m",
+                "height_m",
+                "color"
+            ]
         );
     }
 
@@ -504,10 +510,10 @@ mod tests {
 
         assert_eq!(
             plan.attributes,
-            vec!["name", "custom_base_m", "custom_height_m"]
+            vec!["name", "color", "custom_base_m", "custom_height_m"]
         );
-        assert!(plan.sql.contains("t.\"custom_base_m\"::text AS attr_1"));
-        assert!(plan.sql.contains("t.\"custom_height_m\"::text AS attr_2"));
+        assert!(plan.sql.contains("t.\"custom_base_m\"::text AS attr_2"));
+        assert!(plan.sql.contains("t.\"custom_height_m\"::text AS attr_3"));
     }
 
     #[test]
@@ -560,6 +566,13 @@ mod tests {
                 .get("name")
                 .and_then(|value| value.as_deref()),
             Some("Sansome Office")
+        );
+        assert_eq!(
+            root_features[0]
+                .attributes
+                .get("color")
+                .and_then(|value| value.as_deref()),
+            Some("#8aa1b1")
         );
 
         let availability = query_subtree_availability(&client, &source, TileCoord::root())
@@ -687,6 +700,69 @@ mod tests {
             .await
             .expect("legacy subtree body should read");
         assert_eq!(legacy_body, scoped_body);
+
+        let content = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sources/poc_buildings/content/0/0/0.glb")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("content request should route");
+        assert_eq!(content.status(), StatusCode::OK);
+        assert_eq!(
+            content
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("model/gltf-binary")
+        );
+        let content_body = to_bytes(content.into_body(), usize::MAX)
+            .await
+            .expect("content body should read");
+        assert_eq!(&content_body[0..4], b"glTF");
+        let content_json_length =
+            u32::from_le_bytes(content_body[12..16].try_into().expect("JSON length")) as usize;
+        let content_document: serde_json::Value =
+            serde_json::from_slice(&content_body[20..20 + content_json_length])
+                .expect("content glTF JSON should parse");
+        assert_eq!(
+            content_document["extensionsUsed"],
+            serde_json::json!(["EXT_mesh_features", "EXT_structural_metadata"])
+        );
+        assert_eq!(
+            content_document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"],
+            2
+        );
+        assert_eq!(
+            content_document["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"],
+            6
+        );
+        let color_accessor_index =
+            content_document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"]
+                .as_u64()
+                .expect("color accessor") as usize;
+        let color_accessor = &content_document["accessors"][color_accessor_index];
+        let color_view_index = color_accessor["bufferView"].as_u64().expect("color view") as usize;
+        let color_view = &content_document["bufferViews"][color_view_index];
+        let binary_start = 20 + content_json_length + 8;
+        let color_start =
+            binary_start + color_view["byteOffset"].as_u64().expect("color offset") as usize;
+        let first_color = content_body[color_start..color_start + 16]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 color")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_color,
+            vec![
+                f32::from(0x8a_u8) / 255.0,
+                f32::from(0xa1_u8) / 255.0,
+                f32::from(0xb1_u8) / 255.0,
+                1.0
+            ]
+        );
 
         let empty_child_index = availability
             .child_subtree
