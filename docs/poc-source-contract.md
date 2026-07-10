@@ -114,6 +114,31 @@ content extrudes each footprint from `base_height_m` to
 When encoded into GLB, those internal ENU positions are converted to glTF's
 Y-up convention as `[east_m, up_m, -north_m]`.
 
+## Content Tile Query Semantics
+
+Content uses deterministic clipping rather than assigning a whole feature to
+one tile or repeating the whole feature in every intersecting tile. For every
+requested level, the configured bounds are partitioned into QUADTREE tile
+envelopes. PostGIS first uses the source geometry index to find intersections,
+then computes `ST_Intersection` with the tile envelope, extracts polygonal
+components, and discards empty or zero-area results. The resulting WKB is
+therefore contained by the tile's horizontal bounds.
+
+A building crossing a tile boundary produces one clipped fragment in each
+intersected tile. Every fragment retains the source feature id and attributes,
+and stable id ordering makes repeated requests deterministic. At a given level,
+the union of the fragments equals the source footprint within the configured
+bounds, so clipping creates neither visual gaps nor uncontrolled whole-feature
+duplication. Content availability uses this same positive-area intersection
+rule.
+
+`max_features_per_tile` is an overflow threshold, not a truncation setting.
+Lucy asks PostGIS for at most one row beyond the threshold. If that extra row
+exists, the entire content request fails with the structured
+`tile_overflow`/HTTP 409 response instead of returning an arbitrary prefix. A
+caller can request deeper tiles while the configured `max_level` permits it; an
+overflow at the deepest level requires changing the data or configuration.
+
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
@@ -191,7 +216,7 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `min_level` | Validated and currently required to be `0` by root tileset/subtree generation. |
 | `max_level` | Drives implicit tileset `availableLevels` and root subtree child-subtree availability. |
 | `subtree_levels` | Drives implicit tileset `subtreeLevels` and subtree availability calculations. |
-| `max_features_per_tile` | Bound as the PostGIS tile query `LIMIT`. |
+| `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
 | `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
 | `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |
 | `material.default_base_color` | Parsed, but not consumed by GLB generation yet because Phase 0 emits position-only GLB meshes. |

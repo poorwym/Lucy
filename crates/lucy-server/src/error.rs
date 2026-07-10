@@ -84,6 +84,14 @@ impl RouteError {
         }
     }
 
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
     fn internal(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -134,7 +142,12 @@ impl From<TileCoordError> for RouteError {
 
 impl From<TileQueryError> for RouteError {
     fn from(error: TileQueryError) -> Self {
-        Self::internal("postgis_error", error.to_string())
+        match error {
+            error @ TileQueryError::FeatureLimitExceeded { .. } => {
+                Self::conflict("tile_overflow", error.to_string())
+            }
+            error => Self::internal("postgis_error", error.to_string()),
+        }
     }
 }
 
@@ -153,4 +166,21 @@ struct ErrorBody {
 struct ErrorDetail {
     code: &'static str,
     message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    #[test]
+    fn tile_feature_overflow_maps_to_structured_conflict() {
+        let response = RouteError::from(TileQueryError::FeatureLimitExceeded {
+            max_features_per_tile: 100,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 }

@@ -6,7 +6,7 @@ use tokio_postgres::GenericClient;
 use lucy_core::source::{ConfigError, SourceConfig};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
 
-/// One PostGIS feature intersecting a requested tile bbox.
+/// One PostGIS feature clipped to a requested tile bbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileFeatureWkb {
     pub id: String,
@@ -14,7 +14,7 @@ pub struct TileFeatureWkb {
     pub attributes: BTreeMap<String, Option<String>>,
 }
 
-/// Query a tile bbox from PostGIS and return source geometry as WKB.
+/// Query a tile bbox from PostGIS and return positive-area clipped geometry as WKB.
 pub async fn query_tile_geometry_wkb(
     client: &impl GenericClient,
     source: &SourceConfig,
@@ -24,7 +24,7 @@ pub async fn query_tile_geometry_wkb(
     query_tile_geometry_wkb_for_bbox(client, source, bbox).await
 }
 
-/// Query an explicit geographic bbox from PostGIS and return source geometry as WKB.
+/// Query an explicit geographic bbox from PostGIS and return clipped geometry as WKB.
 pub async fn query_tile_geometry_wkb_for_bbox(
     client: &impl GenericClient,
     source: &SourceConfig,
@@ -33,7 +33,7 @@ pub async fn query_tile_geometry_wkb_for_bbox(
     validate_query_bbox(bbox)?;
 
     let plan = build_tile_wkb_query(source)?;
-    let max_features = i64::from(source.max_features_per_tile);
+    let query_limit = i64::from(source.max_features_per_tile) + 1;
     let rows = client
         .query(
             &plan.sql,
@@ -43,10 +43,11 @@ pub async fn query_tile_geometry_wkb_for_bbox(
                 &bbox.east,
                 &bbox.north,
                 &source.srid,
-                &max_features,
+                &query_limit,
             ],
         )
         .await?;
+    ensure_within_feature_limit(rows.len(), source.max_features_per_tile)?;
 
     let mut features = Vec::with_capacity(rows.len());
     for row in rows {
@@ -74,6 +75,7 @@ pub async fn query_tile_geometry_wkb_for_bbox(
 #[derive(Debug)]
 pub enum TileQueryError {
     Config(ConfigError),
+    FeatureLimitExceeded { max_features_per_tile: u32 },
     Postgres(tokio_postgres::Error),
 }
 
@@ -81,6 +83,12 @@ impl fmt::Display for TileQueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TileQueryError::Config(error) => write!(f, "{error}"),
+            TileQueryError::FeatureLimitExceeded {
+                max_features_per_tile,
+            } => write!(
+                f,
+                "tile contains more than {max_features_per_tile} features; request a deeper tile or raise max_features_per_tile instead of serving truncated content"
+            ),
             TileQueryError::Postgres(error) => write!(f, "PostGIS tile query failed: {error}"),
         }
     }
@@ -120,7 +128,7 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
 
     let mut select_columns = vec![
         format!("t.{id_column}::text AS id"),
-        format!("ST_AsBinary(t.{geometry_column}, 'NDR') AS geometry_wkb"),
+        "ST_AsBinary(clipped.geom, 'NDR') AS geometry_wkb".to_string(),
     ];
 
     let query_attributes = source.content_query_attributes();
@@ -134,15 +142,34 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
     let sql = format!(
         "WITH tile_bbox AS (SELECT ST_MakeEnvelope($1, $2, $3, $4, $5) AS geom) \
          SELECT {} \
-         FROM {schema}.{table} AS t, tile_bbox AS b \
+         FROM {schema}.{table} AS t \
+         CROSS JOIN tile_bbox AS b \
+         CROSS JOIN LATERAL ( \
+           SELECT ST_Multi(ST_CollectionExtract(ST_Intersection(t.{geometry_column}, b.geom), 3)) AS geom \
+         ) AS clipped \
          WHERE t.{geometry_column} && b.geom \
          AND ST_Intersects(t.{geometry_column}, b.geom) \
+         AND NOT ST_IsEmpty(clipped.geom) \
+         AND ST_Area(clipped.geom) > 0 \
          ORDER BY t.{id_column} \
          LIMIT $6",
         select_columns.join(", ")
     );
 
     Ok(TileWkbQueryPlan { sql, attributes })
+}
+
+fn ensure_within_feature_limit(
+    row_count: usize,
+    max_features_per_tile: u32,
+) -> Result<(), TileQueryError> {
+    if row_count > max_features_per_tile as usize {
+        return Err(TileQueryError::FeatureLimitExceeded {
+            max_features_per_tile,
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_query_bbox(bbox: GeographicRegionDegrees) -> Result<(), ConfigError> {
@@ -219,13 +246,17 @@ mod tests {
     }
 
     #[test]
-    fn tile_wkb_query_uses_bound_bbox_values_and_limit() {
+    fn tile_wkb_query_uses_bound_bbox_values_clipping_and_limit() {
         let source = fixture_source();
         let plan = build_tile_wkb_query(&source).expect("query should build");
 
         assert!(plan.sql.contains("ST_MakeEnvelope($1, $2, $3, $4, $5)"));
         assert!(plan.sql.contains("t.\"geom\" && b.geom"));
         assert!(plan.sql.contains("ST_Intersects(t.\"geom\", b.geom)"));
+        assert!(plan.sql.contains("ST_Intersection(t.\"geom\", b.geom)"));
+        assert!(plan.sql.contains("ST_CollectionExtract"));
+        assert!(plan.sql.contains("ST_Area(clipped.geom) > 0"));
+        assert!(plan.sql.contains("ST_AsBinary(clipped.geom, 'NDR')"));
         assert!(plan.sql.contains("LIMIT $6"));
         assert!(!plan.sql.contains("-122.40130"));
         assert!(!plan.sql.contains("37.79245"));
@@ -264,8 +295,22 @@ mod tests {
         assert!(plan.sql.contains("t.\"custom_height_m\"::text AS attr_2"));
     }
 
+    #[test]
+    fn feature_limit_reports_overflow_instead_of_truncating() {
+        ensure_within_feature_limit(2, 2).expect("limit itself should be accepted");
+
+        let error = ensure_within_feature_limit(3, 2).expect_err("overflow should fail");
+        assert!(matches!(
+            error,
+            TileQueryError::FeatureLimitExceeded {
+                max_features_per_tile: 2
+            }
+        ));
+        assert!(error.to_string().contains("instead of serving truncated"));
+    }
+
     #[tokio::test]
-    async fn fixture_tile_query_returns_wkb_empty_tiles_and_applies_limit() {
+    async fn fixture_tile_query_clips_cross_boundary_features_and_rejects_overflow() {
         let Ok(database_url) = env::var("DATABASE_URL") else {
             return;
         };
@@ -308,10 +353,39 @@ mod tests {
             .expect("empty tile should query");
         assert!(empty_features.is_empty());
 
+        let southwest = query_tile_geometry_wkb(
+            &client,
+            &source,
+            TileCoord::new(1, 0, 0).expect("southwest tile"),
+        )
+        .await
+        .expect("southwest tile should query");
+        let southeast = query_tile_geometry_wkb(
+            &client,
+            &source,
+            TileCoord::new(1, 1, 0).expect("southeast tile"),
+        )
+        .await
+        .expect("southeast tile should query");
+        let west_fragment = southwest
+            .iter()
+            .find(|feature| feature.id == "2")
+            .expect("cross-boundary feature should have a west fragment");
+        let east_fragment = southeast
+            .iter()
+            .find(|feature| feature.id == "2")
+            .expect("cross-boundary feature should have an east fragment");
+        assert_ne!(west_fragment.geometry_wkb, east_fragment.geometry_wkb);
+
         source.max_features_per_tile = 2;
-        let limited_features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
+        let error = query_tile_geometry_wkb(&client, &source, TileCoord::root())
             .await
-            .expect("limited root tile should query");
-        assert_eq!(limited_features.len(), 2);
+            .expect_err("overflow must not return a truncated tile");
+        assert!(matches!(
+            error,
+            TileQueryError::FeatureLimitExceeded {
+                max_features_per_tile: 2
+            }
+        ));
     }
 }
