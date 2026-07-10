@@ -12,7 +12,9 @@ use crate::postgis::query_subtree_availability;
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::util::{ensure_configured_level, parse_tile_path, resolve_connection_string};
+use super::util::{
+    ensure_configured_level, ensure_subtree_root, parse_tile_path, resolve_connection_string,
+};
 
 pub(crate) async fn source_subtree(
     State(state): State<AppState>,
@@ -32,13 +34,7 @@ pub(crate) async fn default_subtree(
 
 async fn subtree_response(source: &SourceConfig, tile: TileCoord) -> Result<Response, RouteError> {
     ensure_configured_level(source, tile)?;
-
-    if tile != TileCoord::root() {
-        return Err(RouteError::not_found(format!(
-            "source only serves the root subtree at level={} x={} y={}",
-            tile.level, tile.x, tile.y
-        )));
-    }
+    ensure_subtree_root(source, tile)?;
 
     let connection = resolve_connection_string(&source.connection)?;
     let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
@@ -48,6 +44,12 @@ async fn subtree_response(source: &SourceConfig, tile: TileCoord) -> Result<Resp
         }
     });
     let availability = query_subtree_availability(&client, source, tile).await?;
+    if !availability.tile[0] {
+        return Err(RouteError::not_found(format!(
+            "subtree level={} x={} y={} has no available tiles",
+            tile.level, tile.x, tile.y
+        )));
+    }
 
     Ok(bytes_response(
         StatusCode::OK,

@@ -30,6 +30,20 @@ pub(crate) fn ensure_configured_level(
     Ok(())
 }
 
+pub(crate) fn ensure_subtree_root(
+    source: &SourceConfig,
+    tile: TileCoord,
+) -> Result<(), RouteError> {
+    if !tile.level.is_multiple_of(source.subtree_levels) {
+        return Err(RouteError::bad_request(format!(
+            "level {} is not a subtree root; expected a multiple of subtree_levels {}",
+            tile.level, source.subtree_levels
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn parse_tile_path(
     level: &str,
     x: &str,
@@ -86,12 +100,26 @@ mod tests {
             TileCoord::new(source.max_level, 0, 0).expect("max-level coordinate"),
         )
         .expect("max level should pass");
+        ensure_subtree_root(&source, TileCoord::root()).expect("root should pass");
+        ensure_subtree_root(
+            &source,
+            TileCoord::new(source.subtree_levels, 0, 0).expect("subtree coordinate"),
+        )
+        .expect("configured subtree boundary should pass");
 
         let above = TileCoord::new(source.max_level + 1, 0, 0).expect("coordinate should parse");
         let error = ensure_configured_level(&source, above).expect_err("level should be rejected");
         assert_eq!(
             error.into_response().status(),
             axum::http::StatusCode::NOT_FOUND
+        );
+
+        let non_root_level = TileCoord::new(1, 0, 0).expect("coordinate should parse");
+        let error =
+            ensure_subtree_root(&source, non_root_level).expect_err("level should be rejected");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
         );
 
         let mut nonzero_min = source;

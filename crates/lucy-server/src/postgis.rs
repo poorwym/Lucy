@@ -424,7 +424,9 @@ mod tests {
 
     use super::*;
     use lucy_core::source::SourceCatalog;
-    use lucy_core::subtree::{generate_subtree_bytes_with_availability, pack_availability_bits};
+    use lucy_core::subtree::{
+        generate_subtree_bytes_with_availability, pack_availability_bits, subtree_layout,
+    };
 
     fn fixture_catalog() -> SourceCatalog {
         let config_path =
@@ -601,8 +603,9 @@ mod tests {
                 .expect("sparse subtree should encode deterministically");
         assert_eq!(first, second);
 
-        let response = crate::server::build_app(fixture_catalog())
-            .expect("fixture app should build")
+        let app = crate::server::build_app(fixture_catalog()).expect("fixture app should build");
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/sources/poc_buildings/subtrees/0/0/0.subtree")
@@ -629,6 +632,83 @@ mod tests {
         assert_eq!(document["tileAvailability"]["availableCount"], 60);
         assert_eq!(document["contentAvailability"][0]["availableCount"], 60);
         assert_eq!(document["childSubtreeAvailability"]["availableCount"], 121);
+
+        let layout = subtree_layout(&source, TileCoord::root()).expect("root layout should build");
+        let occupied_child_index = availability
+            .child_subtree
+            .iter()
+            .position(|available| *available)
+            .expect("fixture should have an occupied child subtree");
+        let occupied_child = layout.child_roots[occupied_child_index]
+            .expect("occupied child slot should have a coordinate");
+        let scoped_path = format!(
+            "/sources/poc_buildings/subtrees/{}/{}/{}.subtree",
+            occupied_child.level, occupied_child.x, occupied_child.y
+        );
+        let scoped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&scoped_path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("non-root subtree request should route");
+        assert_eq!(scoped.status(), StatusCode::OK);
+        assert_eq!(
+            scoped
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let scoped_body = to_bytes(scoped.into_body(), usize::MAX)
+            .await
+            .expect("scoped subtree body should read");
+        assert_eq!(&scoped_body[0..4], b"subt");
+
+        let legacy_path = format!(
+            "/subtrees/{}/{}/{}.subtree",
+            occupied_child.level, occupied_child.x, occupied_child.y
+        );
+        let legacy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&legacy_path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("legacy non-root subtree request should route");
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let legacy_body = to_bytes(legacy.into_body(), usize::MAX)
+            .await
+            .expect("legacy subtree body should read");
+        assert_eq!(legacy_body, scoped_body);
+
+        let empty_child_index = availability
+            .child_subtree
+            .iter()
+            .position(|available| !*available)
+            .expect("fixture should have an empty child subtree");
+        let empty_child = layout.child_roots[empty_child_index]
+            .expect("empty child slot should have a coordinate");
+        let empty_path = format!(
+            "/sources/poc_buildings/subtrees/{}/{}/{}.subtree",
+            empty_child.level, empty_child.x, empty_child.y
+        );
+        let empty = app
+            .oneshot(
+                Request::builder()
+                    .uri(&empty_path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("empty subtree request should route");
+        assert_eq!(empty.status(), StatusCode::NOT_FOUND);
 
         let empty_tile = TileCoord::new(2, 0, 3).expect("valid empty fixture tile");
         let empty_features = query_tile_geometry_wkb(&client, &source, empty_tile)

@@ -116,7 +116,20 @@ mod tests {
         );
 
         let missing_subtree = request("/sources/poc_buildings/subtrees/1/0/0.subtree").await;
-        assert_eq!(missing_subtree.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing_subtree.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(missing_subtree).await;
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message should be a string")
+                .contains("not a subtree root")
+        );
+
+        let invalid_subtree_coord = request("/sources/poc_buildings/subtrees/4/16/0.subtree").await;
+        assert_eq!(invalid_subtree_coord.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(invalid_subtree_coord).await;
+        assert_eq!(body["error"]["code"], "bad_request");
 
         let subtree_above_max = request("/sources/poc_buildings/subtrees/20/0/0.subtree").await;
         assert_eq!(subtree_above_max.status(), StatusCode::NOT_FOUND);

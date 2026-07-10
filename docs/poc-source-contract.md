@@ -161,6 +161,13 @@ than shortening the arrays. Mixed arrays are encoded as Morton-ordered,
 little-endian bitstreams with 8-byte-aligned buffer views and deterministic
 padding.
 
+Both `/sources/{source_id}/subtrees/{level}/{x}/{y}.subtree` and the legacy
+default-source alias serve populated subtree roots at levels divisible by
+`subtree_levels`. Malformed coordinates and non-root levels return structured
+400 responses, configured-level misses return 404, and a direct request for an
+empty non-root subtree returns 404. Binary encoding and content type are the
+same for root and non-root responses.
+
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
@@ -252,8 +259,8 @@ introspection and later rendering work:
    configured SRID. P1.3 should verify table SRID at startup and decide whether
    non-4326 reprojection is in scope.
 2. `min_level` must be `0`; generalizing the implicit root to a nonzero level is
-   deferred. Non-root subtree generation exists, while non-root HTTP serving is
-   a separate follow-up.
+   deferred. Populated non-root subtree roots are served at configured subtree
+   boundaries.
 3. Runtime geometry filtering does not yet push `geometry_types` into SQL.
    P1.3 should validate table geometry types during startup and return clear
    source errors before tile requests.
