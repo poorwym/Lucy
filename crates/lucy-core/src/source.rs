@@ -7,7 +7,9 @@ use crate::tile::MAX_TILE_LEVEL;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
+pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
 pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
+pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree";
 pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -232,6 +234,10 @@ pub struct MaterialConfig {
 pub struct TilesetConfig {
     #[serde(default = "default_root_geometric_error_m")]
     pub root_geometric_error_m: f64,
+    #[serde(default = "default_content_uri_template")]
+    pub content_uri_template: String,
+    #[serde(default = "default_subtree_uri_template")]
+    pub subtree_uri_template: String,
 }
 
 impl TilesetConfig {
@@ -248,6 +254,17 @@ impl TilesetConfig {
             )));
         }
 
+        require_uri_template(
+            &self.content_uri_template,
+            source_id,
+            "tileset.content_uri_template",
+        )?;
+        require_uri_template(
+            &self.subtree_uri_template,
+            source_id,
+            "tileset.subtree_uri_template",
+        )?;
+
         Ok(())
     }
 }
@@ -256,12 +273,40 @@ impl Default for TilesetConfig {
     fn default() -> Self {
         Self {
             root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M,
+            content_uri_template: DEFAULT_CONTENT_URI_TEMPLATE.to_string(),
+            subtree_uri_template: DEFAULT_SUBTREE_URI_TEMPLATE.to_string(),
         }
     }
 }
 
 fn default_root_geometric_error_m() -> f64 {
     DEFAULT_ROOT_GEOMETRIC_ERROR_M
+}
+
+fn default_content_uri_template() -> String {
+    DEFAULT_CONTENT_URI_TEMPLATE.to_string()
+}
+
+fn default_subtree_uri_template() -> String {
+    DEFAULT_SUBTREE_URI_TEMPLATE.to_string()
+}
+
+fn require_uri_template(template: &str, source_id: &str, field: &str) -> Result<(), ConfigError> {
+    if template.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{source_id}: {field} must not be empty"
+        )));
+    }
+
+    for variable in ["{level}", "{x}", "{y}"] {
+        if !template.contains(variable) {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: {field} must contain {variable}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -330,6 +375,14 @@ mod tests {
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column, "height_m");
         assert_eq!(source.tileset.root_geometric_error_m, 512.0);
+        assert_eq!(
+            source.tileset.content_uri_template,
+            DEFAULT_CONTENT_URI_TEMPLATE
+        );
+        assert_eq!(
+            source.tileset.subtree_uri_template,
+            DEFAULT_SUBTREE_URI_TEMPLATE
+        );
     }
 
     #[test]
@@ -380,7 +433,9 @@ sources:
         assert_eq!(
             source.tileset,
             TilesetConfig {
-                root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M
+                root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M,
+                content_uri_template: DEFAULT_CONTENT_URI_TEMPLATE.to_string(),
+                subtree_uri_template: DEFAULT_SUBTREE_URI_TEMPLATE.to_string(),
             }
         );
     }
@@ -431,5 +486,28 @@ sources:
                 .to_string()
                 .contains("must be positive when max_level > min_level")
         );
+    }
+
+    #[test]
+    fn validates_tileset_uri_template_placeholders() {
+        for (field, original, configured) in [
+            (
+                "tileset.content_uri_template",
+                DEFAULT_CONTENT_URI_TEMPLATE,
+                "content/{level}/{x}/tile.glb",
+            ),
+            (
+                "tileset.subtree_uri_template",
+                DEFAULT_SUBTREE_URI_TEMPLATE,
+                "subtrees/{level}/{y}/tree.subtree",
+            ),
+        ] {
+            let raw =
+                include_str!("../../../config/poc-sources.yaml").replace(original, configured);
+            let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains("must contain"));
+        }
     }
 }

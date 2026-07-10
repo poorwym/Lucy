@@ -26,6 +26,8 @@ sources:
     max_features_per_tile: 1000
     tileset:
       root_geometric_error_m: 512.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
     attributes:
       - name
       - building_type

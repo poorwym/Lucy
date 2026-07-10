@@ -3,9 +3,9 @@ use serde::Serialize;
 use crate::source::{ConfigError, SourceBounds, SourceConfig};
 use crate::tile::TileCoord;
 
-pub use crate::source::DEFAULT_ROOT_GEOMETRIC_ERROR_M;
-pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
-pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree";
+pub use crate::source::{
+    DEFAULT_CONTENT_URI_TEMPLATE, DEFAULT_ROOT_GEOMETRIC_ERROR_M, DEFAULT_SUBTREE_URI_TEMPLATE,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TilesetOptions {
@@ -28,7 +28,8 @@ impl TilesetOptions {
     pub fn from_source(source: &SourceConfig) -> Self {
         Self {
             root_geometric_error_m: source.tileset.root_geometric_error_m,
-            ..Self::default()
+            content_uri_template: source.tileset.content_uri_template.clone(),
+            subtree_uri_template: source.tileset.subtree_uri_template.clone(),
         }
     }
 
@@ -285,6 +286,8 @@ mod tests {
     fn configured_root_error_drives_implicit_lod_sequence() {
         let mut source = fixture_source();
         source.tileset.root_geometric_error_m = 256.0;
+        source.tileset.content_uri_template = "tiles/{level}/{x}/{y}.glb".to_string();
+        source.tileset.subtree_uri_template = "trees/{level}/{x}/{y}.subtree".to_string();
         let options = TilesetOptions::from_source(&source);
         let tileset = generate_tileset(&source, &options).expect("tileset should generate");
 
@@ -300,6 +303,11 @@ mod tests {
             0.00390625
         );
         assert_eq!(tileset.root.refine, Refine::Replace);
+        assert_eq!(tileset.root.content.uri, "tiles/{level}/{x}/{y}.glb");
+        assert_eq!(
+            tileset.root.implicit_tiling.subtrees.uri,
+            "trees/{level}/{x}/{y}.subtree"
+        );
         assert_eq!(tileset.root.implicit_tiling.available_levels, 17);
         assert_eq!(tileset.root.implicit_tiling.subtree_levels, 4);
     }

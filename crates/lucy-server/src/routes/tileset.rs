@@ -46,6 +46,9 @@ mod tests {
             .remove("poc_buildings")
             .expect("poc source should exist");
         source.tileset.root_geometric_error_m = 128.0;
+        source.tileset.content_uri_template = "generated-content/{level}/{x}/{y}.glb".to_string();
+        source.tileset.subtree_uri_template =
+            "generated-subtrees/{level}/{x}/{y}.subtree".to_string();
 
         let response = tileset_response(&source).expect("response should generate");
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -56,5 +59,13 @@ mod tests {
 
         assert_eq!(document["geometricError"], 128.0);
         assert_eq!(document["root"]["geometricError"], 128.0);
+        assert_eq!(
+            document["root"]["content"]["uri"],
+            "generated-content/{level}/{x}/{y}.glb"
+        );
+        assert_eq!(
+            document["root"]["implicitTiling"]["subtrees"]["uri"],
+            "generated-subtrees/{level}/{x}/{y}.subtree"
+        );
     }
 }

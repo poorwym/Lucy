@@ -190,6 +190,15 @@ their parent rather than as an additive layer. `availableLevels = max_level +
 provide the traversal stop; a nonzero geometric error at the deepest tile does
 not advertise another level.
 
+Content and subtree URI templates are also source-level generation options:
+`tileset.content_uri_template` and `tileset.subtree_uri_template`. Both must
+contain `{level}`, `{x}`, and `{y}`. The defaults map directly to Lucy's built-in
+relative routes and preserve existing configs. Custom templates are emitted
+verbatim for deployments that provide matching proxy or application routes;
+they do not create new Axum routes. Process concerns such as the listen address,
+config path, and CORS policy remain global server settings rather than source
+metadata.
+
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
@@ -235,6 +244,8 @@ sources:
     max_features_per_tile: 1000
     tileset:
       root_geometric_error_m: 512.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
     attributes:
       - name
       - building_type
@@ -271,6 +282,8 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
 | `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
 | `tileset.root_geometric_error_m` | Drives both emitted root error values and the implicit `root / 2^level` LOD sequence; defaults to `512.0`. |
+| `tileset.content_uri_template` | Emitted as the implicit content URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in content route. |
+| `tileset.subtree_uri_template` | Emitted as the subtree URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in subtree route. |
 | `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
 | `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |
 | `material.default_base_color` | Parsed, but not consumed by GLB generation yet because Phase 0 emits position-only GLB meshes. |
