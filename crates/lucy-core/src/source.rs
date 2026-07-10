@@ -7,6 +7,7 @@ use crate::tile::MAX_TILE_LEVEL;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
+pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
 pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,6 +57,8 @@ pub struct SourceConfig {
     pub max_level: u8,
     pub subtree_levels: u8,
     pub max_features_per_tile: u32,
+    #[serde(default)]
+    pub tileset: TilesetConfig,
     #[serde(default)]
     pub attributes: Vec<String>,
     pub material: MaterialConfig,
@@ -142,6 +145,9 @@ impl SourceConfig {
             )));
         }
 
+        self.tileset
+            .validate(source_id, self.max_level > self.min_level)?;
+
         self.bounds.validate(source_id)?;
         Ok(())
     }
@@ -222,6 +228,42 @@ pub struct MaterialConfig {
     pub default_base_color: [f32; 4],
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TilesetConfig {
+    #[serde(default = "default_root_geometric_error_m")]
+    pub root_geometric_error_m: f64,
+}
+
+impl TilesetConfig {
+    fn validate(&self, source_id: &str, has_descendants: bool) -> Result<(), ConfigError> {
+        if !self.root_geometric_error_m.is_finite() || self.root_geometric_error_m < 0.0 {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: tileset.root_geometric_error_m must be finite and nonnegative"
+            )));
+        }
+
+        if has_descendants && self.root_geometric_error_m == 0.0 {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: tileset.root_geometric_error_m must be positive when max_level > min_level"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for TilesetConfig {
+    fn default() -> Self {
+        Self {
+            root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M,
+        }
+    }
+}
+
+fn default_root_geometric_error_m() -> f64 {
+    DEFAULT_ROOT_GEOMETRIC_ERROR_M
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Parse { source: serde_yaml::Error },
@@ -287,6 +329,7 @@ mod tests {
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column, "height_m");
+        assert_eq!(source.tileset.root_geometric_error_m, 512.0);
     }
 
     #[test]
@@ -334,6 +377,12 @@ sources:
             source.content_query_attributes(),
             vec!["name", "top_delta_m", "bottom_m"]
         );
+        assert_eq!(
+            source.tileset,
+            TilesetConfig {
+                root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M
+            }
+        );
     }
 
     #[test]
@@ -361,5 +410,26 @@ sources:
         let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
 
         assert!(error.to_string().contains("max_level must be <= 31"));
+    }
+
+    #[test]
+    fn validates_configured_root_geometric_error() {
+        let negative = include_str!("../../../config/poc-sources.yaml").replace(
+            "root_geometric_error_m: 512.0",
+            "root_geometric_error_m: -1.0",
+        );
+        let error = SourceCatalog::from_yaml_str(&negative).expect_err("config should be rejected");
+        assert!(error.to_string().contains("finite and nonnegative"));
+
+        let zero = include_str!("../../../config/poc-sources.yaml").replace(
+            "root_geometric_error_m: 512.0",
+            "root_geometric_error_m: 0.0",
+        );
+        let error = SourceCatalog::from_yaml_str(&zero).expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must be positive when max_level > min_level")
+        );
     }
 }

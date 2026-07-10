@@ -21,10 +21,40 @@ pub(crate) async fn default_tileset(State(state): State<AppState>) -> Result<Res
 }
 
 fn tileset_response(source: &SourceConfig) -> Result<Response, RouteError> {
-    let json = generate_tileset_json(source, &TilesetOptions::default())?;
+    let json = generate_tileset_json(source, &TilesetOptions::from_source(source))?;
     Ok(bytes_response(
         StatusCode::OK,
         "application/json",
         json.into_bytes(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+    use lucy_core::source::SourceCatalog;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn tileset_response_uses_source_geometric_error() {
+        let mut catalog =
+            SourceCatalog::from_yaml_str(include_str!("../../../../config/poc-sources.yaml"))
+                .expect("fixture config should load");
+        let mut source = catalog
+            .sources
+            .remove("poc_buildings")
+            .expect("poc source should exist");
+        source.tileset.root_geometric_error_m = 128.0;
+
+        let response = tileset_response(&source).expect("response should generate");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).expect("tileset JSON should parse");
+
+        assert_eq!(document["geometricError"], 128.0);
+        assert_eq!(document["root"]["geometricError"], 128.0);
+    }
 }

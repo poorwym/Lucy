@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::source::{ConfigError, SourceBounds, SourceConfig};
 use crate::tile::TileCoord;
 
-pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
+pub use crate::source::DEFAULT_ROOT_GEOMETRIC_ERROR_M;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
 pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree";
 
@@ -21,6 +21,20 @@ impl Default for TilesetOptions {
             content_uri_template: DEFAULT_CONTENT_URI_TEMPLATE.to_string(),
             subtree_uri_template: DEFAULT_SUBTREE_URI_TEMPLATE.to_string(),
         }
+    }
+}
+
+impl TilesetOptions {
+    pub fn from_source(source: &SourceConfig) -> Self {
+        Self {
+            root_geometric_error_m: source.tileset.root_geometric_error_m,
+            ..Self::default()
+        }
+    }
+
+    pub fn geometric_error_at_level(&self, level: u8) -> Result<f64, ConfigError> {
+        validate_root_geometric_error(self.root_geometric_error_m, false)?;
+        Ok(self.root_geometric_error_m / 2_f64.powi(i32::from(level)))
     }
 }
 
@@ -44,11 +58,11 @@ pub fn generate_tileset(
         ));
     }
 
-    if !options.root_geometric_error_m.is_finite() || options.root_geometric_error_m < 0.0 {
-        return Err(ConfigError::Validation(
-            "root_geometric_error_m must be finite and nonnegative".to_string(),
-        ));
-    }
+    validate_root_geometric_error(
+        options.root_geometric_error_m,
+        source.max_level > source.min_level,
+    )?;
+    options.geometric_error_at_level(source.max_level)?;
 
     require_template(&options.content_uri_template, "content_uri_template")?;
     require_template(&options.subtree_uri_template, "subtree_uri_template")?;
@@ -82,6 +96,25 @@ pub fn generate_tileset(
             },
         },
     })
+}
+
+fn validate_root_geometric_error(
+    root_geometric_error_m: f64,
+    has_descendants: bool,
+) -> Result<(), ConfigError> {
+    if !root_geometric_error_m.is_finite() || root_geometric_error_m < 0.0 {
+        return Err(ConfigError::Validation(
+            "root_geometric_error_m must be finite and nonnegative".to_string(),
+        ));
+    }
+
+    if has_descendants && root_geometric_error_m == 0.0 {
+        return Err(ConfigError::Validation(
+            "root_geometric_error_m must be positive when the tileset has descendants".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -246,6 +279,41 @@ mod tests {
             tileset.root.implicit_tiling.subtrees.uri,
             "subtrees/{level}/{x}/{y}.subtree"
         );
+    }
+
+    #[test]
+    fn configured_root_error_drives_implicit_lod_sequence() {
+        let mut source = fixture_source();
+        source.tileset.root_geometric_error_m = 256.0;
+        let options = TilesetOptions::from_source(&source);
+        let tileset = generate_tileset(&source, &options).expect("tileset should generate");
+
+        assert_eq!(tileset.geometric_error, 256.0);
+        assert_eq!(tileset.root.geometric_error, 256.0);
+        assert_eq!(options.geometric_error_at_level(0).expect("level 0"), 256.0);
+        assert_eq!(options.geometric_error_at_level(1).expect("level 1"), 128.0);
+        assert_eq!(options.geometric_error_at_level(4).expect("level 4"), 16.0);
+        assert_eq!(
+            options
+                .geometric_error_at_level(source.max_level)
+                .expect("leaf level"),
+            0.00390625
+        );
+        assert_eq!(tileset.root.refine, Refine::Replace);
+        assert_eq!(tileset.root.implicit_tiling.available_levels, 17);
+        assert_eq!(tileset.root.implicit_tiling.subtree_levels, 4);
+    }
+
+    #[test]
+    fn rejects_zero_error_for_a_tileset_with_descendants() {
+        let source = fixture_source();
+        let options = TilesetOptions {
+            root_geometric_error_m: 0.0,
+            ..TilesetOptions::default()
+        };
+
+        let error = generate_tileset(&source, &options).expect_err("error should be rejected");
+        assert!(error.to_string().contains("positive"));
     }
 
     #[test]

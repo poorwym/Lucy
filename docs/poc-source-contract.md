@@ -23,6 +23,7 @@ config in `config/poc-sources.yaml`.
 | Max level | `16` |
 | Subtree levels | `4` |
 | Feature limit | `1000` features per tile |
+| Root geometric error | `512.0` meters |
 
 ## Sample Table Schema
 
@@ -168,6 +169,27 @@ default-source alias serve populated subtree roots at levels divisible by
 empty non-root subtree returns 404. Binary encoding and content type are the
 same for root and non-root responses.
 
+## Geometric Error and LOD Policy
+
+Each source configures `tileset.root_geometric_error_m`. Lucy writes that value
+to both the tileset-level and root-tile `geometricError`; multi-level sources
+require a finite positive value. Existing configs that omit the nested
+`tileset` object retain the safe `512.0` meter default.
+
+The [3D Tiles 1.1 implicit tiling
+rules](https://docs.ogc.org/cs/22-025r4/22-025r4.html) derive each child's error
+as half its parent's error. Lucy therefore defines the absolute-level sequence
+as `error(level) = root_geometric_error_m / 2^level`. Subtree boundaries do not
+restart that sequence. With the fixture values, level 4 is `32.0` meters and
+level 16 is `0.0078125` meters.
+
+The root uses `REPLACE` refinement. Parent and child content are alternate HLOD
+representations: once selected descendants are ready, they render in place of
+their parent rather than as an additive layer. `availableLevels = max_level +
+1`, final-partial zero bits, and zero child-subtree bits beyond `max_level`
+provide the traversal stop; a nonzero geometric error at the deepest tile does
+not advertise another level.
+
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
@@ -211,6 +233,8 @@ sources:
     max_level: 16
     subtree_levels: 4
     max_features_per_tile: 1000
+    tileset:
+      root_geometric_error_m: 512.0
     attributes:
       - name
       - building_type
@@ -246,6 +270,7 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, final-partial clipping, terminal overflow detection, and child-subtree availability. |
 | `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
 | `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
+| `tileset.root_geometric_error_m` | Drives both emitted root error values and the implicit `root / 2^level` LOD sequence; defaults to `512.0`. |
 | `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
 | `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |
 | `material.default_base_color` | Parsed, but not consumed by GLB generation yet because Phase 0 emits position-only GLB meshes. |

@@ -24,6 +24,8 @@ sources:
     max_level: 16
     subtree_levels: 4
     max_features_per_tile: 1000
+    tileset:
+      root_geometric_error_m: 512.0
     attributes:
       - name
       - building_type
