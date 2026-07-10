@@ -1,8 +1,45 @@
 sources:
-  poc_buildings:
+  # poc_buildings:
+  #   connection: ${DATABASE_URL}
+  #   schema: public
+  #   table: poc_buildings
+  #   geometry_column: geom
+  #   id_column: id
+  #   srid: 4326
+  #   source_model: extruded_footprint
+  #   vertical_reference: local_ground_meters
+  #   base_height_column: base_height_m # Zero if this field is not present in the source table
+  #   height_column: height_m
+  #   geometry_types:
+  #     - Polygon
+  #     - MultiPolygon
+  #   bounds:
+  #     west: -122.40130
+  #     south: 37.79245
+  #     east: -122.39975
+  #     north: 37.79375
+  #     min_height_m: 0.0
+  #     max_height_m: 100.0
+  #   min_level: 0
+  #   max_level: 16
+  #   subtree_levels: 4
+  #   max_features_per_tile: 1000
+  #   tileset:
+  #     root_geometric_error_m: 512.0
+  #     content_uri_template: "content/{level}/{x}/{y}.glb"
+  #     subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
+  #   attributes:
+  #     - name
+  #     - building_type
+  #     - base_height_m
+  #     - height_m
+  #   material:
+  #     color_column: color
+  #     default_base_color: [0.72, 0.70, 0.65, 1.0]
+  controlled_airspace:
     connection: ${DATABASE_URL}
     schema: public
-    table: poc_buildings
+    table: controlledairspace
     geometry_column: geom
     id_column: id
     srid: 4326
@@ -14,12 +51,12 @@ sources:
       - Polygon
       - MultiPolygon
     bounds:
-      west: -122.40130
-      south: 37.79245
-      east: -122.39975
-      north: 37.79375
+      west: -180
+      south: -90
+      east: 180
+      north: 90
       min_height_m: 0.0
-      max_height_m: 100.0
+      max_height_m: 50000
     min_level: 0
     max_level: 16
     subtree_levels: 4
@@ -29,10 +66,7 @@ sources:
       content_uri_template: "content/{level}/{x}/{y}.glb"
       subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
     attributes:
-      - name
-      - building_type
       - base_height_m
       - height_m
     material:
-      color_column: color
-      default_base_color: [0.72, 0.70, 0.65, 1.0]
+      default_base_color: [0.72, 0.70, 0.65, 0.5]
