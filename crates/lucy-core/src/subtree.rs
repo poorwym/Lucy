@@ -1,41 +1,74 @@
 use serde::Serialize;
 
 use crate::source::{ConfigError, SourceConfig};
+use crate::tile::TileCoord;
 
 const SUBTREE_MAGIC: &[u8; 4] = b"subt";
 const SUBTREE_VERSION: u32 = 1;
 const BYTE_ALIGNMENT: usize = 8;
 
 pub fn generate_root_subtree_json(source: &SourceConfig) -> Result<String, ConfigError> {
-    let subtree = generate_root_subtree(source)?;
+    generate_subtree_json(source, TileCoord::root())
+}
+
+pub fn generate_subtree_json(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<String, ConfigError> {
+    let subtree = generate_subtree(source, subtree_root)?;
 
     serde_json::to_string_pretty(&subtree)
         .map_err(|error| ConfigError::Validation(format!("failed to encode subtree JSON: {error}")))
 }
 
 pub fn generate_root_subtree_bytes(source: &SourceConfig) -> Result<Vec<u8>, ConfigError> {
-    let json = generate_root_subtree_json(source)?;
-    Ok(encode_subtree_binary(json.as_bytes()))
+    generate_subtree_bytes(source, TileCoord::root())
+}
+
+pub fn generate_subtree_bytes(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<Vec<u8>, ConfigError> {
+    let subtree = generate_subtree(source, subtree_root)?;
+    let json = serde_json::to_vec_pretty(&subtree).map_err(|error| {
+        ConfigError::Validation(format!("failed to encode subtree JSON: {error}"))
+    })?;
+
+    Ok(encode_subtree_binary_with_buffer(&json, &subtree.binary))
 }
 
 pub fn encode_subtree_binary(json: &[u8]) -> Vec<u8> {
+    encode_subtree_binary_with_buffer(json, &[])
+}
+
+fn encode_subtree_binary_with_buffer(json: &[u8], binary: &[u8]) -> Vec<u8> {
     let padded_json_length = padded_len(json.len(), BYTE_ALIGNMENT);
-    let mut bytes = Vec::with_capacity(24 + padded_json_length);
+    let padded_binary_length = padded_len(binary.len(), BYTE_ALIGNMENT);
+    let mut bytes = Vec::with_capacity(24 + padded_json_length + padded_binary_length);
 
     bytes.extend_from_slice(SUBTREE_MAGIC);
     bytes.extend_from_slice(&SUBTREE_VERSION.to_le_bytes());
     bytes.extend_from_slice(&(padded_json_length as u64).to_le_bytes());
-    bytes.extend_from_slice(&0_u64.to_le_bytes());
+    bytes.extend_from_slice(&(padded_binary_length as u64).to_le_bytes());
     bytes.extend_from_slice(json);
     bytes.extend(std::iter::repeat_n(b' ', padded_json_length - json.len()));
+    bytes.extend_from_slice(binary);
+    bytes.extend(std::iter::repeat_n(0, padded_binary_length - binary.len()));
 
     bytes
 }
 
 pub fn generate_root_subtree(source: &SourceConfig) -> Result<Subtree, ConfigError> {
+    generate_subtree(source, TileCoord::root())
+}
+
+pub fn generate_subtree(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<Subtree, ConfigError> {
     if source.min_level != 0 {
         return Err(ConfigError::Validation(
-            "Phase 0 root subtree generation requires min_level = 0".to_string(),
+            "implicit subtree generation requires min_level = 0".to_string(),
         ));
     }
 
@@ -45,33 +78,122 @@ pub fn generate_root_subtree(source: &SourceConfig) -> Result<Subtree, ConfigErr
         ));
     }
 
-    let child_subtrees_available =
-        u8::from(u32::from(source.max_level) + 1 > u32::from(source.subtree_levels));
+    if subtree_root.level < source.min_level || subtree_root.level > source.max_level {
+        return Err(ConfigError::Validation(format!(
+            "subtree root level {} is outside configured levels {}..={}",
+            subtree_root.level, source.min_level, source.max_level
+        )));
+    }
+
+    if !subtree_root.level.is_multiple_of(source.subtree_levels) {
+        return Err(ConfigError::Validation(format!(
+            "level {} is not a subtree root; expected a multiple of subtree_levels {}",
+            subtree_root.level, source.subtree_levels
+        )));
+    }
+
+    let remaining_levels = u16::from(source.max_level) - u16::from(subtree_root.level) + 1;
+    let local_available_levels =
+        u8::try_from(remaining_levels.min(u16::from(source.subtree_levels)))
+            .expect("subtree level count is bounded by u8");
+    let next_subtree_level = u16::from(subtree_root.level) + u16::from(source.subtree_levels);
+    let child_subtrees_available = u8::from(next_subtree_level <= u16::from(source.max_level));
+
+    let (buffers, buffer_views, binary, tile_availability, content_availability) =
+        if local_available_levels == source.subtree_levels {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Availability::constant(1),
+                Availability::constant(1),
+            )
+        } else {
+            let total_node_count = quadtree_node_count(source.subtree_levels)?;
+            let available_node_count = quadtree_node_count(local_available_levels)?;
+            let mut bits = vec![false; total_node_count];
+            bits[..available_node_count].fill(true);
+            let binary = pack_availability_bits(&bits);
+            let byte_length = binary.len();
+            let availability = Availability::bitstream(0, available_node_count);
+
+            (
+                vec![SubtreeBuffer { byte_length }],
+                vec![SubtreeBufferView {
+                    buffer: 0,
+                    byte_offset: 0,
+                    byte_length,
+                }],
+                binary,
+                availability.clone(),
+                availability,
+            )
+        };
 
     Ok(Subtree {
-        tile_availability: Availability::constant(1),
-        content_availability: vec![Availability::constant(1)],
+        buffers,
+        buffer_views,
+        tile_availability,
+        content_availability: vec![content_availability],
         child_subtree_availability: Availability::constant(child_subtrees_available),
+        binary,
     })
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Subtree {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<SubtreeBuffer>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub buffer_views: Vec<SubtreeBufferView>,
     pub tile_availability: Availability,
     pub content_availability: Vec<Availability>,
     pub child_subtree_availability: Availability,
+    #[serde(skip)]
+    pub binary: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SubtreeBuffer {
+    pub byte_length: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtreeBufferView {
+    pub buffer: usize,
+    pub byte_offset: usize,
+    pub byte_length: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Availability {
-    pub constant: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constant: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitstream: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_count: Option<usize>,
 }
 
 impl Availability {
     fn constant(value: u8) -> Self {
-        Self { constant: value }
+        Self {
+            constant: Some(value),
+            bitstream: None,
+            available_count: None,
+        }
+    }
+
+    fn bitstream(bitstream: usize, available_count: usize) -> Self {
+        Self {
+            constant: None,
+            bitstream: Some(bitstream),
+            available_count: Some(available_count),
+        }
     }
 }
 
@@ -173,6 +295,65 @@ mod tests {
         let expected = include_str!("../tests/golden/poc_buildings_root.subtree.json").trim_end();
 
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn generates_first_non_root_subtree() {
+        let source = fixture_source();
+        let subtree_root = TileCoord::new(source.subtree_levels, 3, 7).expect("valid root");
+        let subtree = generate_subtree(&source, subtree_root).expect("subtree should generate");
+
+        assert_eq!(subtree.tile_availability, Availability::constant(1));
+        assert_eq!(
+            subtree.content_availability,
+            vec![Availability::constant(1)]
+        );
+        assert_eq!(
+            subtree.child_subtree_availability,
+            Availability::constant(1)
+        );
+        assert!(subtree.buffers.is_empty());
+        assert!(subtree.binary.is_empty());
+    }
+
+    #[test]
+    fn clips_final_partial_subtree_at_max_level() {
+        let mut source = fixture_source();
+        source.max_level = 5;
+        let subtree_root = TileCoord::new(4, 9, 6).expect("valid root");
+        let subtree = generate_subtree(&source, subtree_root).expect("subtree should generate");
+
+        assert_eq!(subtree.tile_availability, Availability::bitstream(0, 5));
+        assert_eq!(
+            subtree.content_availability,
+            vec![Availability::bitstream(0, 5)]
+        );
+        assert_eq!(
+            subtree.child_subtree_availability,
+            Availability::constant(0)
+        );
+        assert_eq!(subtree.buffers[0].byte_length, 11);
+        assert_eq!(subtree.buffer_views[0].byte_length, 11);
+        assert_eq!(subtree.binary.len(), 11);
+        assert_eq!(subtree.binary[0], 0b0001_1111);
+        assert!(subtree.binary[1..].iter().all(|byte| *byte == 0));
+
+        let bytes = generate_subtree_bytes(&source, subtree_root).expect("binary subtree");
+        let binary_byte_len = u64::from_le_bytes(bytes[16..24].try_into().expect("binary length"));
+        assert_eq!(binary_byte_len, 16);
+    }
+
+    #[test]
+    fn rejects_non_root_levels_and_levels_outside_source_bounds() {
+        let source = fixture_source();
+        let non_root = TileCoord::new(1, 0, 0).expect("valid tile coordinate");
+        let error = generate_subtree(&source, non_root).expect_err("level should be rejected");
+        assert!(error.to_string().contains("not a subtree root"));
+
+        let beyond_max = TileCoord::new(20, 0, 0).expect("valid tile coordinate");
+        let error =
+            generate_subtree(&source, beyond_max).expect_err("level should be rejected early");
+        assert!(error.to_string().contains("outside configured levels"));
     }
 
     #[test]
