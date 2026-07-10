@@ -139,6 +139,28 @@ exists, the entire content request fails with the structured
 caller can request deeper tiles while the configured `max_level` permits it; an
 overflow at the deepest level requires changing the data or configuration.
 
+## Sparse Subtree Availability
+
+Subtree availability is derived from the same positive-area clipping predicate
+as content. Lucy sends the bounding boxes for every valid local tile and child
+subtree root to PostGIS as arrays and receives all capped feature counts in one
+ordered query. With the default `subtree_levels: 4`, this covers 85 local tiles
+and 256 child roots in one database round trip instead of one query per tile.
+
+An occupied tile is tile-available. It is content-available only when its count
+does not exceed `max_features_per_tile`; an overflowing non-leaf remains
+tile-available so traversal can continue into descendants. Overflow at
+`max_level` is a terminal `tile_overflow` error because it cannot be resolved by
+subdivision. Child subtree bits are set only for occupied child roots at or
+below `max_level`. Empty regions remain zero, while the global implicit root
+tile remains available even for an empty source.
+
+Availability arrays always retain the fixed size required by the configured
+`subtree_levels`. Final partial subtrees clear bits beyond `max_level` rather
+than shortening the arrays. Mixed arrays are encoded as Morton-ordered,
+little-endian bitstreams with 8-byte-aligned buffer views and deterministic
+padding.
+
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
@@ -214,8 +236,8 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
 | `bounds` | Drives root tileset region, tile coordinate bbox mapping, local mesh frame origin, tileset transform origin, and vertical bounding interval. |
 | `min_level` | Validated and currently required to be `0` by root tileset/subtree generation. |
-| `max_level` | Drives implicit tileset `availableLevels` and root subtree child-subtree availability. |
-| `subtree_levels` | Drives implicit tileset `subtreeLevels` and subtree availability calculations. |
+| `max_level` | Drives implicit tileset `availableLevels`, final-partial clipping, terminal overflow detection, and child-subtree availability. |
+| `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
 | `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
 | `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
 | `material.color_column` | Parsed and identifier-validated, but not consumed by GLB generation yet. |

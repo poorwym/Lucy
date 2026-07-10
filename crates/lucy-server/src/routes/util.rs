@@ -2,6 +2,19 @@ use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
 
+pub(crate) fn resolve_connection_string(connection: &str) -> Result<String, RouteError> {
+    let trimmed = connection.trim();
+    if trimmed == "${DATABASE_URL}" {
+        std::env::var("DATABASE_URL").map_err(|error| {
+            RouteError::config(format!(
+                "DATABASE_URL is required by source connection: {error}"
+            ))
+        })
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 pub(crate) fn parse_tile_path(
     level: &str,
     x: &str,

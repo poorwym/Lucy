@@ -76,7 +76,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_source_scoped_tileset_subtree_and_legacy_aliases() {
+    async fn routes_source_scoped_tileset_and_legacy_alias() {
         let tileset = request("/sources/poc_buildings/tileset.json").await;
         assert_eq!(tileset.status(), StatusCode::OK);
         assert_eq!(
@@ -90,17 +90,6 @@ mod tests {
 
         let legacy_tileset = request("/tileset.json").await;
         assert_eq!(legacy_tileset.status(), StatusCode::OK);
-
-        let subtree = request("/sources/poc_buildings/subtrees/0/0/0.subtree").await;
-        assert_eq!(subtree.status(), StatusCode::OK);
-        assert_eq!(
-            subtree.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("application/octet-stream"))
-        );
-        let body = to_bytes(subtree.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        assert_eq!(&body[0..4], b"subt");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::source::{ConfigError, SourceConfig};
+use crate::source::{ConfigError, MAX_SUBTREE_LEVELS, SourceConfig};
 use crate::tile::TileCoord;
 
 const SUBTREE_MAGIC: &[u8; 4] = b"subt";
@@ -30,6 +30,19 @@ pub fn generate_subtree_bytes(
     subtree_root: TileCoord,
 ) -> Result<Vec<u8>, ConfigError> {
     let subtree = generate_subtree(source, subtree_root)?;
+    encode_generated_subtree(&subtree)
+}
+
+pub fn generate_subtree_bytes_with_availability(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+    availability: &SubtreeAvailabilityBits,
+) -> Result<Vec<u8>, ConfigError> {
+    let subtree = generate_subtree_with_availability(source, subtree_root, availability)?;
+    encode_generated_subtree(&subtree)
+}
+
+fn encode_generated_subtree(subtree: &Subtree) -> Result<Vec<u8>, ConfigError> {
     let json = serde_json::to_vec_pretty(&subtree).map_err(|error| {
         ConfigError::Validation(format!("failed to encode subtree JSON: {error}"))
     })?;
@@ -66,6 +79,104 @@ pub fn generate_subtree(
     source: &SourceConfig,
     subtree_root: TileCoord,
 ) -> Result<Subtree, ConfigError> {
+    let layout = subtree_layout(source, subtree_root)?;
+    let availability = SubtreeAvailabilityBits {
+        tile: layout.local_tiles.iter().map(Option::is_some).collect(),
+        content: layout.local_tiles.iter().map(Option::is_some).collect(),
+        child_subtree: layout.child_roots.iter().map(Option::is_some).collect(),
+    };
+
+    generate_subtree_with_availability(source, subtree_root, &availability)
+}
+
+pub fn subtree_layout(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<SubtreeLayout, ConfigError> {
+    validate_subtree_root(source, subtree_root)?;
+
+    if source.subtree_levels > MAX_SUBTREE_LEVELS {
+        return Err(ConfigError::Validation(format!(
+            "subtree_levels greater than {MAX_SUBTREE_LEVELS} would create impractically large availability arrays"
+        )));
+    }
+
+    let mut local_tiles = vec![None; quadtree_node_count(source.subtree_levels)?];
+    for local_level in 0..source.subtree_levels {
+        let absolute_level = u16::from(subtree_root.level) + u16::from(local_level);
+        if absolute_level > u16::from(source.max_level) {
+            continue;
+        }
+
+        let width = 1_u32
+            .checked_shl(u32::from(local_level))
+            .ok_or_else(|| ConfigError::Validation("local_level is too deep".to_string()))?;
+        for local_y in 0..width {
+            for local_x in 0..width {
+                let index = quadtree_availability_index(local_level, local_x, local_y)?;
+                local_tiles[index] = Some(descendant_coord(
+                    subtree_root,
+                    local_level,
+                    local_x,
+                    local_y,
+                )?);
+            }
+        }
+    }
+
+    let mut child_roots = vec![None; quadtree_child_subtree_count(source.subtree_levels)?];
+    let child_level = u16::from(subtree_root.level) + u16::from(source.subtree_levels);
+    if child_level <= u16::from(source.max_level) {
+        let width = 1_u32
+            .checked_shl(u32::from(source.subtree_levels))
+            .ok_or_else(|| ConfigError::Validation("subtree_levels is too deep".to_string()))?;
+        for local_y in 0..width {
+            for local_x in 0..width {
+                let index = morton_index_2d(local_x, local_y);
+                child_roots[index] = Some(descendant_coord(
+                    subtree_root,
+                    source.subtree_levels,
+                    local_x,
+                    local_y,
+                )?);
+            }
+        }
+    }
+
+    Ok(SubtreeLayout {
+        local_tiles,
+        child_roots,
+    })
+}
+
+pub fn generate_subtree_with_availability(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+    availability: &SubtreeAvailabilityBits,
+) -> Result<Subtree, ConfigError> {
+    let layout = subtree_layout(source, subtree_root)?;
+    validate_availability(source, &layout, availability)?;
+
+    let mut builder = AvailabilityBuilder::default();
+    let tile_availability = builder.append(&availability.tile);
+    let content_availability = builder.append(&availability.content);
+    let child_subtree_availability = builder.append(&availability.child_subtree);
+    let (buffers, buffer_views, binary) = builder.finish();
+
+    Ok(Subtree {
+        buffers,
+        buffer_views,
+        tile_availability,
+        content_availability: vec![content_availability],
+        child_subtree_availability,
+        binary,
+    })
+}
+
+fn validate_subtree_root(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<(), ConfigError> {
     if source.min_level != 0 {
         return Err(ConfigError::Validation(
             "implicit subtree generation requires min_level = 0".to_string(),
@@ -92,52 +203,20 @@ pub fn generate_subtree(
         )));
     }
 
-    let remaining_levels = u16::from(source.max_level) - u16::from(subtree_root.level) + 1;
-    let local_available_levels =
-        u8::try_from(remaining_levels.min(u16::from(source.subtree_levels)))
-            .expect("subtree level count is bounded by u8");
-    let next_subtree_level = u16::from(subtree_root.level) + u16::from(source.subtree_levels);
-    let child_subtrees_available = u8::from(next_subtree_level <= u16::from(source.max_level));
+    Ok(())
+}
 
-    let (buffers, buffer_views, binary, tile_availability, content_availability) =
-        if local_available_levels == source.subtree_levels {
-            (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Availability::constant(1),
-                Availability::constant(1),
-            )
-        } else {
-            let total_node_count = quadtree_node_count(source.subtree_levels)?;
-            let available_node_count = quadtree_node_count(local_available_levels)?;
-            let mut bits = vec![false; total_node_count];
-            bits[..available_node_count].fill(true);
-            let binary = pack_availability_bits(&bits);
-            let byte_length = binary.len();
-            let availability = Availability::bitstream(0, available_node_count);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtreeLayout {
+    pub local_tiles: Vec<Option<TileCoord>>,
+    pub child_roots: Vec<Option<TileCoord>>,
+}
 
-            (
-                vec![SubtreeBuffer { byte_length }],
-                vec![SubtreeBufferView {
-                    buffer: 0,
-                    byte_offset: 0,
-                    byte_length,
-                }],
-                binary,
-                availability.clone(),
-                availability,
-            )
-        };
-
-    Ok(Subtree {
-        buffers,
-        buffer_views,
-        tile_availability,
-        content_availability: vec![content_availability],
-        child_subtree_availability: Availability::constant(child_subtrees_available),
-        binary,
-    })
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtreeAvailabilityBits {
+    pub tile: Vec<bool>,
+    pub content: Vec<bool>,
+    pub child_subtree: Vec<bool>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -195,6 +274,178 @@ impl Availability {
             available_count: Some(available_count),
         }
     }
+}
+
+#[derive(Default)]
+struct AvailabilityBuilder {
+    buffer_views: Vec<SubtreeBufferView>,
+    binary: Vec<u8>,
+}
+
+impl AvailabilityBuilder {
+    fn append(&mut self, bits: &[bool]) -> Availability {
+        let available_count = bits.iter().filter(|available| **available).count();
+        if available_count == 0 {
+            return Availability::constant(0);
+        }
+        if available_count == bits.len() {
+            return Availability::constant(1);
+        }
+
+        pad_binary(&mut self.binary);
+        let byte_offset = self.binary.len();
+        let packed = pack_availability_bits(bits);
+        let byte_length = packed.len();
+        self.binary.extend_from_slice(&packed);
+
+        let bitstream = self.buffer_views.len();
+        self.buffer_views.push(SubtreeBufferView {
+            buffer: 0,
+            byte_offset,
+            byte_length,
+        });
+
+        Availability::bitstream(bitstream, available_count)
+    }
+
+    fn finish(mut self) -> (Vec<SubtreeBuffer>, Vec<SubtreeBufferView>, Vec<u8>) {
+        if self.buffer_views.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        pad_binary(&mut self.binary);
+        let buffers = vec![SubtreeBuffer {
+            byte_length: self.binary.len(),
+        }];
+        (buffers, self.buffer_views, self.binary)
+    }
+}
+
+fn validate_availability(
+    source: &SourceConfig,
+    layout: &SubtreeLayout,
+    availability: &SubtreeAvailabilityBits,
+) -> Result<(), ConfigError> {
+    for (field, actual, expected) in [
+        (
+            "tile availability",
+            availability.tile.len(),
+            layout.local_tiles.len(),
+        ),
+        (
+            "content availability",
+            availability.content.len(),
+            layout.local_tiles.len(),
+        ),
+        (
+            "child subtree availability",
+            availability.child_subtree.len(),
+            layout.child_roots.len(),
+        ),
+    ] {
+        if actual != expected {
+            return Err(ConfigError::Validation(format!(
+                "{field} has {actual} bits; expected {expected}"
+            )));
+        }
+    }
+
+    if !availability.tile[0] {
+        return Err(ConfigError::Validation(
+            "tile availability must include the subtree root".to_string(),
+        ));
+    }
+
+    for (index, tile) in layout.local_tiles.iter().enumerate() {
+        if tile.is_none() && (availability.tile[index] || availability.content[index]) {
+            return Err(ConfigError::Validation(format!(
+                "availability index {index} is beyond max_level {}",
+                source.max_level
+            )));
+        }
+        if availability.content[index] && !availability.tile[index] {
+            return Err(ConfigError::Validation(format!(
+                "content availability index {index} requires tile availability"
+            )));
+        }
+    }
+
+    for local_level in 1..source.subtree_levels {
+        let width = 1_u32 << local_level;
+        for local_y in 0..width {
+            for local_x in 0..width {
+                let index = quadtree_availability_index(local_level, local_x, local_y)?;
+                if !availability.tile[index] {
+                    continue;
+                }
+
+                let parent =
+                    quadtree_availability_index(local_level - 1, local_x / 2, local_y / 2)?;
+                if !availability.tile[parent] {
+                    return Err(ConfigError::Validation(format!(
+                        "tile availability index {index} requires ancestor index {parent}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let child_width = 1_u32 << source.subtree_levels;
+    for local_y in 0..child_width {
+        for local_x in 0..child_width {
+            let index = morton_index_2d(local_x, local_y);
+            if !availability.child_subtree[index] {
+                continue;
+            }
+            if layout.child_roots[index].is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "child subtree availability index {index} is beyond max_level {}",
+                    source.max_level
+                )));
+            }
+
+            let parent =
+                quadtree_availability_index(source.subtree_levels - 1, local_x / 2, local_y / 2)?;
+            if !availability.tile[parent] {
+                return Err(ConfigError::Validation(format!(
+                    "child subtree availability index {index} requires parent tile index {parent}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn descendant_coord(
+    subtree_root: TileCoord,
+    local_level: u8,
+    local_x: u32,
+    local_y: u32,
+) -> Result<TileCoord, ConfigError> {
+    let level = subtree_root
+        .level
+        .checked_add(local_level)
+        .ok_or_else(|| ConfigError::Validation("tile level overflowed".to_string()))?;
+    let x = subtree_root
+        .x
+        .checked_shl(u32::from(local_level))
+        .and_then(|base| base.checked_add(local_x))
+        .ok_or_else(|| ConfigError::Validation("tile x coordinate overflowed".to_string()))?;
+    let y = subtree_root
+        .y
+        .checked_shl(u32::from(local_level))
+        .and_then(|base| base.checked_add(local_y))
+        .ok_or_else(|| ConfigError::Validation("tile y coordinate overflowed".to_string()))?;
+
+    TileCoord::new(level, x, y).map_err(|error| ConfigError::Validation(error.to_string()))
+}
+
+fn pad_binary(binary: &mut Vec<u8>) {
+    binary.extend(std::iter::repeat_n(
+        0,
+        padded_len(binary.len(), BYTE_ALIGNMENT) - binary.len(),
+    ));
 }
 
 pub fn quadtree_node_count(subtree_levels: u8) -> Result<usize, ConfigError> {
@@ -326,21 +577,143 @@ mod tests {
         assert_eq!(subtree.tile_availability, Availability::bitstream(0, 5));
         assert_eq!(
             subtree.content_availability,
-            vec![Availability::bitstream(0, 5)]
+            vec![Availability::bitstream(1, 5)]
         );
         assert_eq!(
             subtree.child_subtree_availability,
             Availability::constant(0)
         );
-        assert_eq!(subtree.buffers[0].byte_length, 11);
+        assert_eq!(subtree.buffers[0].byte_length, 32);
         assert_eq!(subtree.buffer_views[0].byte_length, 11);
-        assert_eq!(subtree.binary.len(), 11);
+        assert_eq!(subtree.buffer_views[1].byte_offset, 16);
+        assert_eq!(subtree.buffer_views[1].byte_length, 11);
+        assert_eq!(subtree.binary.len(), 32);
         assert_eq!(subtree.binary[0], 0b0001_1111);
-        assert!(subtree.binary[1..].iter().all(|byte| *byte == 0));
+        assert_eq!(subtree.binary[16], 0b0001_1111);
+        assert!(subtree.binary[1..16].iter().all(|byte| *byte == 0));
+        assert!(subtree.binary[17..].iter().all(|byte| *byte == 0));
 
         let bytes = generate_subtree_bytes(&source, subtree_root).expect("binary subtree");
         let binary_byte_len = u64::from_le_bytes(bytes[16..24].try_into().expect("binary length"));
-        assert_eq!(binary_byte_len, 16);
+        assert_eq!(binary_byte_len, 32);
+    }
+
+    #[test]
+    fn subtree_layout_uses_morton_order_and_marks_partial_slots() {
+        let mut source = fixture_source();
+        source.max_level = 5;
+        let root = TileCoord::new(4, 3, 7).expect("valid subtree root");
+        let layout = subtree_layout(&source, root).expect("layout should build");
+
+        assert_eq!(layout.local_tiles.len(), 85);
+        assert_eq!(layout.local_tiles[0], Some(root));
+        assert_eq!(
+            layout.local_tiles[1],
+            Some(TileCoord::new(5, 6, 14).expect("southwest child"))
+        );
+        assert_eq!(
+            layout.local_tiles[2],
+            Some(TileCoord::new(5, 7, 14).expect("southeast child"))
+        );
+        assert!(layout.local_tiles[5..].iter().all(Option::is_none));
+        assert_eq!(layout.child_roots.len(), 256);
+        assert!(layout.child_roots.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn encodes_sparse_availability_with_aligned_buffer_views() {
+        let mut source = fixture_source();
+        source.subtree_levels = 2;
+        source.max_level = 4;
+        let availability = SubtreeAvailabilityBits {
+            tile: vec![true, true, false, false, false],
+            content: vec![false, true, false, false, false],
+            child_subtree: vec![
+                true, false, false, false, false, false, false, false, false, false, false, false,
+                false, false, false, false,
+            ],
+        };
+
+        let subtree = generate_subtree_with_availability(&source, TileCoord::root(), &availability)
+            .expect("sparse subtree should generate");
+
+        assert_eq!(subtree.tile_availability, Availability::bitstream(0, 2));
+        assert_eq!(
+            subtree.content_availability,
+            vec![Availability::bitstream(1, 1)]
+        );
+        assert_eq!(
+            subtree.child_subtree_availability,
+            Availability::bitstream(2, 1)
+        );
+        assert_eq!(
+            subtree
+                .buffer_views
+                .iter()
+                .map(|view| view.byte_offset)
+                .collect::<Vec<_>>(),
+            vec![0, 8, 16]
+        );
+        assert_eq!(subtree.buffers[0].byte_length, 24);
+        assert_eq!(subtree.binary.len(), 24);
+    }
+
+    #[test]
+    fn validates_sparse_availability_hierarchy_and_configured_levels() {
+        let mut source = fixture_source();
+        source.subtree_levels = 2;
+        source.max_level = 1;
+
+        let content_without_tile = SubtreeAvailabilityBits {
+            tile: vec![true, false, false, false, false],
+            content: vec![false, true, false, false, false],
+            child_subtree: vec![false; 16],
+        };
+        let error =
+            generate_subtree_with_availability(&source, TileCoord::root(), &content_without_tile)
+                .expect_err("content without a tile should fail");
+        assert!(error.to_string().contains("requires tile availability"));
+
+        let beyond_max = SubtreeAvailabilityBits {
+            tile: vec![true, true, false, false, false],
+            content: vec![false; 5],
+            child_subtree: {
+                let mut bits = vec![false; 16];
+                bits[0] = true;
+                bits
+            },
+        };
+        let error = generate_subtree_with_availability(&source, TileCoord::root(), &beyond_max)
+            .expect_err("child roots beyond max should fail");
+        assert!(error.to_string().contains("beyond max_level"));
+    }
+
+    #[test]
+    fn allows_an_empty_dataset_only_when_the_global_root_tile_exists() {
+        let mut source = fixture_source();
+        source.subtree_levels = 2;
+        source.max_level = 4;
+        let empty_root = SubtreeAvailabilityBits {
+            tile: vec![true, false, false, false, false],
+            content: vec![false; 5],
+            child_subtree: vec![false; 16],
+        };
+        let subtree = generate_subtree_with_availability(&source, TileCoord::root(), &empty_root)
+            .expect("global root tile should remain available");
+        assert_eq!(
+            subtree.content_availability,
+            vec![Availability::constant(0)]
+        );
+
+        let empty_non_root = SubtreeAvailabilityBits {
+            tile: vec![false; 5],
+            content: vec![false; 5],
+            child_subtree: vec![false; 16],
+        };
+        let root = TileCoord::new(2, 0, 0).expect("valid subtree root");
+        let error = generate_subtree_with_availability(&source, root, &empty_non_root)
+            .expect_err("empty non-root subtree should not be encoded");
+        assert!(error.to_string().contains("must include the subtree root"));
     }
 
     #[test]

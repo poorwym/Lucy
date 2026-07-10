@@ -13,7 +13,7 @@ use crate::postgis::{TileFeatureWkb, query_tile_geometry_wkb};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::util::parse_tile_path;
+use super::util::{parse_tile_path, resolve_connection_string};
 
 pub(crate) async fn source_content(
     State(state): State<AppState>,
@@ -114,19 +114,6 @@ fn parse_optional_feature_f32(
             feature.id
         ))
     })
-}
-
-fn resolve_connection_string(connection: &str) -> Result<String, RouteError> {
-    let trimmed = connection.trim();
-    if trimmed == "${DATABASE_URL}" {
-        std::env::var("DATABASE_URL").map_err(|error| {
-            RouteError::config(format!(
-                "DATABASE_URL is required by source connection: {error}"
-            ))
-        })
-    } else {
-        Ok(trimmed.to_string())
-    }
 }
 
 #[cfg(test)]

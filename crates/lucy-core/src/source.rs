@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
+pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceCatalog {
@@ -112,6 +113,12 @@ impl SourceConfig {
         if self.subtree_levels == 0 {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: subtree_levels must be greater than zero"
+            )));
+        }
+
+        if self.subtree_levels > MAX_SUBTREE_LEVELS {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: subtree_levels must be <= {MAX_SUBTREE_LEVELS}"
             )));
         }
 
@@ -313,5 +320,14 @@ sources:
             source.content_query_attributes(),
             vec!["name", "top_delta_m", "bottom_m"]
         );
+    }
+
+    #[test]
+    fn rejects_impractically_large_subtree_levels() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("subtree_levels: 4", "subtree_levels: 9");
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(error.to_string().contains("subtree_levels must be <= 8"));
     }
 }

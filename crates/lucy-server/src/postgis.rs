@@ -4,6 +4,7 @@ use std::fmt;
 use tokio_postgres::GenericClient;
 
 use lucy_core::source::{ConfigError, SourceConfig};
+use lucy_core::subtree::{SubtreeAvailabilityBits, subtree_layout};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
 
 /// One PostGIS feature clipped to a requested tile bbox.
@@ -72,10 +73,129 @@ pub async fn query_tile_geometry_wkb_for_bbox(
     Ok(features)
 }
 
+/// Derive all tile, content, and child-subtree availability for one subtree
+/// with a single batched PostGIS query.
+pub async fn query_subtree_availability(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+) -> Result<SubtreeAvailabilityBits, TileQueryError> {
+    let layout = subtree_layout(source, subtree_root)?;
+    let mut slots = Vec::new();
+    for (index, tile) in layout.local_tiles.iter().copied().enumerate() {
+        if let Some(tile) = tile {
+            slots.push(SubtreeQuerySlot::Tile { index, tile });
+        }
+    }
+    for (index, tile) in layout.child_roots.iter().copied().enumerate() {
+        if let Some(tile) = tile {
+            slots.push(SubtreeQuerySlot::ChildSubtree { index, tile });
+        }
+    }
+
+    let mut west = Vec::with_capacity(slots.len());
+    let mut south = Vec::with_capacity(slots.len());
+    let mut east = Vec::with_capacity(slots.len());
+    let mut north = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        let bbox = slot.tile().geographic_region_degrees(&source.bounds)?;
+        west.push(bbox.west);
+        south.push(bbox.south);
+        east.push(bbox.east);
+        north.push(bbox.north);
+    }
+
+    let plan = build_subtree_occupancy_query(source)?;
+    let query_limit = i64::from(source.max_features_per_tile) + 1;
+    let rows = client
+        .query(
+            &plan.sql,
+            &[&west, &south, &east, &north, &source.srid, &query_limit],
+        )
+        .await?;
+
+    if rows.len() != slots.len() {
+        return Err(TileQueryError::Config(ConfigError::Validation(format!(
+            "PostGIS returned {} subtree occupancy rows for {} requested slots",
+            rows.len(),
+            slots.len()
+        ))));
+    }
+
+    let mut availability = SubtreeAvailabilityBits {
+        tile: vec![false; layout.local_tiles.len()],
+        content: vec![false; layout.local_tiles.len()],
+        child_subtree: vec![false; layout.child_roots.len()],
+    };
+    for row in rows {
+        let slot_index = usize::try_from(row.try_get::<_, i64>(0)?).map_err(|_| {
+            ConfigError::Validation("PostGIS returned a negative subtree slot".to_string())
+        })?;
+        let feature_count = u64::try_from(row.try_get::<_, i64>(1)?).map_err(|_| {
+            ConfigError::Validation("PostGIS returned a negative feature count".to_string())
+        })?;
+        let slot = slots.get(slot_index).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "PostGIS returned out-of-range subtree slot {slot_index}"
+            ))
+        })?;
+        let tile = slot.tile();
+        let has_features = feature_count > 0;
+        let overflow = feature_count > u64::from(source.max_features_per_tile);
+
+        if overflow && tile.level == source.max_level {
+            return Err(TileQueryError::TerminalFeatureLimitExceeded {
+                level: tile.level,
+                x: tile.x,
+                y: tile.y,
+                max_features_per_tile: source.max_features_per_tile,
+            });
+        }
+
+        match *slot {
+            SubtreeQuerySlot::Tile { index, .. } => {
+                availability.tile[index] = has_features;
+                availability.content[index] = has_features && !overflow;
+            }
+            SubtreeQuerySlot::ChildSubtree { index, .. } => {
+                availability.child_subtree[index] = has_features;
+            }
+        }
+    }
+
+    if subtree_root == TileCoord::root() {
+        availability.tile[0] = true;
+    }
+
+    Ok(availability)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubtreeQuerySlot {
+    Tile { index: usize, tile: TileCoord },
+    ChildSubtree { index: usize, tile: TileCoord },
+}
+
+impl SubtreeQuerySlot {
+    fn tile(self) -> TileCoord {
+        match self {
+            Self::Tile { tile, .. } | Self::ChildSubtree { tile, .. } => tile,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TileQueryError {
     Config(ConfigError),
-    FeatureLimitExceeded { max_features_per_tile: u32 },
+    FeatureLimitExceeded {
+        max_features_per_tile: u32,
+    },
+    TerminalFeatureLimitExceeded {
+        level: u8,
+        x: u32,
+        y: u32,
+        max_features_per_tile: u32,
+    },
     Postgres(tokio_postgres::Error),
 }
 
@@ -88,6 +208,15 @@ impl fmt::Display for TileQueryError {
             } => write!(
                 f,
                 "tile contains more than {max_features_per_tile} features; request a deeper tile or raise max_features_per_tile instead of serving truncated content"
+            ),
+            TileQueryError::TerminalFeatureLimitExceeded {
+                level,
+                x,
+                y,
+                max_features_per_tile,
+            } => write!(
+                f,
+                "tile level={level} x={x} y={y} exceeds max_features_per_tile={max_features_per_tile} at max_level and cannot be subdivided"
             ),
             TileQueryError::Postgres(error) => write!(f, "PostGIS tile query failed: {error}"),
         }
@@ -112,6 +241,11 @@ impl From<tokio_postgres::Error> for TileQueryError {
 struct TileWkbQueryPlan {
     sql: String,
     attributes: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubtreeOccupancyQueryPlan {
+    sql: String,
 }
 
 fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, ConfigError> {
@@ -139,24 +273,78 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         attributes.push(attribute.clone());
     }
 
+    let table_geometry = format!("t.{geometry_column}");
+    let clipped_geometry = clipped_geometry_expression(&table_geometry, "b.geom");
+    let intersection_predicate =
+        positive_area_intersection_predicate(&table_geometry, "b.geom", "clipped.geom");
+
     let sql = format!(
         "WITH tile_bbox AS (SELECT ST_MakeEnvelope($1, $2, $3, $4, $5) AS geom) \
          SELECT {} \
          FROM {schema}.{table} AS t \
          CROSS JOIN tile_bbox AS b \
          CROSS JOIN LATERAL ( \
-           SELECT ST_Multi(ST_CollectionExtract(ST_Intersection(t.{geometry_column}, b.geom), 3)) AS geom \
+           SELECT {clipped_geometry} AS geom \
          ) AS clipped \
-         WHERE t.{geometry_column} && b.geom \
-         AND ST_Intersects(t.{geometry_column}, b.geom) \
-         AND NOT ST_IsEmpty(clipped.geom) \
-         AND ST_Area(clipped.geom) > 0 \
+         WHERE {intersection_predicate} \
          ORDER BY t.{id_column} \
          LIMIT $6",
         select_columns.join(", ")
     );
 
     Ok(TileWkbQueryPlan { sql, attributes })
+}
+
+fn build_subtree_occupancy_query(
+    source: &SourceConfig,
+) -> Result<SubtreeOccupancyQueryPlan, ConfigError> {
+    let schema = quote_identifier(&source.schema, "schema")?;
+    let table = quote_identifier(&source.table, "table")?;
+    let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
+    let table_geometry = format!("t.{geometry_column}");
+    let clipped_geometry = clipped_geometry_expression(&table_geometry, "q.geom");
+    let intersection_predicate =
+        positive_area_intersection_predicate(&table_geometry, "q.geom", "clipped.geom");
+
+    let sql = format!(
+        "WITH requested_tiles AS ( \
+           SELECT (u.ordinality - 1)::bigint AS slot, \
+                  ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5) AS geom \
+           FROM unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[]) \
+                WITH ORDINALITY AS u(west, south, east, north, ordinality) \
+         ) \
+         SELECT q.slot, ( \
+           SELECT count(*)::bigint \
+           FROM ( \
+             SELECT 1 \
+             FROM {schema}.{table} AS t \
+             CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped \
+             WHERE {intersection_predicate} \
+             LIMIT $6 \
+           ) AS capped \
+         ) AS feature_count \
+         FROM requested_tiles AS q \
+         ORDER BY q.slot"
+    );
+
+    Ok(SubtreeOccupancyQueryPlan { sql })
+}
+
+fn clipped_geometry_expression(table_geometry: &str, bbox_geometry: &str) -> String {
+    format!("ST_Multi(ST_CollectionExtract(ST_Intersection({table_geometry}, {bbox_geometry}), 3))")
+}
+
+fn positive_area_intersection_predicate(
+    table_geometry: &str,
+    bbox_geometry: &str,
+    clipped_geometry: &str,
+) -> String {
+    format!(
+        "{table_geometry} && {bbox_geometry} \
+         AND ST_Intersects({table_geometry}, {bbox_geometry}) \
+         AND NOT ST_IsEmpty({clipped_geometry}) \
+         AND ST_Area({clipped_geometry}) > 0"
+    )
 }
 
 fn ensure_within_feature_limit(
@@ -229,16 +417,24 @@ mod tests {
     use std::env;
     use std::path::Path;
 
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
     use tokio_postgres::NoTls;
+    use tower::ServiceExt;
 
     use super::*;
     use lucy_core::source::SourceCatalog;
+    use lucy_core::subtree::{generate_subtree_bytes_with_availability, pack_availability_bits};
 
-    fn fixture_source() -> SourceConfig {
+    fn fixture_catalog() -> SourceCatalog {
         let config_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
         let raw = std::fs::read_to_string(config_path).expect("fixture config should read");
-        let mut catalog = SourceCatalog::from_yaml_str(&raw).expect("fixture config should load");
+        SourceCatalog::from_yaml_str(&raw).expect("fixture config should load")
+    }
+
+    fn fixture_source() -> SourceConfig {
+        let mut catalog = fixture_catalog();
         catalog
             .sources
             .remove("poc_buildings")
@@ -264,6 +460,23 @@ mod tests {
             plan.attributes,
             vec!["name", "building_type", "base_height_m", "height_m"]
         );
+    }
+
+    #[test]
+    fn subtree_occupancy_query_batches_all_boxes_with_shared_clipping_semantics() {
+        let source = fixture_source();
+        let plan = build_subtree_occupancy_query(&source).expect("query should build");
+
+        assert!(
+            plan.sql
+                .contains("unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[])")
+        );
+        assert!(plan.sql.contains("WITH ORDINALITY"));
+        assert!(plan.sql.contains("ST_Intersection(t.\"geom\", q.geom)"));
+        assert!(plan.sql.contains("t.\"geom\" && q.geom"));
+        assert!(plan.sql.contains("ST_Area(clipped.geom) > 0"));
+        assert!(plan.sql.contains("LIMIT $6"));
+        assert!(plan.sql.contains("ORDER BY q.slot"));
     }
 
     #[test]
@@ -347,6 +560,76 @@ mod tests {
             Some("Sansome Office")
         );
 
+        let availability = query_subtree_availability(&client, &source, TileCoord::root())
+            .await
+            .expect("root availability should query");
+        assert_eq!(
+            availability
+                .tile
+                .iter()
+                .filter(|available| **available)
+                .count(),
+            60
+        );
+        assert_eq!(
+            availability
+                .content
+                .iter()
+                .filter(|available| **available)
+                .count(),
+            60
+        );
+        assert_eq!(
+            availability
+                .child_subtree
+                .iter()
+                .filter(|available| **available)
+                .count(),
+            121
+        );
+        assert_eq!(
+            pack_availability_bits(&availability.tile),
+            vec![
+                0xff, 0x7f, 0xe6, 0xff, 0xff, 0xbf, 0xf9, 0x1f, 0xe0, 0x07, 0x00,
+            ]
+        );
+        let first =
+            generate_subtree_bytes_with_availability(&source, TileCoord::root(), &availability)
+                .expect("sparse subtree should encode");
+        let second =
+            generate_subtree_bytes_with_availability(&source, TileCoord::root(), &availability)
+                .expect("sparse subtree should encode deterministically");
+        assert_eq!(first, second);
+
+        let response = crate::server::build_app(fixture_catalog())
+            .expect("fixture app should build")
+            .oneshot(
+                Request::builder()
+                    .uri("/sources/poc_buildings/subtrees/0/0/0.subtree")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("subtree request should route");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("subtree body should read");
+        assert_eq!(&body[0..4], b"subt");
+        let json_length = u64::from_le_bytes(body[8..16].try_into().expect("JSON length")) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&body[24..24 + json_length]).expect("subtree JSON should parse");
+        assert_eq!(document["tileAvailability"]["availableCount"], 60);
+        assert_eq!(document["contentAvailability"][0]["availableCount"], 60);
+        assert_eq!(document["childSubtreeAvailability"]["availableCount"], 121);
+
         let empty_tile = TileCoord::new(2, 0, 3).expect("valid empty fixture tile");
         let empty_features = query_tile_geometry_wkb(&client, &source, empty_tile)
             .await
@@ -378,12 +661,53 @@ mod tests {
         assert_ne!(west_fragment.geometry_wkb, east_fragment.geometry_wkb);
 
         source.max_features_per_tile = 2;
+        let limited_availability = query_subtree_availability(&client, &source, TileCoord::root())
+            .await
+            .expect("non-terminal overflow should require subdivision");
+        assert_eq!(
+            limited_availability
+                .tile
+                .iter()
+                .filter(|available| **available)
+                .count(),
+            60
+        );
+        assert_eq!(
+            limited_availability
+                .content
+                .iter()
+                .filter(|available| **available)
+                .count(),
+            56
+        );
+        assert!(!limited_availability.content[0]);
+        assert_eq!(
+            pack_availability_bits(&limited_availability.content),
+            vec![
+                0xf8, 0x7e, 0xe6, 0xff, 0xff, 0xbf, 0xf9, 0x1f, 0xe0, 0x07, 0x00,
+            ]
+        );
+
         let error = query_tile_geometry_wkb(&client, &source, TileCoord::root())
             .await
             .expect_err("overflow must not return a truncated tile");
         assert!(matches!(
             error,
             TileQueryError::FeatureLimitExceeded {
+                max_features_per_tile: 2
+            }
+        ));
+
+        source.max_level = 0;
+        let error = query_subtree_availability(&client, &source, TileCoord::root())
+            .await
+            .expect_err("overflow at max_level must be terminal");
+        assert!(matches!(
+            error,
+            TileQueryError::TerminalFeatureLimitExceeded {
+                level: 0,
+                x: 0,
+                y: 0,
                 max_features_per_tile: 2
             }
         ));

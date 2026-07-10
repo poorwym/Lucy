@@ -143,7 +143,8 @@ impl From<TileCoordError> for RouteError {
 impl From<TileQueryError> for RouteError {
     fn from(error: TileQueryError) -> Self {
         match error {
-            error @ TileQueryError::FeatureLimitExceeded { .. } => {
+            error @ (TileQueryError::FeatureLimitExceeded { .. }
+            | TileQueryError::TerminalFeatureLimitExceeded { .. }) => {
                 Self::conflict("tile_overflow", error.to_string())
             }
             error => Self::internal("postgis_error", error.to_string()),
