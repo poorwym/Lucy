@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::tile::MAX_TILE_LEVEL;
+
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
 pub const MAX_SUBTREE_LEVELS: u8 = 8;
@@ -107,6 +109,18 @@ impl SourceConfig {
         if self.min_level > self.max_level {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: min_level must be <= max_level"
+            )));
+        }
+
+        if self.min_level != 0 {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: implicit QUADTREE sources currently require min_level = 0"
+            )));
+        }
+
+        if self.max_level > MAX_TILE_LEVEL {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: max_level must be <= {MAX_TILE_LEVEL} for u32 tile coordinates"
             )));
         }
 
@@ -329,5 +343,23 @@ sources:
         let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
 
         assert!(error.to_string().contains("subtree_levels must be <= 8"));
+    }
+
+    #[test]
+    fn preserves_zero_min_level_constraint() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("min_level: 0", "min_level: 1");
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(error.to_string().contains("require min_level = 0"));
+    }
+
+    #[test]
+    fn rejects_levels_outside_u32_coordinate_domain() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("max_level: 16", "max_level: 32");
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(error.to_string().contains("max_level must be <= 31"));
     }
 }

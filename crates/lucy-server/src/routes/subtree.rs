@@ -12,7 +12,7 @@ use crate::postgis::query_subtree_availability;
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::util::{parse_tile_path, resolve_connection_string};
+use super::util::{ensure_configured_level, parse_tile_path, resolve_connection_string};
 
 pub(crate) async fn source_subtree(
     State(state): State<AppState>,
@@ -31,6 +31,8 @@ pub(crate) async fn default_subtree(
 }
 
 async fn subtree_response(source: &SourceConfig, tile: TileCoord) -> Result<Response, RouteError> {
+    ensure_configured_level(source, tile)?;
+
     if tile != TileCoord::root() {
         return Err(RouteError::not_found(format!(
             "source only serves the root subtree at level={} x={} y={}",

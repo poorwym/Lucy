@@ -104,7 +104,29 @@ mod tests {
         let body = body_json(bad_coord).await;
         assert_eq!(body["error"]["code"], "bad_request");
 
+        let content_above_max = request("/content/17/0/0.glb").await;
+        assert_eq!(content_above_max.status(), StatusCode::NOT_FOUND);
+        let body = body_json(content_above_max).await;
+        assert_eq!(body["error"]["code"], "not_found");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message should be a string")
+                .contains("outside configured levels")
+        );
+
         let missing_subtree = request("/sources/poc_buildings/subtrees/1/0/0.subtree").await;
         assert_eq!(missing_subtree.status(), StatusCode::NOT_FOUND);
+
+        let subtree_above_max = request("/sources/poc_buildings/subtrees/20/0/0.subtree").await;
+        assert_eq!(subtree_above_max.status(), StatusCode::NOT_FOUND);
+        let body = body_json(subtree_above_max).await;
+        assert_eq!(body["error"]["code"], "not_found");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message should be a string")
+                .contains("outside configured levels")
+        );
     }
 }

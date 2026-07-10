@@ -13,7 +13,7 @@ use crate::postgis::{TileFeatureWkb, query_tile_geometry_wkb};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
-use super::util::{parse_tile_path, resolve_connection_string};
+use super::util::{ensure_configured_level, parse_tile_path, resolve_connection_string};
 
 pub(crate) async fn source_content(
     State(state): State<AppState>,
@@ -35,6 +35,7 @@ async fn content_tile_response(
     source: &SourceConfig,
     tile: TileCoord,
 ) -> Result<Response, RouteError> {
+    ensure_configured_level(source, tile)?;
     let connection = resolve_connection_string(&source.connection)?;
     let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
     tokio::spawn(async move {

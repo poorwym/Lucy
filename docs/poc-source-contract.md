@@ -235,8 +235,8 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `height_column` | Automatically selected by the PostGIS tile query and required as positive extrusion height input. |
 | `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
 | `bounds` | Drives root tileset region, tile coordinate bbox mapping, local mesh frame origin, tileset transform origin, and vertical bounding interval. |
-| `min_level` | Validated and currently required to be `0` by root tileset/subtree generation. |
-| `max_level` | Drives implicit tileset `availableLevels`, final-partial clipping, terminal overflow detection, and child-subtree availability. |
+| `min_level` | Validated as the retained implicit-root constraint `0`; tile-addressed routes reject requests below the configured bound before database work. |
+| `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, final-partial clipping, terminal overflow detection, and child-subtree availability. |
 | `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
 | `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; overflow returns `tile_overflow` instead of silently truncating content. |
 | `attributes` | Additional metadata columns selected into `TileFeatureWkb.attributes`; height columns are selected even when omitted from this list. |
@@ -251,8 +251,9 @@ introspection and later rendering work:
 1. SRID validation only accepts `4326`, even though the query path binds the
    configured SRID. P1.3 should verify table SRID at startup and decide whether
    non-4326 reprojection is in scope.
-2. `min_level` must be `0`; non-root implicit subtree generation is still a
-   follow-up.
+2. `min_level` must be `0`; generalizing the implicit root to a nonzero level is
+   deferred. Non-root subtree generation exists, while non-root HTTP serving is
+   a separate follow-up.
 3. Runtime geometry filtering does not yet push `geometry_types` into SQL.
    P1.3 should validate table geometry types during startup and return clear
    source errors before tile requests.
