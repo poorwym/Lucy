@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use tokio_postgres::NoTls;
+use tracing::{debug, error};
 
 use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
 use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh};
@@ -22,7 +24,12 @@ pub(crate) async fn source_content(
     AxumPath((source_id, level, x, y_file)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, RouteError> {
     let source = state.source(&source_id)?;
-    content_tile_response(&source, parse_tile_path(&level, &x, &y_file, ".glb")?).await
+    content_tile_response(
+        &source_id,
+        &source,
+        parse_tile_path(&level, &x, &y_file, ".glb")?,
+    )
+    .await
 }
 
 pub(crate) async fn default_content(
@@ -30,10 +37,21 @@ pub(crate) async fn default_content(
     AxumPath((level, x, y_file)): AxumPath<(String, String, String)>,
 ) -> Result<Response, RouteError> {
     let source = state.default_source()?;
-    content_tile_response(&source, parse_tile_path(&level, &x, &y_file, ".glb")?).await
+    content_tile_response(
+        state.default_source_id(),
+        &source,
+        parse_tile_path(&level, &x, &y_file, ".glb")?,
+    )
+    .await
 }
 
+#[tracing::instrument(
+    name = "content_tile",
+    skip(source),
+    fields(tile.level = tile.level, tile.x = tile.x, tile.y = tile.y)
+)]
 async fn content_tile_response(
+    source_id: &str,
     source: &SourceConfig,
     tile: TileCoord,
 ) -> Result<Response, RouteError> {
@@ -45,14 +63,30 @@ async fn content_tile_response(
         )));
     }
     let connection = resolve_connection_string(&source.connection)?;
+    let started = Instant::now();
     let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
+    debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "PostGIS connection established"
+    );
     tokio::spawn(async move {
         if let Err(error) = connection_task.await {
-            eprintln!("PostGIS connection error: {error}");
+            error!(error = %error, "PostGIS connection task failed");
         }
     });
 
+    let started = Instant::now();
     let features = query_tile_geometry_wkb(&client, source, tile).await?;
+    let wkb_bytes = features
+        .iter()
+        .map(|feature| feature.geometry_wkb.len())
+        .sum::<usize>();
+    debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        feature_count = features.len(),
+        wkb_bytes,
+        "tile geometry queried"
+    );
     if features.is_empty() {
         return Err(RouteError::not_found(format!(
             "tile level={} x={} y={} has no fixture features",
@@ -62,6 +96,7 @@ async fn content_tile_response(
 
     let frame = MeshFrame::from_tile_region(tile.geographic_region_degrees(&source.bounds)?);
     let mut content_features = Vec::with_capacity(features.len());
+    let started = Instant::now();
     for feature in features {
         let (base_height_m, height_m) = feature_heights(source, &feature)?;
         let mesh =
@@ -84,12 +119,30 @@ async fn content_tile_response(
             properties,
         });
     }
+    let vertex_count = content_features
+        .iter()
+        .map(|feature| feature.mesh.vertices.len())
+        .sum::<usize>();
+    let triangle_count = content_features
+        .iter()
+        .map(|feature| feature.mesh.indices.len() / 3)
+        .sum::<usize>();
+    debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        mesh_count = content_features.len(),
+        vertex_count,
+        triangle_count,
+        "feature meshes generated"
+    );
 
-    Ok(bytes_response(
-        StatusCode::OK,
-        "model/gltf-binary",
-        encode_feature_content_tile_glb(&content_features, frame.gltf_to_ecef_transform())?,
-    ))
+    let started = Instant::now();
+    let glb = encode_feature_content_tile_glb(&content_features, frame.gltf_to_ecef_transform())?;
+    debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        glb_bytes = glb.len(),
+        "GLB encoded"
+    );
+    Ok(bytes_response(StatusCode::OK, "model/gltf-binary", glb))
 }
 
 fn feature_base_color(

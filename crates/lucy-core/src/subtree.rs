@@ -33,13 +33,27 @@ pub fn generate_subtree_bytes(
     encode_generated_subtree(&subtree)
 }
 
+#[tracing::instrument(
+    level = "debug",
+    skip(source, availability),
+    fields(
+        tile.level = subtree_root.level,
+        tile.x = subtree_root.x,
+        tile.y = subtree_root.y,
+        available_tile_count = availability.tile.iter().filter(|&&value| value).count(),
+        available_content_count = availability.content.iter().filter(|&&value| value).count(),
+        available_child_subtree_count = availability.child_subtree.iter().filter(|&&value| value).count(),
+    )
+)]
 pub fn generate_subtree_bytes_with_availability(
     source: &SourceConfig,
     subtree_root: TileCoord,
     availability: &SubtreeAvailabilityBits,
 ) -> Result<Vec<u8>, ConfigError> {
     let subtree = generate_subtree_with_availability(source, subtree_root, availability)?;
-    encode_generated_subtree(&subtree)
+    let bytes = encode_generated_subtree(&subtree)?;
+    tracing::debug!(output_bytes = bytes.len(), "subtree binary encoded");
+    Ok(bytes)
 }
 
 fn encode_generated_subtree(subtree: &Subtree) -> Result<Vec<u8>, ConfigError> {

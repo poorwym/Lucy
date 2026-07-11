@@ -129,6 +129,7 @@ fn geodetic_to_ecef(lon_deg: f64, lat_deg: f64, height_m: f64) -> [f64; 3] {
     ]
 }
 
+#[tracing::instrument(level = "debug", skip(wkb, frame), fields(input_wkb_bytes = wkb.len()))]
 pub fn wkb_footprint_to_mesh(wkb: &[u8], frame: MeshFrame) -> Result<TriangleMesh, MeshError> {
     let geometry = read_wkb_geometry(wkb)?;
 
@@ -154,9 +155,19 @@ pub fn wkb_footprint_to_mesh(wkb: &[u8], frame: MeshFrame) -> Result<TriangleMes
         ));
     }
 
+    tracing::debug!(
+        vertex_count = mesh.vertices.len(),
+        triangle_count = mesh.indices.len() / 3,
+        "mesh generated"
+    );
     Ok(mesh)
 }
 
+#[tracing::instrument(
+    level = "debug",
+    skip(wkb, frame),
+    fields(input_wkb_bytes = wkb.len())
+)]
 pub fn wkb_footprint_to_extruded_mesh(
     wkb: &[u8],
     frame: MeshFrame,
@@ -197,6 +208,11 @@ pub fn wkb_footprint_to_extruded_mesh(
         ));
     }
 
+    tracing::debug!(
+        vertex_count = mesh.vertices.len(),
+        triangle_count = mesh.indices.len() / 3,
+        "extruded mesh generated"
+    );
     Ok(mesh)
 }
 

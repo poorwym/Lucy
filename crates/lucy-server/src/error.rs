@@ -103,6 +103,32 @@ impl RouteError {
 
 impl IntoResponse for RouteError {
     fn into_response(self) -> Response {
+        match self.status {
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
+                tracing::debug!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request rejected"
+                );
+            }
+            StatusCode::CONFLICT => {
+                tracing::warn!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request conflict"
+                );
+            }
+            _ => {
+                tracing::error!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request failed"
+                );
+            }
+        }
         (
             self.status,
             Json(ErrorBody {

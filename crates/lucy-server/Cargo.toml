@@ -12,6 +12,9 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tracing.workspace = true
+tower = "0.5.2"
+tower-http = { version = "0.7.0", features = ["request-id", "trace", "uuid"] }
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }

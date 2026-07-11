@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Instant;
 
 use tokio_postgres::GenericClient;
 
@@ -26,6 +27,21 @@ pub async fn query_tile_geometry_wkb(
 }
 
 /// Query an explicit geographic bbox from PostGIS and return clipped geometry as WKB.
+#[tracing::instrument(
+    name = "postgis.tile_geometry",
+    skip(client, source, bbox),
+    fields(
+        db.operation = "select",
+        db.query_kind = "tile_geometry",
+        db.schema = %source.schema,
+        db.table = %source.table,
+        bbox.west = bbox.west,
+        bbox.south = bbox.south,
+        bbox.east = bbox.east,
+        bbox.north = bbox.north,
+        query_limit = source.max_features_per_tile + 1,
+    )
+)]
 pub async fn query_tile_geometry_wkb_for_bbox(
     client: &impl GenericClient,
     source: &SourceConfig,
@@ -35,6 +51,7 @@ pub async fn query_tile_geometry_wkb_for_bbox(
 
     let plan = build_tile_wkb_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
+    let started = Instant::now();
     let rows = client
         .query(
             &plan.sql,
@@ -48,6 +65,11 @@ pub async fn query_tile_geometry_wkb_for_bbox(
             ],
         )
         .await?;
+    tracing::debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        row_count = rows.len(),
+        "PostGIS query completed"
+    );
     ensure_within_feature_limit(rows.len(), source.max_features_per_tile)?;
 
     let mut features = Vec::with_capacity(rows.len());
@@ -75,6 +97,20 @@ pub async fn query_tile_geometry_wkb_for_bbox(
 
 /// Derive all tile, content, and child-subtree availability for one subtree
 /// with a single batched PostGIS query.
+#[tracing::instrument(
+    name = "postgis.subtree_availability",
+    skip(client, source),
+    fields(
+        db.operation = "select",
+        db.query_kind = "subtree_availability",
+        db.schema = %source.schema,
+        db.table = %source.table,
+        tile.level = subtree_root.level,
+        tile.x = subtree_root.x,
+        tile.y = subtree_root.y,
+        query_limit = source.max_features_per_tile + 1,
+    )
+)]
 pub async fn query_subtree_availability(
     client: &impl GenericClient,
     source: &SourceConfig,
@@ -107,12 +143,19 @@ pub async fn query_subtree_availability(
 
     let plan = build_subtree_occupancy_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
+    let started = Instant::now();
     let rows = client
         .query(
             &plan.sql,
             &[&west, &south, &east, &north, &source.srid, &query_limit],
         )
         .await?;
+    tracing::debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        query_slot_count = slots.len(),
+        row_count = rows.len(),
+        "PostGIS query completed"
+    );
 
     if rows.len() != slots.len() {
         return Err(TileQueryError::Config(ConfigError::Validation(format!(

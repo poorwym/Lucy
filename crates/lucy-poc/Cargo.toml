@@ -6,5 +6,7 @@ license.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 lucy-core = { path = "../lucy-core" }
 lucy-server = { path = "../lucy-server" }

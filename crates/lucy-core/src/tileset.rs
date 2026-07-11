@@ -39,14 +39,18 @@ impl TilesetOptions {
     }
 }
 
+#[tracing::instrument(level = "debug", skip(source, options))]
 pub fn generate_tileset_json(
     source: &SourceConfig,
     options: &TilesetOptions,
 ) -> Result<String, ConfigError> {
     let tileset = generate_tileset(source, options)?;
 
-    serde_json::to_string_pretty(&tileset)
-        .map_err(|error| ConfigError::Validation(format!("failed to encode tileset JSON: {error}")))
+    let json = serde_json::to_string_pretty(&tileset).map_err(|error| {
+        ConfigError::Validation(format!("failed to encode tileset JSON: {error}"))
+    })?;
+    tracing::debug!(output_bytes = json.len(), "tileset JSON encoded");
+    Ok(json)
 }
 
 pub fn generate_tileset(

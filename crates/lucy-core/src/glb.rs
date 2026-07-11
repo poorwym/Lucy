@@ -71,6 +71,11 @@ pub fn encode_content_tile_glb(meshes: &[TriangleMesh]) -> Result<Vec<u8>, GlbEr
 
 /// Encode feature-aware 3D Tiles content with vertex colors, feature IDs, and
 /// an embedded structural metadata property table.
+#[tracing::instrument(
+    level = "debug",
+    skip(features, gltf_to_ecef),
+    fields(feature_count = features.len())
+)]
 pub fn encode_feature_content_tile_glb(
     features: &[ContentFeature],
     gltf_to_ecef: [f64; 16],
@@ -337,7 +342,14 @@ pub fn encode_feature_content_tile_glb(
         ]
     });
 
-    encode_glb_document(document, binary)
+    let glb = encode_glb_document(document, binary)?;
+    tracing::debug!(
+        vertex_count = tile_mesh.vertices.len(),
+        triangle_count = tile_mesh.indices.len() / 3,
+        glb_bytes = glb.len(),
+        "feature content GLB encoded"
+    );
+    Ok(glb)
 }
 
 fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {

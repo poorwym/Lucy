@@ -4,7 +4,8 @@ import "./App.css";
 import { useEffect, useRef, useState } from "react";
 import * as Cesium from "cesium";
 
-const TILESET_URL = "/tileset.json";
+const TILESET_URL =
+  "http://localhost:8080/sources/controlled_airspace/tileset.json";
 
 function App() {
   const containerRef = useRef<HTMLDivElement | null>(null);
