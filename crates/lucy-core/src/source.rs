@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -16,6 +16,8 @@ pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceCatalog {
+    #[serde(default)]
+    pub default_source: Option<String>,
     pub sources: BTreeMap<String, SourceConfig>,
 }
 
@@ -35,11 +37,26 @@ impl SourceCatalog {
             ));
         }
 
+        if let Some(default_source) = &self.default_source {
+            require_identifier(default_source, "default_source")?;
+            if !self.sources.contains_key(default_source) {
+                return Err(ConfigError::Validation(format!(
+                    "default_source {default_source:?} is not present in sources"
+                )));
+            }
+        }
+
         for (source_id, source) in &self.sources {
             source.validate(source_id)?;
         }
 
         Ok(())
+    }
+
+    pub fn default_source_id(&self) -> Option<&str> {
+        self.default_source
+            .as_deref()
+            .or_else(|| self.sources.keys().next().map(String::as_str))
     }
 }
 
@@ -52,9 +69,10 @@ pub struct SourceConfig {
     pub id_column: String,
     pub srid: i32,
     pub source_model: SourceModel,
-    pub vertical_reference: String,
+    pub vertical_reference: VerticalReference,
     pub base_height_column: Option<String>,
-    pub height_column: String,
+    #[serde(default)]
+    pub height_column: Option<String>,
     pub geometry_types: Vec<GeometryType>,
     pub bounds: SourceBounds,
     pub min_level: u8,
@@ -75,10 +93,11 @@ impl SourceConfig {
         require_identifier(&self.table, "table")?;
         require_identifier(&self.geometry_column, "geometry_column")?;
         require_identifier(&self.id_column, "id_column")?;
-        require_identifier(&self.height_column, "height_column")?;
-
         if let Some(base_height_column) = &self.base_height_column {
             require_identifier(base_height_column, "base_height_column")?;
+        }
+        if let Some(height_column) = &self.height_column {
+            require_identifier(height_column, "height_column")?;
         }
 
         for attribute in &self.attributes {
@@ -101,23 +120,19 @@ impl SourceConfig {
             )));
         }
 
-        if self.srid != 4326 {
-            return Err(ConfigError::Validation(format!(
-                "{source_id}: Phase 0 only supports SRID 4326"
-            )));
-        }
-
-        if self.source_model != SourceModel::ExtrudedFootprint {
-            return Err(ConfigError::Validation(format!(
-                "{source_id}: Phase 0 only supports extruded_footprint sources"
-            )));
-        }
-
         if self.geometry_types.is_empty() {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: at least one geometry type must be allowed"
             )));
         }
+
+        if self.geometry_types.iter().collect::<BTreeSet<_>>().len() != self.geometry_types.len() {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: geometry_types must not contain duplicates"
+            )));
+        }
+
+        self.validate_geometry_strategy(source_id)?;
 
         if self.min_level > self.max_level {
             return Err(ConfigError::Validation(format!(
@@ -134,6 +149,12 @@ impl SourceConfig {
         if self.max_level > MAX_TILE_LEVEL {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: max_level must be <= {MAX_TILE_LEVEL} for u32 tile coordinates"
+            )));
+        }
+
+        if self.source_model == SourceModel::SurfaceGeometryZ && self.max_level != 0 {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: surface_geometry_z currently requires max_level = 0 so every whole 3D feature is owned by the root tile without 2D clipping or cross-tile duplication"
             )));
         }
 
@@ -162,14 +183,107 @@ impl SourceConfig {
         }
 
         self.tileset
-            .validate(source_id, self.max_level > self.min_level)?;
+            .validate(source_id, self.max_level, self.max_level > self.min_level)?;
 
         self.bounds.validate(source_id)?;
         Ok(())
     }
 
+    fn validate_geometry_strategy(&self, source_id: &str) -> Result<(), ConfigError> {
+        match self.source_model {
+            SourceModel::ExtrudedFootprint => {
+                if self.srid != 4326 {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: extruded_footprint currently requires SRID 4326"
+                    )));
+                }
+                if self.vertical_reference
+                    != VerticalReference::Named(NamedVerticalReference::LocalGroundMeters)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: extruded_footprint requires vertical_reference: local_ground_meters"
+                    )));
+                }
+                if self.height_column.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: extruded_footprint requires height_column"
+                    )));
+                }
+                if self
+                    .geometry_types
+                    .iter()
+                    .any(|geometry_type| geometry_type.has_z())
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: extruded_footprint only accepts Polygon and MultiPolygon geometry_types"
+                    )));
+                }
+            }
+            SourceModel::SurfaceGeometryZ => {
+                if self.base_height_column.is_some() || self.height_column.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_geometry_z must not configure base_height_column or height_column"
+                    )));
+                }
+                if self
+                    .geometry_types
+                    .iter()
+                    .any(|geometry_type| !geometry_type.has_z())
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_geometry_z only accepts PolygonZ and MultiPolygonZ geometry_types"
+                    )));
+                }
+
+                let VerticalReference::Crs(reference) = &self.vertical_reference else {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_geometry_z requires a vertical_reference mapping with crs and target"
+                    )));
+                };
+                let configured_srid = reference.source_srid(source_id)?;
+                if configured_srid != self.srid {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: vertical_reference.crs EPSG:{configured_srid} does not match srid {}",
+                        self.srid
+                    )));
+                }
+                let target_srid = reference.target_srid(source_id)?;
+                if target_srid != 4979 {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_geometry_z currently requires vertical_reference.target: EPSG:4979"
+                    )));
+                }
+
+                match reference.effective_operation(configured_srid) {
+                    VerticalTransform::Rdnaptrans2018Epsg1149 if configured_srid != 7415 => {
+                        return Err(ConfigError::Validation(format!(
+                            "{source_id}: rdnaptrans2018_epsg_1149 is only valid for EPSG:7415"
+                        )));
+                    }
+                    VerticalTransform::Identity if configured_srid == 7415 => {
+                        return Err(ConfigError::Validation(format!(
+                            "{source_id}: EPSG:7415 requires rdnaptrans2018_epsg_1149 so NAP heights cannot silently pass through unchanged"
+                        )));
+                    }
+                    VerticalTransform::Identity if configured_srid != 4979 => {
+                        return Err(ConfigError::Validation(format!(
+                            "{source_id}: identity surface transformation requires already-ellipsoidal EPSG:4979 input; configure a supported explicit operation for EPSG:{configured_srid}"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn base_height_column_or_default(&self) -> Option<&str> {
         self.base_height_column.as_deref()
+    }
+
+    pub fn extrusion_height_column(&self) -> Option<&str> {
+        self.height_column.as_deref()
     }
 
     pub fn content_query_attributes(&self) -> Vec<String> {
@@ -183,25 +297,90 @@ impl SourceConfig {
             push_unique_attribute(&mut attributes, color_column);
         }
 
-        if let Some(base_height_column) = &self.base_height_column {
-            push_unique_attribute(&mut attributes, base_height_column);
+        if self.source_model == SourceModel::ExtrudedFootprint {
+            if let Some(base_height_column) = &self.base_height_column {
+                push_unique_attribute(&mut attributes, base_height_column);
+            }
+            if let Some(height_column) = &self.height_column {
+                push_unique_attribute(&mut attributes, height_column);
+            }
         }
-        push_unique_attribute(&mut attributes, &self.height_column);
 
         attributes
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceModel {
     ExtrudedFootprint,
+    SurfaceGeometryZ,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GeometryType {
     Polygon,
     MultiPolygon,
+    PolygonZ,
+    MultiPolygonZ,
+}
+
+impl GeometryType {
+    pub fn has_z(self) -> bool {
+        matches!(self, Self::PolygonZ | Self::MultiPolygonZ)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum VerticalReference {
+    Named(NamedVerticalReference),
+    Crs(VerticalCrsReference),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NamedVerticalReference {
+    LocalGroundMeters,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerticalCrsReference {
+    pub crs: String,
+    pub target: String,
+    #[serde(default)]
+    pub operation: Option<VerticalTransform>,
+}
+
+impl VerticalCrsReference {
+    pub fn source_srid(&self, source_id: &str) -> Result<i32, ConfigError> {
+        parse_epsg_code(&self.crs).map_err(|message| {
+            ConfigError::Validation(format!("{source_id}: vertical_reference.crs {message}"))
+        })
+    }
+
+    pub fn target_srid(&self, source_id: &str) -> Result<i32, ConfigError> {
+        parse_epsg_code(&self.target).map_err(|message| {
+            ConfigError::Validation(format!("{source_id}: vertical_reference.target {message}"))
+        })
+    }
+
+    pub fn effective_operation(&self, source_srid: i32) -> VerticalTransform {
+        self.operation.unwrap_or(if source_srid == 7415 {
+            VerticalTransform::Rdnaptrans2018Epsg1149
+        } else {
+            VerticalTransform::Identity
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalTransform {
+    Identity,
+    #[serde(rename = "rdnaptrans2018_epsg_1149")]
+    Rdnaptrans2018Epsg1149,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -220,9 +399,36 @@ impl SourceBounds {
     }
 
     fn validate(&self, source_id: &str) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("west", self.west),
+            ("south", self.south),
+            ("east", self.east),
+            ("north", self.north),
+            ("min_height_m", self.min_height_m),
+            ("max_height_m", self.max_height_m),
+        ] {
+            if !value.is_finite() {
+                return Err(ConfigError::Validation(format!(
+                    "{source_id}: bounds.{field} must be finite"
+                )));
+            }
+        }
+
+        if !(-180.0..=180.0).contains(&self.west) || !(-180.0..=180.0).contains(&self.east) {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: bounds west/east must be within -180..=180 degrees"
+            )));
+        }
+
+        if !(-90.0..=90.0).contains(&self.south) || !(-90.0..=90.0).contains(&self.north) {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: bounds south/north must be within -90..=90 degrees"
+            )));
+        }
+
         if self.west >= self.east {
             return Err(ConfigError::Validation(format!(
-                "{source_id}: west must be less than east"
+                "{source_id}: bounds.west must be less than bounds.east; antimeridian-spanning bounds are not supported"
             )));
         }
 
@@ -275,10 +481,20 @@ pub struct TilesetConfig {
 }
 
 impl TilesetConfig {
-    fn validate(&self, source_id: &str, has_descendants: bool) -> Result<(), ConfigError> {
+    fn validate(
+        &self,
+        source_id: &str,
+        max_level: u8,
+        has_descendants: bool,
+    ) -> Result<(), ConfigError> {
         if self.content_start_level > MAX_TILE_LEVEL {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: tileset.content_start_level must be <= {MAX_TILE_LEVEL}"
+            )));
+        }
+        if self.content_start_level > max_level {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: tileset.content_start_level must be <= max_level ({max_level})"
             )));
         }
         if !self.root_geometric_error_m.is_finite() || self.root_geometric_error_m < 0.0 {
@@ -393,6 +609,23 @@ fn require_identifier(value: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn parse_epsg_code(value: &str) -> Result<i32, &'static str> {
+    let value = value.trim();
+    let Some((authority, code)) = value.split_once(':') else {
+        return Err("must use EPSG:<positive integer> syntax");
+    };
+    if !authority.eq_ignore_ascii_case("EPSG") {
+        return Err("must use the EPSG authority");
+    }
+    let code = code
+        .parse::<i32>()
+        .map_err(|_| "must contain a valid EPSG integer code")?;
+    if code <= 0 {
+        return Err("must contain a positive EPSG code");
+    }
+    Ok(code)
+}
+
 fn push_unique_attribute(attributes: &mut Vec<String>, attribute: &str) {
     if !attributes.iter().any(|existing| existing == attribute) {
         attributes.push(attribute.to_string());
@@ -417,7 +650,7 @@ mod tests {
         assert_eq!(source.srid, 4326);
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
-        assert_eq!(source.height_column, "height_m");
+        assert_eq!(source.height_column.as_deref(), Some("height_m"));
         assert_eq!(source.tileset.root_geometric_error_m, 512.0);
         assert_eq!(
             source.tileset.content_uri_template,
@@ -486,6 +719,208 @@ sources:
     }
 
     #[test]
+    fn loads_surface_geometry_z_without_extrusion_columns() {
+        let raw = r#"
+sources:
+  sibbe_lod12:
+    connection: ${DATABASE_URL}
+    schema: bag
+    table: lod12_3d
+    geometry_column: geom
+    id_column: identificatie
+    srid: 7415
+    source_model: surface_geometry_z
+    vertical_reference:
+      crs: EPSG:7415
+      target: EPSG:4979
+    geometry_types:
+      - PolygonZ
+      - MultiPolygonZ
+    bounds:
+      west: 5.84
+      south: 50.87
+      east: 5.88
+      north: 50.90
+      min_height_m: 40.0
+      max_height_m: 180.0
+    min_level: 0
+    max_level: 0
+    subtree_levels: 4
+    max_features_per_tile: 1000
+    attributes:
+      - status
+    material:
+      default_base_color: [0.72, 0.70, 0.65, 1.0]
+"#;
+        let catalog = SourceCatalog::from_yaml_str(raw).expect("surface config should load");
+        let source = &catalog.sources["sibbe_lod12"];
+
+        assert_eq!(source.source_model, SourceModel::SurfaceGeometryZ);
+        assert_eq!(source.base_height_column, None);
+        assert_eq!(source.height_column, None);
+        assert_eq!(source.content_query_attributes(), vec!["status"]);
+        let VerticalReference::Crs(reference) = &source.vertical_reference else {
+            panic!("surface vertical reference should be CRS-backed");
+        };
+        assert_eq!(
+            reference
+                .source_srid("sibbe_lod12")
+                .expect("EPSG code should parse"),
+            7415
+        );
+        assert_eq!(
+            reference
+                .target_srid("sibbe_lod12")
+                .expect("target EPSG code should parse"),
+            4979
+        );
+        assert_eq!(
+            reference.effective_operation(7415),
+            VerticalTransform::Rdnaptrans2018Epsg1149
+        );
+    }
+
+    #[test]
+    fn rejects_surface_geometry_without_z_or_vertical_crs_contract() {
+        let valid = r#"
+sources:
+  surfaces:
+    connection: ${DATABASE_URL}
+    schema: public
+    table: surfaces
+    geometry_column: geom
+    id_column: id
+    srid: 7415
+    source_model: surface_geometry_z
+    vertical_reference:
+      crs: EPSG:7415
+      target: EPSG:4979
+    geometry_types: [MultiPolygonZ]
+    bounds:
+      west: 5.0
+      south: 50.0
+      east: 6.0
+      north: 51.0
+      min_height_m: 0.0
+      max_height_m: 100.0
+    min_level: 0
+    max_level: 0
+    subtree_levels: 1
+    max_features_per_tile: 10
+    attributes: []
+    material:
+      default_base_color: [1.0, 1.0, 1.0, 1.0]
+"#;
+
+        let no_z = valid.replace("[MultiPolygonZ]", "[MultiPolygon]");
+        let error = SourceCatalog::from_yaml_str(&no_z).expect_err("2D surface should fail");
+        assert!(error.to_string().contains("PolygonZ and MultiPolygonZ"));
+
+        let local_vertical = valid.replace(
+            "vertical_reference:\n      crs: EPSG:7415\n      target: EPSG:4979",
+            "vertical_reference: local_ground_meters",
+        );
+        let error = SourceCatalog::from_yaml_str(&local_vertical)
+            .expect_err("surface without CRS contract should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a vertical_reference mapping")
+        );
+
+        let wrong_target = valid.replace("target: EPSG:4979", "target: EPSG:4978");
+        let error = SourceCatalog::from_yaml_str(&wrong_target)
+            .expect_err("surface target must be geographic 3D WGS84");
+        assert!(
+            error
+                .to_string()
+                .contains("requires vertical_reference.target: EPSG:4979")
+        );
+
+        let ballpark = valid.replace(
+            "target: EPSG:4979",
+            "target: EPSG:4979\n      operation: identity",
+        );
+        let error = SourceCatalog::from_yaml_str(&ballpark)
+            .expect_err("EPSG:7415 ballpark transform should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires rdnaptrans2018_epsg_1149")
+        );
+
+        let unsupported_postgis = valid
+            .replace("srid: 7415", "srid: 28992")
+            .replace("crs: EPSG:7415", "crs: EPSG:28992")
+            .replace(
+                "target: EPSG:4979",
+                "target: EPSG:4979\n      operation: identity",
+            );
+        let error = SourceCatalog::from_yaml_str(&unsupported_postgis)
+            .expect_err("an implicit 3D transform from a projected CRS should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("identity surface transformation requires already-ellipsoidal EPSG:4979")
+        );
+
+        let subdivided = valid.replace("max_level: 0", "max_level: 1");
+        let error = SourceCatalog::from_yaml_str(&subdivided)
+            .expect_err("whole native surfaces must not be duplicated into child tiles");
+        assert!(error.to_string().contains("requires max_level = 0"));
+    }
+
+    #[test]
+    fn rejects_non_finite_or_out_of_range_geodetic_bounds() {
+        let valid = SourceBounds {
+            west: 4.0,
+            south: 50.0,
+            east: 6.0,
+            north: 52.0,
+            min_height_m: -10.0,
+            max_height_m: 100.0,
+        };
+        valid.validate("fixture").expect("valid bounds");
+
+        for (field, bounds) in [
+            (
+                "finite",
+                SourceBounds {
+                    west: f64::NAN,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "longitude",
+                SourceBounds {
+                    east: 181.0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "latitude",
+                SourceBounds {
+                    north: 91.0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "height",
+                SourceBounds {
+                    max_height_m: f64::INFINITY,
+                    ..valid.clone()
+                },
+            ),
+        ] {
+            let error = bounds.validate("fixture").expect_err(field);
+            assert!(
+                error.to_string().contains("bounds"),
+                "{field}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_impractically_large_subtree_levels() {
         let raw = include_str!("../../../config/poc-sources.yaml")
             .replace("subtree_levels: 4", "subtree_levels: 9");
@@ -510,6 +945,19 @@ sources:
         let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
 
         assert!(error.to_string().contains("max_level must be <= 31"));
+    }
+
+    #[test]
+    fn rejects_content_start_level_above_source_max_level() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("content_start_level: 12", "content_start_level: 17");
+        let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("content_start_level must be <= max_level")
+        );
     }
 
     #[test]

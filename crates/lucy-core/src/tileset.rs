@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::mesh::MeshFrame;
 use crate::source::{ConfigError, SourceConfig};
 use crate::tile::TileCoord;
 
@@ -84,6 +85,7 @@ pub fn generate_tileset(
             bounding_volume: BoundingVolume {
                 region: root_region,
             },
+            transform: MeshFrame::from_source_bounds(&source.bounds).enu_to_ecef_transform(),
             geometric_error: options.root_geometric_error_m,
             refine: Refine::Replace,
             content: TileContent {
@@ -137,6 +139,7 @@ pub struct Asset {
 #[serde(rename_all = "camelCase")]
 pub struct Tile {
     pub bounding_volume: BoundingVolume,
+    pub transform: [f64; 16],
     pub geometric_error: f64,
     pub refine: Refine,
     pub content: TileContent,

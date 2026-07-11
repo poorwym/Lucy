@@ -72,7 +72,10 @@ mod tests {
         let metrics = request("/metrics").await;
         assert_eq!(metrics.status(), StatusCode::OK);
         let metrics = body_json(metrics).await;
-        assert_eq!(metrics["source_count"], 1);
+        assert_eq!(
+            metrics["source_count"],
+            serde_json::json!(fixture_catalog().sources.len())
+        );
     }
 
     #[tokio::test]

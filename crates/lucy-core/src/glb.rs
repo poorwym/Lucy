@@ -21,6 +21,7 @@ const CHUNK_HEADER_LEN: usize = 8;
 const INDEX_BYTE_LEN: usize = 4;
 const POSITION_COMPONENTS: usize = 3;
 const POSITION_BYTE_LEN: usize = POSITION_COMPONENTS * 4;
+const NORMAL_BYTE_LEN: usize = POSITION_COMPONENTS * 4;
 const COLOR_BYTE_LEN: usize = 4 * 4;
 const FEATURE_ID_BYTE_LEN: usize = 4;
 const FEATURE_ID_PROPERTY: &str = "featureId";
@@ -31,6 +32,7 @@ pub struct ContentFeature {
     pub id: String,
     pub mesh: TriangleMesh,
     pub base_color: [f32; 4],
+    pub double_sided: bool,
     pub properties: BTreeMap<String, Option<String>>,
 }
 
@@ -73,16 +75,17 @@ pub fn encode_content_tile_glb(meshes: &[TriangleMesh]) -> Result<Vec<u8>, GlbEr
 /// an embedded structural metadata property table.
 #[tracing::instrument(
     level = "debug",
-    skip(features, gltf_to_ecef),
+    skip(features, node_transform),
     fields(feature_count = features.len())
 )]
 pub fn encode_feature_content_tile_glb(
     features: &[ContentFeature],
-    gltf_to_ecef: [f64; 16],
+    node_transform: [f64; 16],
 ) -> Result<Vec<u8>, GlbError> {
     if features.is_empty() {
         return Err(GlbError::EmptyMesh);
     }
+    validate_node_transform(node_transform)?;
     if features.len() > MAX_PICKABLE_FEATURES_PER_TILE as usize {
         return Err(GlbError::InvalidFeature(format!(
             "feature count {} exceeds the exact FLOAT feature ID limit {MAX_PICKABLE_FEATURES_PER_TILE}",
@@ -99,6 +102,7 @@ pub fn encode_feature_content_tile_glb(
     let mut property_names = BTreeSet::new();
     let mut source_ids = BTreeSet::new();
     let mut uses_blending = false;
+    let mut double_sided = false;
 
     for (feature_index, feature) in features.iter().enumerate() {
         validate_content_feature(feature, &mut source_ids, &mut property_names)?;
@@ -117,6 +121,7 @@ pub fn encode_feature_content_tile_glb(
             feature.mesh.vertices.len(),
         ));
         uses_blending |= feature.base_color[3] < 1.0;
+        double_sided |= feature.double_sided;
 
         for index in &feature.mesh.indices {
             tile_mesh
@@ -156,6 +161,21 @@ pub fn encode_feature_content_tile_glb(
         BYTE_ALIGNMENT,
         Some(ARRAY_BUFFER_TARGET),
         Some(POSITION_BYTE_LEN),
+    );
+
+    let mut normal_bytes = Vec::with_capacity(tile_mesh.vertices.len() * NORMAL_BYTE_LEN);
+    for vertex in &tile_mesh.vertices {
+        for component in gltf_direction(vertex.normal) {
+            normal_bytes.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    let normal_view = append_buffer_view(
+        &mut binary,
+        &mut buffer_views,
+        &normal_bytes,
+        BYTE_ALIGNMENT,
+        Some(ARRAY_BUFFER_TARGET),
+        Some(NORMAL_BYTE_LEN),
     );
 
     let mut color_bytes = Vec::with_capacity(vertex_colors.len() * COLOR_BYTE_LEN);
@@ -264,7 +284,7 @@ pub fn encode_feature_content_tile_glb(
         },
         "scene": 0,
         "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0, "matrix": gltf_to_ecef }],
+        "nodes": [{ "mesh": 0, "matrix": node_transform }],
         "materials": [
             {
                 "name": "Lucy feature colors",
@@ -273,7 +293,8 @@ pub fn encode_feature_content_tile_glb(
                     "metallicFactor": 0.0,
                     "roughnessFactor": 1.0
                 },
-                "alphaMode": alpha_mode
+                "alphaMode": alpha_mode,
+                "doubleSided": double_sided
             }
         ],
         "meshes": [
@@ -282,8 +303,9 @@ pub fn encode_feature_content_tile_glb(
                     {
                         "attributes": {
                             "POSITION": 1,
-                            "COLOR_0": 2,
-                            "_FEATURE_ID_0": 3
+                            "NORMAL": 2,
+                            "COLOR_0": 3,
+                            "_FEATURE_ID_0": 4
                         },
                         "indices": 0,
                         "material": 0,
@@ -324,6 +346,13 @@ pub fn encode_feature_content_tile_glb(
                 "max": bounds.max
             },
             {
+                "bufferView": normal_view,
+                "byteOffset": 0,
+                "componentType": FLOAT_COMPONENT_TYPE,
+                "count": tile_mesh.vertices.len(),
+                "type": "VEC3"
+            },
+            {
                 "bufferView": color_view,
                 "byteOffset": 0,
                 "componentType": FLOAT_COMPONENT_TYPE,
@@ -359,7 +388,9 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
     let index_byte_length = mesh.indices.len() * INDEX_BYTE_LEN;
     let position_byte_offset = align_len(index_byte_length, BYTE_ALIGNMENT);
     let position_byte_length = mesh.vertices.len() * POSITION_BYTE_LEN;
-    let binary_byte_length = position_byte_offset + position_byte_length;
+    let normal_byte_offset = align_len(position_byte_offset + position_byte_length, BYTE_ALIGNMENT);
+    let normal_byte_length = mesh.vertices.len() * NORMAL_BYTE_LEN;
+    let binary_byte_length = normal_byte_offset + normal_byte_length;
 
     let mut binary = Vec::with_capacity(binary_byte_length);
     for index in &mesh.indices {
@@ -368,6 +399,12 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
     binary.extend(std::iter::repeat_n(0, position_byte_offset - binary.len()));
     for vertex in &mesh.vertices {
         for component in gltf_position(vertex.position) {
+            binary.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    binary.extend(std::iter::repeat_n(0, normal_byte_offset - binary.len()));
+    for vertex in &mesh.vertices {
+        for component in gltf_direction(vertex.normal) {
             binary.extend_from_slice(&component.to_le_bytes());
         }
     }
@@ -394,7 +431,8 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
                 "primitives": [
                     {
                         "attributes": {
-                            "POSITION": 1
+                            "POSITION": 1,
+                            "NORMAL": 2
                         },
                         "indices": 0,
                         "mode": TRIANGLES_MODE
@@ -420,6 +458,13 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
                 "byteLength": position_byte_length,
                 "byteStride": POSITION_BYTE_LEN,
                 "target": ARRAY_BUFFER_TARGET
+            },
+            {
+                "buffer": 0,
+                "byteOffset": normal_byte_offset,
+                "byteLength": normal_byte_length,
+                "byteStride": NORMAL_BYTE_LEN,
+                "target": ARRAY_BUFFER_TARGET
             }
         ],
         "accessors": [
@@ -438,6 +483,13 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
                 "type": "VEC3",
                 "min": bounds.min,
                 "max": bounds.max
+            },
+            {
+                "bufferView": 2,
+                "byteOffset": 0,
+                "componentType": FLOAT_COMPONENT_TYPE,
+                "count": mesh.vertices.len(),
+                "type": "VEC3"
             }
         ]
     });
@@ -614,6 +666,7 @@ pub enum GlbError {
     EmptyMesh,
     InvalidMesh(String),
     InvalidFeature(String),
+    InvalidTransform(String),
     Encode(String),
 }
 
@@ -625,6 +678,9 @@ impl fmt::Display for GlbError {
             GlbError::InvalidFeature(message) => {
                 write!(f, "invalid feature content for GLB encoding: {message}")
             }
+            GlbError::InvalidTransform(message) => {
+                write!(f, "invalid GLB node transform: {message}")
+            }
             GlbError::Encode(message) => write!(f, "failed to encode GLB: {message}"),
         }
     }
@@ -635,6 +691,24 @@ impl std::error::Error for GlbError {}
 struct PositionBounds {
     min: [f32; 3],
     max: [f32; 3],
+}
+
+fn validate_node_transform(transform: [f64; 16]) -> Result<(), GlbError> {
+    if !transform.iter().all(|component| component.is_finite()) {
+        return Err(GlbError::InvalidTransform(
+            "all matrix components must be finite".to_string(),
+        ));
+    }
+    if transform[3].abs() > 1.0e-12
+        || transform[7].abs() > 1.0e-12
+        || transform[11].abs() > 1.0e-12
+        || (transform[15] - 1.0).abs() > 1.0e-12
+    {
+        return Err(GlbError::InvalidTransform(
+            "matrix must be affine with bottom row [0, 0, 0, 1]".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_mesh(mesh: &TriangleMesh) -> Result<(), GlbError> {
@@ -659,6 +733,22 @@ fn validate_mesh(mesh: &TriangleMesh) -> Result<(), GlbError> {
         {
             return Err(GlbError::InvalidMesh(format!(
                 "vertex {index} position contains a non-finite component"
+            )));
+        }
+        if !vertex.normal.iter().all(|component| component.is_finite()) {
+            return Err(GlbError::InvalidMesh(format!(
+                "vertex {index} normal contains a non-finite component"
+            )));
+        }
+        let normal_length = vertex
+            .normal
+            .iter()
+            .map(|component| component * component)
+            .sum::<f32>()
+            .sqrt();
+        if (normal_length - 1.0).abs() > 1.0e-3 {
+            return Err(GlbError::InvalidMesh(format!(
+                "vertex {index} normal must be unit length, got {normal_length}"
             )));
         }
     }
@@ -694,6 +784,11 @@ fn gltf_position(enu_position: [f32; 3]) -> [f32; 3] {
     [east, up, -north]
 }
 
+fn gltf_direction(enu_direction: [f32; 3]) -> [f32; 3] {
+    let [east, north, up] = enu_direction;
+    [east, up, -north]
+}
+
 fn append_chunk(glb: &mut Vec<u8>, chunk_type: u32, chunk: &[u8]) -> Result<(), GlbError> {
     let chunk_length = u32::try_from(chunk.len())
         .map_err(|_| GlbError::Encode("GLB chunk length exceeds u32".to_string()))?;
@@ -725,15 +820,19 @@ mod tests {
             vertices: vec![
                 MeshVertex {
                     position: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                 },
                 MeshVertex {
                     position: [1.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                 },
                 MeshVertex {
                     position: [1.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                 },
                 MeshVertex {
                     position: [0.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                 },
             ],
             indices: vec![0, 1, 2, 0, 2, 3],
@@ -745,6 +844,7 @@ mod tests {
             id: "101".to_string(),
             mesh: fixture_mesh(),
             base_color: [0.72, 0.70, 0.65, 1.0],
+            double_sided: false,
             properties: BTreeMap::from([
                 ("name".to_string(), Some("Alpha".to_string())),
                 ("building_type".to_string(), None),
@@ -758,6 +858,7 @@ mod tests {
             id: "202".to_string(),
             mesh: second_mesh,
             base_color: [0.25, 0.5, 0.75, 0.5],
+            double_sided: true,
             properties: BTreeMap::from([
                 ("name".to_string(), Some("Beta".to_string())),
                 ("building_type".to_string(), Some("office".to_string())),
@@ -765,6 +866,12 @@ mod tests {
         };
 
         vec![first, second]
+    }
+
+    fn identity_transform() -> [f64; 16] {
+        [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
     }
 
     #[test]
@@ -777,12 +884,13 @@ mod tests {
         assert_eq!(parsed.length as usize, glb.len());
         assert_eq!(parsed.json_chunk_type, JSON_CHUNK_TYPE);
         assert_eq!(parsed.bin_chunk_type, BIN_CHUNK_TYPE);
-        assert_eq!(parsed.bin.len(), 72);
+        assert_eq!(parsed.bin.len(), 120);
         assert_eq!(parsed.document["asset"]["version"], "2.0");
         assert_eq!(parsed.document["scene"], 0);
-        assert_eq!(parsed.document["buffers"][0]["byteLength"], 72);
+        assert_eq!(parsed.document["buffers"][0]["byteLength"], 120);
         assert_eq!(parsed.document["bufferViews"][0]["byteLength"], 24);
         assert_eq!(parsed.document["bufferViews"][1]["byteOffset"], 24);
+        assert_eq!(parsed.document["bufferViews"][2]["byteOffset"], 72);
         assert_eq!(parsed.document["accessors"][0]["componentType"], 5125);
         assert_eq!(parsed.document["accessors"][0]["count"], 6);
         assert_eq!(parsed.document["accessors"][1]["componentType"], 5126);
@@ -808,7 +916,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(indices, vec![0, 1, 2, 0, 2, 3]);
 
-        let positions = parsed.bin[24..]
+        let positions = parsed.bin[24..72]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk")))
             .collect::<Vec<_>>();
@@ -816,6 +924,17 @@ mod tests {
             positions,
             vec![
                 0.0, 0.0, -0.0, 1.0, 0.0, -0.0, 1.0, 0.0, -1.0, 0.0, 0.0, -1.0
+            ]
+        );
+
+        let normals = parsed.bin[72..120]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            normals,
+            vec![
+                0.0, 1.0, -0.0, 0.0, 1.0, -0.0, 0.0, 1.0, -0.0, 0.0, 1.0, -0.0
             ]
         );
     }
@@ -844,7 +963,9 @@ mod tests {
     #[test]
     fn feature_content_emits_material_colors_and_pickable_metadata() {
         let features = fixture_content_features();
-        let glb = encode_feature_content_tile_glb(&features, identity_transform())
+        let mut node_transform = identity_transform();
+        node_transform[12..15].copy_from_slice(&[125.25, -32.5, 7.75]);
+        let glb = encode_feature_content_tile_glb(&features, node_transform)
             .expect("feature GLB should encode");
         let parsed = parse_glb(&glb);
         let document = &parsed.document;
@@ -859,11 +980,14 @@ mod tests {
             json!([1.0, 1.0, 1.0, 1.0])
         );
         assert_eq!(document["materials"][0]["alphaMode"], "BLEND");
+        assert_eq!(document["materials"][0]["doubleSided"], true);
+        assert_eq!(document["nodes"][0]["matrix"], json!(node_transform));
 
         let primitive = &document["meshes"][0]["primitives"][0];
         assert_eq!(primitive["attributes"]["POSITION"], 1);
-        assert_eq!(primitive["attributes"]["COLOR_0"], 2);
-        assert_eq!(primitive["attributes"]["_FEATURE_ID_0"], 3);
+        assert_eq!(primitive["attributes"]["NORMAL"], 2);
+        assert_eq!(primitive["attributes"]["COLOR_0"], 3);
+        assert_eq!(primitive["attributes"]["_FEATURE_ID_0"], 4);
         assert_eq!(
             primitive["extensions"]["EXT_mesh_features"]["featureIds"][0],
             json!({
@@ -874,13 +998,13 @@ mod tests {
             })
         );
 
-        let colors = read_f32_accessor(&parsed, 2, 4);
+        let colors = read_f32_accessor(&parsed, 3, 4);
         assert_eq!(&colors[0..4], &[0.72, 0.70, 0.65, 1.0]);
         assert_eq!(&colors[12..16], &[0.72, 0.70, 0.65, 1.0]);
         assert_eq!(&colors[16..20], &[0.25, 0.5, 0.75, 0.5]);
         assert_eq!(&colors[28..32], &[0.25, 0.5, 0.75, 0.5]);
 
-        let feature_ids = read_f32_accessor(&parsed, 3, 1);
+        let feature_ids = read_f32_accessor(&parsed, 4, 1);
         assert_eq!(feature_ids, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
 
         let metadata = &document["extensions"]["EXT_structural_metadata"];
@@ -920,6 +1044,15 @@ mod tests {
         let error = encode_feature_content_tile_glb(&features, identity_transform())
             .expect_err("property should fail");
         assert!(error.to_string().contains("must match"));
+    }
+
+    #[test]
+    fn feature_content_rejects_non_affine_node_transform() {
+        let mut transform = identity_transform();
+        transform[3] = 0.5;
+        let error = encode_feature_content_tile_glb(&fixture_content_features(), transform)
+            .expect_err("perspective transform should fail");
+        assert!(matches!(error, GlbError::InvalidTransform(_)));
     }
 
     #[test]
@@ -1028,10 +1161,4 @@ mod tests {
             bin,
         }
     }
-}
-#[cfg(test)]
-fn identity_transform() -> [f64; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ]
 }

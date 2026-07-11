@@ -1,14 +1,35 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Instant;
 
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Row};
 
-use lucy_core::source::{ConfigError, SourceConfig};
+use lucy_core::source::{
+    ConfigError, GeometryType, SourceBounds, SourceConfig, SourceModel, VerticalReference,
+    VerticalTransform,
+};
 use lucy_core::subtree::{SubtreeAvailabilityBits, subtree_layout};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
 
-/// One PostGIS feature clipped to a requested tile bbox.
+const TARGET_GEODETIC_3D_SRID: i32 = 4979;
+const RDNAPTRANS2018_EPSG_1149_OPERATION: &str = "rdnaptrans2018_epsg_1149";
+const RDNAPTRANS2018_EPSG_1149_PIPELINE: &str = "+proj=pipeline \
+  +step +inv +proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 \
+        +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel \
+  +step +proj=hgridshift +grids=nl_nsgi_rdtrans2018.tif \
+  +step +proj=vgridshift +grids=nl_nsgi_nlgeo2018.tif +multiplier=1 \
+  +step +proj=cart +ellps=GRS80 \
+  +step +proj=helmert +x=0 +y=0 +z=0 \
+  +step +inv +proj=cart +ellps=WGS84 \
+  +step +proj=unitconvert +xy_in=rad +xy_out=deg";
+
+/// One PostGIS feature selected for a requested tile bbox.
+///
+/// Extruded footprints contain the clipped fragment. Native surface features
+/// contain the whole source geometry, normalized to Lucy's explicit EPSG:4979
+/// target contract. Validated native-surface sources are root-owned
+/// (`max_level = 0`), because PostGIS XY overlay would collapse vertical
+/// PolygonZ faces and whole-feature child duplication would violate tile bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileFeatureWkb {
     pub id: String,
@@ -16,17 +37,24 @@ pub struct TileFeatureWkb {
     pub attributes: BTreeMap<String, Option<String>>,
 }
 
-/// Query a tile bbox from PostGIS and return positive-area clipped geometry as WKB.
+/// Query a tile bbox from PostGIS using the configured geometry strategy.
 pub async fn query_tile_geometry_wkb(
     client: &impl GenericClient,
     source: &SourceConfig,
     tile: TileCoord,
 ) -> Result<Vec<TileFeatureWkb>, TileQueryError> {
+    if tile.level < source.min_level || tile.level > source.max_level {
+        return Err(ConfigError::Validation(format!(
+            "tile level={} is outside configured levels {}..={}",
+            tile.level, source.min_level, source.max_level
+        ))
+        .into());
+    }
     let bbox = tile.geographic_region_degrees(&source.bounds)?;
     query_tile_geometry_wkb_for_bbox(client, source, bbox).await
 }
 
-/// Query an explicit geographic bbox from PostGIS and return clipped geometry as WKB.
+/// Query an explicit target-geodetic bbox and return strategy-normalized WKB.
 #[tracing::instrument(
     name = "postgis.tile_geometry",
     skip(client, source, bbox),
@@ -42,7 +70,7 @@ pub async fn query_tile_geometry_wkb(
         query_limit = source.max_features_per_tile + 1,
     )
 )]
-pub async fn query_tile_geometry_wkb_for_bbox(
+async fn query_tile_geometry_wkb_for_bbox(
     client: &impl GenericClient,
     source: &SourceConfig,
     bbox: GeographicRegionDegrees,
@@ -52,19 +80,40 @@ pub async fn query_tile_geometry_wkb_for_bbox(
     let plan = build_tile_wkb_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
     let started = Instant::now();
-    let rows = client
-        .query(
-            &plan.sql,
-            &[
-                &bbox.west,
-                &bbox.south,
-                &bbox.east,
-                &bbox.north,
-                &source.srid,
-                &query_limit,
-            ],
-        )
-        .await?;
+    let rows = match plan.bindings {
+        QueryBindings::Standard => {
+            client
+                .query(
+                    &plan.sql,
+                    &[
+                        &bbox.west,
+                        &bbox.south,
+                        &bbox.east,
+                        &bbox.north,
+                        &source.srid,
+                        &query_limit,
+                    ],
+                )
+                .await
+        }
+        QueryBindings::Rdnaptrans2018Epsg1149 => {
+            client
+                .query(
+                    &plan.sql,
+                    &[
+                        &bbox.west,
+                        &bbox.south,
+                        &bbox.east,
+                        &bbox.north,
+                        &source.srid,
+                        &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+                        &query_limit,
+                    ],
+                )
+                .await
+        }
+    }
+    .map_err(|source_error| plan.map_query_error(source, source_error))?;
     tracing::debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         row_count = rows.len(),
@@ -144,12 +193,33 @@ pub async fn query_subtree_availability(
     let plan = build_subtree_occupancy_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
     let started = Instant::now();
-    let rows = client
-        .query(
-            &plan.sql,
-            &[&west, &south, &east, &north, &source.srid, &query_limit],
-        )
-        .await?;
+    let rows = match plan.bindings {
+        QueryBindings::Standard => {
+            client
+                .query(
+                    &plan.sql,
+                    &[&west, &south, &east, &north, &source.srid, &query_limit],
+                )
+                .await
+        }
+        QueryBindings::Rdnaptrans2018Epsg1149 => {
+            client
+                .query(
+                    &plan.sql,
+                    &[
+                        &west,
+                        &south,
+                        &east,
+                        &north,
+                        &source.srid,
+                        &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+                        &query_limit,
+                    ],
+                )
+                .await
+        }
+    }
+    .map_err(|source_error| plan.map_query_error(source, source_error))?;
     tracing::debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         query_slot_count = slots.len(),
@@ -229,6 +299,753 @@ impl SubtreeQuerySlot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGeometryProfile {
+    pub row_count: u64,
+    pub srids: Vec<i32>,
+    pub geometry_types: Vec<String>,
+    pub zm_flags: Vec<i32>,
+}
+
+#[derive(Debug)]
+pub enum SourceValidationError {
+    ConnectionConfig {
+        source_id: String,
+        message: String,
+    },
+    Database {
+        source_id: String,
+        stage: &'static str,
+        source: tokio_postgres::Error,
+    },
+    RelationNotFound {
+        source_id: String,
+        schema: String,
+        table: String,
+    },
+    MissingColumns {
+        source_id: String,
+        columns: Vec<String>,
+    },
+    GeometryColumnType {
+        source_id: String,
+        column: String,
+        actual_type: String,
+    },
+    NullFeatureId {
+        source_id: String,
+        count: u64,
+    },
+    EmptyFeatureId {
+        source_id: String,
+        count: u64,
+    },
+    DuplicateFeatureId {
+        source_id: String,
+    },
+    NullGeometry {
+        source_id: String,
+        count: u64,
+    },
+    EmptyGeometry {
+        source_id: String,
+        count: u64,
+    },
+    SridProfile {
+        source_id: String,
+        expected: i32,
+        found: Vec<i32>,
+    },
+    GeometryTypeProfile {
+        source_id: String,
+        allowed: Vec<String>,
+        found: Vec<String>,
+    },
+    CoordinateDimensionProfile {
+        source_id: String,
+        expected_zm_flag: i32,
+        found: Vec<i32>,
+    },
+    NonFiniteCoordinate {
+        source_id: String,
+        feature_id: String,
+    },
+    TransformUnavailable {
+        source_id: String,
+        source_srid: i32,
+        target_srid: i32,
+        operation: &'static str,
+        source: tokio_postgres::Error,
+    },
+    TransformContract {
+        source_id: String,
+        message: String,
+    },
+    TransformedExtentOutsideBounds {
+        source_id: String,
+        configured: [f64; 6],
+        actual: [f64; 6],
+    },
+    Config {
+        source_id: String,
+        source: ConfigError,
+    },
+}
+
+impl SourceValidationError {
+    fn database(source_id: &str, stage: &'static str, source: tokio_postgres::Error) -> Self {
+        Self::Database {
+            source_id: source_id.to_string(),
+            stage,
+            source,
+        }
+    }
+}
+
+impl fmt::Display for SourceValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionConfig { source_id, message } => {
+                write!(
+                    f,
+                    "source {source_id} connection is not configured: {message}"
+                )
+            }
+            Self::Database {
+                source_id,
+                stage,
+                source,
+            } => write!(
+                f,
+                "source {source_id} PostGIS validation failed during {stage}: {source}"
+            ),
+            Self::RelationNotFound {
+                source_id,
+                schema,
+                table,
+            } => write!(
+                f,
+                "source {source_id} relation {schema}.{table} does not exist"
+            ),
+            Self::MissingColumns { source_id, columns } => write!(
+                f,
+                "source {source_id} is missing required column(s): {}",
+                columns.join(", ")
+            ),
+            Self::GeometryColumnType {
+                source_id,
+                column,
+                actual_type,
+            } => write!(
+                f,
+                "source {source_id} geometry column {column} has type {actual_type}, expected PostGIS geometry"
+            ),
+            Self::NullFeatureId { source_id, count } => write!(
+                f,
+                "source {source_id} contains {count} row(s) with a NULL feature id"
+            ),
+            Self::EmptyFeatureId { source_id, count } => write!(
+                f,
+                "source {source_id} contains {count} row(s) whose feature id is an empty string"
+            ),
+            Self::DuplicateFeatureId { source_id } => {
+                write!(f, "source {source_id} feature ids are not unique")
+            }
+            Self::NullGeometry { source_id, count } => write!(
+                f,
+                "source {source_id} contains {count} row(s) with NULL geometry"
+            ),
+            Self::EmptyGeometry { source_id, count } => write!(
+                f,
+                "source {source_id} contains {count} row(s) with empty geometry"
+            ),
+            Self::SridProfile {
+                source_id,
+                expected,
+                found,
+            } => write!(
+                f,
+                "source {source_id} geometry SRID profile {found:?} does not match EPSG:{expected}"
+            ),
+            Self::GeometryTypeProfile {
+                source_id,
+                allowed,
+                found,
+            } => write!(
+                f,
+                "source {source_id} geometry type profile {found:?} is not contained in {allowed:?}"
+            ),
+            Self::CoordinateDimensionProfile {
+                source_id,
+                expected_zm_flag,
+                found,
+            } => write!(
+                f,
+                "source {source_id} coordinate Z/M profile {found:?} does not match required ST_Zmflag={expected_zm_flag}"
+            ),
+            Self::NonFiniteCoordinate {
+                source_id,
+                feature_id,
+            } => write!(
+                f,
+                "source {source_id} feature {feature_id} contains a missing or non-finite coordinate"
+            ),
+            Self::TransformUnavailable {
+                source_id,
+                source_srid,
+                target_srid,
+                operation,
+                source,
+            } => write!(
+                f,
+                "source {source_id} cannot transform EPSG:{source_srid} -> EPSG:{target_srid} with {operation}: {source}"
+            ),
+            Self::TransformContract { source_id, message } => {
+                write!(f, "source {source_id} transform contract failed: {message}")
+            }
+            Self::TransformedExtentOutsideBounds {
+                source_id,
+                configured,
+                actual,
+            } => write!(
+                f,
+                "source {source_id} transformed extent {actual:?} is outside configured EPSG:4979 bounds {configured:?}"
+            ),
+            Self::Config { source_id, source } => {
+                write!(
+                    f,
+                    "source {source_id} query configuration is invalid: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceValidationError {}
+
+/// Validate the configured relation and its strategy-specific geometry contract.
+///
+/// Surface validation deliberately does not call `ST_IsValid`: PostGIS/GEOS
+/// validates PolygonZ topology in XY, where legitimate vertical faces collapse.
+pub async fn validate_source(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<SourceGeometryProfile, SourceValidationError> {
+    validate_source_columns(client, source_id, source).await?;
+    let profile = query_source_geometry_profile(client, source_id, source).await?;
+    validate_source_geometry_profile(source_id, source, &profile)?;
+    validate_finite_coordinates(client, source_id, source).await?;
+    if source.source_model == SourceModel::SurfaceGeometryZ {
+        validate_surface_transform(client, source_id, source).await?;
+        if profile.row_count > 0 {
+            validate_surface_extent(client, source_id, source).await?;
+        }
+    }
+    Ok(profile)
+}
+
+async fn validate_source_columns(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let relation = client
+        .query_opt(
+            "SELECT c.oid::bigint \
+             FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
+            &[&source.schema, &source.table],
+        )
+        .await
+        .map_err(|error| SourceValidationError::database(source_id, "relation lookup", error))?;
+    let Some(relation) = relation else {
+        return Err(SourceValidationError::RelationNotFound {
+            source_id: source_id.to_string(),
+            schema: source.schema.clone(),
+            table: source.table.clone(),
+        });
+    };
+    let relation_oid = relation.get::<_, i64>(0);
+    let rows = client
+        .query(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_catalog.pg_attribute AS a \
+             WHERE a.attrelid = $1::bigint::oid AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&relation_oid],
+        )
+        .await
+        .map_err(|error| SourceValidationError::database(source_id, "column lookup", error))?;
+
+    let columns = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<BTreeMap<_, _>>();
+    let mut required = BTreeSet::from([source.geometry_column.clone(), source.id_column.clone()]);
+    required.extend(source.content_query_attributes());
+    let missing = required
+        .into_iter()
+        .filter(|column| !columns.contains_key(column))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(SourceValidationError::MissingColumns {
+            source_id: source_id.to_string(),
+            columns: missing,
+        });
+    }
+
+    let geometry_type = &columns[&source.geometry_column];
+    if geometry_type != "geometry" && !geometry_type.starts_with("geometry(") {
+        return Err(SourceValidationError::GeometryColumnType {
+            source_id: source_id.to_string(),
+            column: source.geometry_column.clone(),
+            actual_type: geometry_type.clone(),
+        });
+    }
+    Ok(())
+}
+
+async fn query_source_geometry_profile(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<SourceGeometryProfile, SourceValidationError> {
+    let schema = quote_identifier(&source.schema, "schema").map_err(|error| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source: error,
+        }
+    })?;
+    let table = quote_identifier(&source.table, "table").map_err(|error| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source: error,
+        }
+    })?;
+    let geometry =
+        quote_identifier(&source.geometry_column, "geometry_column").map_err(|error| {
+            SourceValidationError::Config {
+                source_id: source_id.to_string(),
+                source: error,
+            }
+        })?;
+    let id = quote_identifier(&source.id_column, "id_column").map_err(|error| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source: error,
+        }
+    })?;
+    let sql = format!(
+        "SELECT count(*)::bigint, \
+                count(*) FILTER (WHERE {geometry} IS NULL)::bigint, \
+                count(*) FILTER (WHERE {geometry} IS NOT NULL AND ST_IsEmpty({geometry}))::bigint, \
+                count(*) FILTER (WHERE {id} IS NULL)::bigint, \
+                count(*) FILTER (WHERE {id} IS NOT NULL AND {id}::text = '')::bigint, \
+                count(DISTINCT {id})::bigint, \
+                COALESCE(array_agg(DISTINCT ST_SRID({geometry})) \
+                  FILTER (WHERE {geometry} IS NOT NULL AND NOT ST_IsEmpty({geometry})), ARRAY[]::integer[]), \
+                COALESCE(array_agg(DISTINCT GeometryType({geometry})) \
+                  FILTER (WHERE {geometry} IS NOT NULL AND NOT ST_IsEmpty({geometry})), ARRAY[]::text[]), \
+                COALESCE(array_agg(DISTINCT ST_Zmflag({geometry})::integer) \
+                  FILTER (WHERE {geometry} IS NOT NULL AND NOT ST_IsEmpty({geometry})), ARRAY[]::integer[]) \
+         FROM {schema}.{table}"
+    );
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .map_err(|error| SourceValidationError::database(source_id, "geometry profile", error))?;
+    let row_count = u64::try_from(row.get::<_, i64>(0)).unwrap_or(0);
+    let null_geometry_count = u64::try_from(row.get::<_, i64>(1)).unwrap_or(0);
+    let empty_geometry_count = u64::try_from(row.get::<_, i64>(2)).unwrap_or(0);
+    let null_id_count = u64::try_from(row.get::<_, i64>(3)).unwrap_or(0);
+    let empty_id_count = u64::try_from(row.get::<_, i64>(4)).unwrap_or(0);
+    let distinct_id_count = u64::try_from(row.get::<_, i64>(5)).unwrap_or(0);
+    if null_id_count > 0 {
+        return Err(SourceValidationError::NullFeatureId {
+            source_id: source_id.to_string(),
+            count: null_id_count,
+        });
+    }
+    if empty_id_count > 0 {
+        return Err(SourceValidationError::EmptyFeatureId {
+            source_id: source_id.to_string(),
+            count: empty_id_count,
+        });
+    }
+    if distinct_id_count != row_count {
+        return Err(SourceValidationError::DuplicateFeatureId {
+            source_id: source_id.to_string(),
+        });
+    }
+    if null_geometry_count > 0 {
+        return Err(SourceValidationError::NullGeometry {
+            source_id: source_id.to_string(),
+            count: null_geometry_count,
+        });
+    }
+    if empty_geometry_count > 0 {
+        return Err(SourceValidationError::EmptyGeometry {
+            source_id: source_id.to_string(),
+            count: empty_geometry_count,
+        });
+    }
+
+    let mut srids = row.get::<_, Vec<i32>>(6);
+    let mut geometry_types = row.get::<_, Vec<String>>(7);
+    let mut zm_flags = row.get::<_, Vec<i32>>(8);
+    srids.sort_unstable();
+    geometry_types.sort();
+    zm_flags.sort_unstable();
+    Ok(SourceGeometryProfile {
+        row_count,
+        srids,
+        geometry_types,
+        zm_flags,
+    })
+}
+
+fn validate_source_geometry_profile(
+    source_id: &str,
+    source: &SourceConfig,
+    profile: &SourceGeometryProfile,
+) -> Result<(), SourceValidationError> {
+    if profile.row_count == 0 {
+        return Ok(());
+    }
+    if profile.srids != [source.srid] {
+        return Err(SourceValidationError::SridProfile {
+            source_id: source_id.to_string(),
+            expected: source.srid,
+            found: profile.srids.clone(),
+        });
+    }
+    let allowed = source
+        .geometry_types
+        .iter()
+        .copied()
+        .map(postgis_geometry_type)
+        .collect::<BTreeSet<_>>();
+    if profile
+        .geometry_types
+        .iter()
+        .any(|geometry_type| !allowed.contains(geometry_type.as_str()))
+    {
+        return Err(SourceValidationError::GeometryTypeProfile {
+            source_id: source_id.to_string(),
+            allowed: allowed.into_iter().map(str::to_string).collect(),
+            found: profile.geometry_types.clone(),
+        });
+    }
+    let expected_zm_flag = match source.source_model {
+        SourceModel::ExtrudedFootprint => 0,
+        SourceModel::SurfaceGeometryZ => 2,
+    };
+    if profile.zm_flags != [expected_zm_flag] {
+        return Err(SourceValidationError::CoordinateDimensionProfile {
+            source_id: source_id.to_string(),
+            expected_zm_flag,
+            found: profile.zm_flags.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn postgis_geometry_type(geometry_type: GeometryType) -> &'static str {
+    match geometry_type {
+        GeometryType::Polygon | GeometryType::PolygonZ => "POLYGON",
+        GeometryType::MultiPolygon | GeometryType::MultiPolygonZ => "MULTIPOLYGON",
+    }
+}
+
+async fn validate_finite_coordinates(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let schema = quote_identifier(&source.schema, "schema").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let table = quote_identifier(&source.table, "table").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let geometry =
+        quote_identifier(&source.geometry_column, "geometry_column").map_err(|source| {
+            SourceValidationError::Config {
+                source_id: source_id.to_string(),
+                source,
+            }
+        })?;
+    let id = quote_identifier(&source.id_column, "id_column").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let z_check = if source.source_model == SourceModel::SurfaceGeometryZ {
+        "ST_Z(p.geom) IS NULL OR NOT (abs(ST_Z(p.geom)) < 'Infinity'::float8) OR"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT t.{id}::text \
+         FROM {schema}.{table} AS t \
+         CROSS JOIN LATERAL ST_DumpPoints(t.{geometry}) AS p \
+         WHERE t.{geometry} IS NOT NULL AND NOT ST_IsEmpty(t.{geometry}) \
+           AND ({z_check} \
+                NOT (abs(ST_X(p.geom)) < 'Infinity'::float8) OR \
+                NOT (abs(ST_Y(p.geom)) < 'Infinity'::float8)) \
+         LIMIT 1"
+    );
+    if let Some(row) = client
+        .query_opt(&sql, &[])
+        .await
+        .map_err(|error| SourceValidationError::database(source_id, "coordinate scan", error))?
+    {
+        return Err(SourceValidationError::NonFiniteCoordinate {
+            source_id: source_id.to_string(),
+            feature_id: row.get(0),
+        });
+    }
+    Ok(())
+}
+
+async fn validate_surface_transform(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let transform =
+        surface_transform(source).map_err(|source_error| SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source: source_error,
+        })?;
+    let longitude = (source.bounds.west + source.bounds.east) / 2.0;
+    let latitude = (source.bounds.south + source.bounds.north) / 2.0;
+    let result = match transform {
+        SurfaceTransform::Rdnaptrans2018Epsg1149 => {
+            client
+                .query_one(
+                    &format!(
+                        "WITH target_point AS ( \
+                           SELECT ST_SetSRID(ST_MakePoint($1, $2, 0.0), {TARGET_GEODETIC_3D_SRID}) AS geom \
+                         ), source_point AS ( \
+                           SELECT ST_InverseTransformPipeline(geom, $3, $4::integer) AS geom FROM target_point \
+                         ), roundtrip AS ( \
+                           SELECT ST_TransformPipeline(geom, $3, {TARGET_GEODETIC_3D_SRID}) AS geom FROM source_point \
+                         ) \
+                         SELECT ST_X(geom), ST_Y(geom), ST_Z(geom), ST_SRID(geom), ST_Zmflag(geom)::integer \
+                         FROM roundtrip"
+                    ),
+                    &[
+                        &longitude,
+                        &latitude,
+                        &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+                        &source.srid,
+                    ],
+                )
+                .await
+        }
+        SurfaceTransform::Identity => {
+            client
+                .query_one(
+                    &format!(
+                        "WITH roundtrip AS ( \
+                           SELECT ST_SetSRID(ST_MakePoint($1, $2, 0.0), {TARGET_GEODETIC_3D_SRID}) AS geom \
+                         ) \
+                         SELECT ST_X(geom), ST_Y(geom), ST_Z(geom), ST_SRID(geom), ST_Zmflag(geom)::integer \
+                         FROM roundtrip"
+                    ),
+                    &[&longitude, &latitude],
+                )
+                .await
+        }
+    }
+    .map_err(|source_error| {
+        map_surface_validation_error(
+            source_id,
+            source,
+            transform,
+            "transform probe",
+            source_error,
+        )
+    })?;
+    validate_transform_probe(source_id, &result)
+}
+
+async fn validate_surface_extent(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let schema = quote_identifier(&source.schema, "schema").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let table = quote_identifier(&source.table, "table").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let geometry =
+        quote_identifier(&source.geometry_column, "geometry_column").map_err(|source| {
+            SourceValidationError::Config {
+                source_id: source_id.to_string(),
+                source,
+            }
+        })?;
+    let transform =
+        surface_transform(source).map_err(|source_error| SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source: source_error,
+        })?;
+    let aggregate = "SELECT min(ST_X(p.geom)), min(ST_Y(p.geom)), \
+                            max(ST_X(p.geom)), max(ST_Y(p.geom)), \
+                            min(ST_Z(p.geom)), max(ST_Z(p.geom))";
+    let row = match transform {
+        SurfaceTransform::Identity => {
+            client
+                .query_one(
+                    &format!(
+                        "{aggregate} \
+                         FROM {schema}.{table} AS t \
+                         CROSS JOIN LATERAL ST_DumpPoints(t.{geometry}) AS p"
+                    ),
+                    &[],
+                )
+                .await
+        }
+        SurfaceTransform::Rdnaptrans2018Epsg1149 => {
+            client
+                .query_one(
+                    &format!(
+                        "{aggregate} \
+                         FROM {schema}.{table} AS t \
+                         CROSS JOIN LATERAL ( \
+                           SELECT ST_TransformPipeline(t.{geometry}, $1, {TARGET_GEODETIC_3D_SRID}) AS geom \
+                         ) AS transformed \
+                         CROSS JOIN LATERAL ST_DumpPoints(transformed.geom) AS p"
+                    ),
+                    &[&RDNAPTRANS2018_EPSG_1149_PIPELINE],
+                )
+                .await
+        }
+    }
+    .map_err(|source_error| {
+        map_surface_validation_error(
+            source_id,
+            source,
+            transform,
+            "transformed extent",
+            source_error,
+        )
+    })?;
+
+    let mut actual = [0.0; 6];
+    for (index, value) in actual.iter_mut().enumerate() {
+        *value = row.get::<_, Option<f64>>(index).ok_or_else(|| {
+            SourceValidationError::TransformContract {
+                source_id: source_id.to_string(),
+                message: "non-empty source produced an empty transformed extent".to_string(),
+            }
+        })?;
+    }
+    validate_surface_extent_contract(source_id, &source.bounds, actual)
+}
+
+fn validate_surface_extent_contract(
+    source_id: &str,
+    bounds: &SourceBounds,
+    actual: [f64; 6],
+) -> Result<(), SourceValidationError> {
+    const ANGULAR_TOLERANCE_DEG: f64 = 1.0e-9;
+    const HEIGHT_TOLERANCE_M: f64 = 1.0e-6;
+
+    let configured = [
+        bounds.west,
+        bounds.south,
+        bounds.east,
+        bounds.north,
+        bounds.min_height_m,
+        bounds.max_height_m,
+    ];
+    let outside = !actual.iter().all(|coordinate| coordinate.is_finite())
+        || actual[0] < bounds.west - ANGULAR_TOLERANCE_DEG
+        || actual[1] < bounds.south - ANGULAR_TOLERANCE_DEG
+        || actual[2] > bounds.east + ANGULAR_TOLERANCE_DEG
+        || actual[3] > bounds.north + ANGULAR_TOLERANCE_DEG
+        || actual[4] < bounds.min_height_m - HEIGHT_TOLERANCE_M
+        || actual[5] > bounds.max_height_m + HEIGHT_TOLERANCE_M;
+    if outside {
+        Err(SourceValidationError::TransformedExtentOutsideBounds {
+            source_id: source_id.to_string(),
+            configured,
+            actual,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn map_surface_validation_error(
+    source_id: &str,
+    source: &SourceConfig,
+    transform: SurfaceTransform,
+    stage: &'static str,
+    source_error: tokio_postgres::Error,
+) -> SourceValidationError {
+    let is_transform_failure = source_error.as_db_error().is_some_and(|database_error| {
+        is_coordinate_transform_failure(database_error.code().code(), database_error.message())
+    });
+    if is_transform_failure {
+        SourceValidationError::TransformUnavailable {
+            source_id: source_id.to_string(),
+            source_srid: source.srid,
+            target_srid: TARGET_GEODETIC_3D_SRID,
+            operation: transform.operation_name(),
+            source: source_error,
+        }
+    } else {
+        SourceValidationError::Database {
+            source_id: source_id.to_string(),
+            stage,
+            source: source_error,
+        }
+    }
+}
+
+fn validate_transform_probe(source_id: &str, row: &Row) -> Result<(), SourceValidationError> {
+    let point = [
+        row.get::<_, f64>(0),
+        row.get::<_, f64>(1),
+        row.get::<_, f64>(2),
+    ];
+    let srid = row.get::<_, i32>(3);
+    let zm_flag = row.get::<_, i32>(4);
+    if !point.iter().all(|coordinate| coordinate.is_finite())
+        || srid != TARGET_GEODETIC_3D_SRID
+        || zm_flag != 2
+    {
+        return Err(SourceValidationError::TransformContract {
+            source_id: source_id.to_string(),
+            message: format!(
+                "probe returned coordinates {point:?}, SRID {srid}, ST_Zmflag {zm_flag}; expected finite EPSG:{TARGET_GEODETIC_3D_SRID} XYZ"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum TileQueryError {
     Config(ConfigError),
@@ -241,6 +1058,13 @@ pub enum TileQueryError {
         y: u32,
         max_features_per_tile: u32,
     },
+    CoordinateTransform {
+        source_srid: i32,
+        target_srid: i32,
+        operation: &'static str,
+        source: tokio_postgres::Error,
+    },
+    SourceContract(String),
     Postgres(tokio_postgres::Error),
 }
 
@@ -263,6 +1087,18 @@ impl fmt::Display for TileQueryError {
                 f,
                 "tile level={level} x={x} y={y} exceeds max_features_per_tile={max_features_per_tile} at max_level and cannot be subdivided"
             ),
+            TileQueryError::CoordinateTransform {
+                source_srid,
+                target_srid,
+                operation,
+                source,
+            } => write!(
+                f,
+                "coordinate transform EPSG:{source_srid} -> EPSG:{target_srid} using {operation} failed: {source}"
+            ),
+            TileQueryError::SourceContract(message) => {
+                write!(f, "source geometry contract violation: {message}")
+            }
             TileQueryError::Postgres(error) => write!(f, "PostGIS tile query failed: {error}"),
         }
     }
@@ -282,15 +1118,96 @@ impl From<tokio_postgres::Error> for TileQueryError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryBindings {
+    Standard,
+    Rdnaptrans2018Epsg1149,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceTransform {
+    Identity,
+    Rdnaptrans2018Epsg1149,
+}
+
+impl SurfaceTransform {
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Rdnaptrans2018Epsg1149 => RDNAPTRANS2018_EPSG_1149_OPERATION,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct TileWkbQueryPlan {
     sql: String,
     attributes: Vec<String>,
+    bindings: QueryBindings,
+    source_model: SourceModel,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct SubtreeOccupancyQueryPlan {
     sql: String,
+    bindings: QueryBindings,
+    source_model: SourceModel,
+}
+
+impl TileWkbQueryPlan {
+    fn map_query_error(
+        &self,
+        source: &SourceConfig,
+        source_error: tokio_postgres::Error,
+    ) -> TileQueryError {
+        map_plan_query_error(self.source_model, self.bindings, source, source_error)
+    }
+}
+
+impl SubtreeOccupancyQueryPlan {
+    fn map_query_error(
+        &self,
+        source: &SourceConfig,
+        source_error: tokio_postgres::Error,
+    ) -> TileQueryError {
+        map_plan_query_error(self.source_model, self.bindings, source, source_error)
+    }
+}
+
+fn map_plan_query_error(
+    source_model: SourceModel,
+    bindings: QueryBindings,
+    source: &SourceConfig,
+    source_error: tokio_postgres::Error,
+) -> TileQueryError {
+    let is_transform_failure = source_error.as_db_error().is_some_and(|database_error| {
+        is_coordinate_transform_failure(database_error.code().code(), database_error.message())
+    });
+    if source_model == SourceModel::SurfaceGeometryZ && is_transform_failure {
+        let operation = match bindings {
+            QueryBindings::Standard => "identity",
+            QueryBindings::Rdnaptrans2018Epsg1149 => RDNAPTRANS2018_EPSG_1149_OPERATION,
+        };
+        TileQueryError::CoordinateTransform {
+            source_srid: source.srid,
+            target_srid: TARGET_GEODETIC_3D_SRID,
+            operation,
+            source: source_error,
+        }
+    } else {
+        TileQueryError::Postgres(source_error)
+    }
+}
+
+fn is_coordinate_transform_failure(sqlstate: &str, message: &str) -> bool {
+    if sqlstate != "XX000" {
+        return false;
+    }
+
+    let message = message.to_ascii_lowercase();
+    message.starts_with("transform:")
+        || message.starts_with("could not parse coordinate operation")
+        || message.starts_with("could not form projection")
 }
 
 fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, ConfigError> {
@@ -305,10 +1222,51 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
     let id_column = quote_identifier(&source.id_column, "id_column")?;
     let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
 
-    let mut select_columns = vec![
-        format!("t.{id_column}::text AS id"),
-        "ST_AsBinary(clipped.geom, 'NDR') AS geometry_wkb".to_string(),
-    ];
+    let (geometry_select, tile_bbox, joins, predicate, limit_parameter, bindings) = match source
+        .source_model
+    {
+        SourceModel::ExtrudedFootprint => {
+            let table_geometry = format!("t.{geometry_column}");
+            let clipped_geometry = clipped_geometry_expression(&table_geometry, "b.geom");
+            let predicate =
+                positive_area_intersection_predicate(&table_geometry, "b.geom", "clipped.geom");
+            (
+                "ST_AsBinary(clipped.geom, 'NDR') AS geometry_wkb".to_string(),
+                "ST_Transform(ST_MakeEnvelope($1, $2, $3, $4, 4326), $5::integer) AS geom"
+                    .to_string(),
+                format!("CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped"),
+                predicate,
+                "$6",
+                QueryBindings::Standard,
+            )
+        }
+        SourceModel::SurfaceGeometryZ => match surface_transform(source)? {
+            SurfaceTransform::Identity => (
+                format!("ST_AsBinary(t.{geometry_column}, 'NDR') AS geometry_wkb"),
+                "ST_MakeEnvelope($1, $2, $3, $4, $5::integer) AS geom".to_string(),
+                String::new(),
+                format!("t.{geometry_column} && b.geom"),
+                "$6",
+                QueryBindings::Standard,
+            ),
+            SurfaceTransform::Rdnaptrans2018Epsg1149 => (
+                format!(
+                    "ST_AsBinary(ST_TransformPipeline(t.{geometry_column}, $6, {TARGET_GEODETIC_3D_SRID}), 'NDR') AS geometry_wkb"
+                ),
+                format!(
+                    "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
+                         ST_Force3D(ST_MakeEnvelope($1, $2, $3, $4, {TARGET_GEODETIC_3D_SRID}), 0.0), \
+                         $6, $5::integer))) AS geom"
+                ),
+                String::new(),
+                format!("t.{geometry_column} && b.geom"),
+                "$7",
+                QueryBindings::Rdnaptrans2018Epsg1149,
+            ),
+        },
+    };
+
+    let mut select_columns = vec![format!("t.{id_column}::text AS id"), geometry_select];
 
     let query_attributes = source.content_query_attributes();
     let mut attributes = Vec::with_capacity(query_attributes.len());
@@ -318,26 +1276,24 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         attributes.push(attribute.clone());
     }
 
-    let table_geometry = format!("t.{geometry_column}");
-    let clipped_geometry = clipped_geometry_expression(&table_geometry, "b.geom");
-    let intersection_predicate =
-        positive_area_intersection_predicate(&table_geometry, "b.geom", "clipped.geom");
-
     let sql = format!(
-        "WITH tile_bbox AS (SELECT ST_MakeEnvelope($1, $2, $3, $4, $5) AS geom) \
+        "WITH tile_bbox AS (SELECT {tile_bbox}) \
          SELECT {} \
          FROM {schema}.{table} AS t \
          CROSS JOIN tile_bbox AS b \
-         CROSS JOIN LATERAL ( \
-           SELECT {clipped_geometry} AS geom \
-         ) AS clipped \
-         WHERE {intersection_predicate} \
+         {joins} \
+         WHERE {predicate} \
          ORDER BY t.{id_column} \
-         LIMIT $6",
+         LIMIT {limit_parameter}",
         select_columns.join(", ")
     );
 
-    Ok(TileWkbQueryPlan { sql, attributes })
+    Ok(TileWkbQueryPlan {
+        sql,
+        attributes,
+        bindings,
+        source_model: source.source_model,
+    })
 }
 
 fn build_subtree_occupancy_query(
@@ -346,15 +1302,45 @@ fn build_subtree_occupancy_query(
     let schema = quote_identifier(&source.schema, "schema")?;
     let table = quote_identifier(&source.table, "table")?;
     let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
-    let table_geometry = format!("t.{geometry_column}");
-    let clipped_geometry = clipped_geometry_expression(&table_geometry, "q.geom");
-    let intersection_predicate =
-        positive_area_intersection_predicate(&table_geometry, "q.geom", "clipped.geom");
+    let (bbox_expression, joins, predicate, limit_parameter, bindings) = match source.source_model {
+        SourceModel::ExtrudedFootprint => {
+            let table_geometry = format!("t.{geometry_column}");
+            let clipped_geometry = clipped_geometry_expression(&table_geometry, "q.geom");
+            (
+                "ST_Transform(ST_MakeEnvelope(u.west, u.south, u.east, u.north, 4326), $5::integer)"
+                    .to_string(),
+                format!("CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped"),
+                positive_area_intersection_predicate(&table_geometry, "q.geom", "clipped.geom"),
+                "$6",
+                QueryBindings::Standard,
+            )
+        }
+        SourceModel::SurfaceGeometryZ => match surface_transform(source)? {
+            SurfaceTransform::Identity => (
+                "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
+                String::new(),
+                format!("t.{geometry_column} && q.geom"),
+                "$6",
+                QueryBindings::Standard,
+            ),
+            SurfaceTransform::Rdnaptrans2018Epsg1149 => (
+                format!(
+                    "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
+                     ST_Force3D(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.0), \
+                     $6, $5::integer)))"
+                ),
+                String::new(),
+                format!("t.{geometry_column} && q.geom"),
+                "$7",
+                QueryBindings::Rdnaptrans2018Epsg1149,
+            ),
+        },
+    };
 
     let sql = format!(
         "WITH requested_tiles AS ( \
            SELECT (u.ordinality - 1)::bigint AS slot, \
-                  ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5) AS geom \
+                  {bbox_expression} AS geom \
            FROM unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[]) \
                 WITH ORDINALITY AS u(west, south, east, north, ordinality) \
          ) \
@@ -363,16 +1349,32 @@ fn build_subtree_occupancy_query(
            FROM ( \
              SELECT 1 \
              FROM {schema}.{table} AS t \
-             CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped \
-             WHERE {intersection_predicate} \
-             LIMIT $6 \
+             {joins} \
+             WHERE {predicate} \
+             LIMIT {limit_parameter} \
            ) AS capped \
          ) AS feature_count \
          FROM requested_tiles AS q \
          ORDER BY q.slot"
     );
 
-    Ok(SubtreeOccupancyQueryPlan { sql })
+    Ok(SubtreeOccupancyQueryPlan {
+        sql,
+        bindings,
+        source_model: source.source_model,
+    })
+}
+
+fn surface_transform(source: &SourceConfig) -> Result<SurfaceTransform, ConfigError> {
+    let VerticalReference::Crs(reference) = &source.vertical_reference else {
+        return Err(ConfigError::Validation(
+            "surface_geometry_z requires a CRS vertical_reference".to_string(),
+        ));
+    };
+    Ok(match reference.effective_operation(source.srid) {
+        VerticalTransform::Identity => SurfaceTransform::Identity,
+        VerticalTransform::Rdnaptrans2018Epsg1149 => SurfaceTransform::Rdnaptrans2018Epsg1149,
+    })
 }
 
 fn clipped_geometry_expression(table_geometry: &str, bbox_geometry: &str) -> String {
@@ -468,14 +1470,15 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use lucy_core::source::SourceCatalog;
+    use lucy_core::geometry::decode_surface_geometry_z_wkb;
+    use lucy_core::source::{SourceCatalog, VerticalCrsReference};
     use lucy_core::subtree::{
         generate_subtree_bytes_with_availability, pack_availability_bits, subtree_layout,
     };
 
     fn fixture_catalog() -> SourceCatalog {
         let config_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/poc-sources.yaml");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/fixture-sources.yaml");
         let raw = std::fs::read_to_string(config_path).expect("fixture config should read");
         SourceCatalog::from_yaml_str(&raw).expect("fixture config should load")
     }
@@ -488,12 +1491,39 @@ mod tests {
             .expect("poc source should exist")
     }
 
+    fn surface_source() -> SourceConfig {
+        let mut source = fixture_source();
+        source.table = "surface_buildings_7415".to_string();
+        source.srid = 7415;
+        source.source_model = SourceModel::SurfaceGeometryZ;
+        source.vertical_reference = VerticalReference::Crs(VerticalCrsReference {
+            crs: "EPSG:7415".to_string(),
+            target: "EPSG:4979".to_string(),
+            operation: Some(VerticalTransform::Rdnaptrans2018Epsg1149),
+        });
+        source.base_height_column = None;
+        source.height_column = None;
+        source.geometry_types = vec![GeometryType::PolygonZ, GeometryType::MultiPolygonZ];
+        source.max_level = 0;
+        source.attributes = vec!["name".to_string()];
+        source.bounds.west = 5.86;
+        source.bounds.south = 50.97;
+        source.bounds.east = 5.90;
+        source.bounds.north = 51.00;
+        source.bounds.min_height_m = 35.0;
+        source.bounds.max_height_m = 100.0;
+        source
+    }
+
     #[test]
     fn tile_wkb_query_uses_bound_bbox_values_clipping_and_limit() {
         let source = fixture_source();
         let plan = build_tile_wkb_query(&source).expect("query should build");
 
-        assert!(plan.sql.contains("ST_MakeEnvelope($1, $2, $3, $4, $5)"));
+        assert!(
+            plan.sql
+                .contains("ST_Transform(ST_MakeEnvelope($1, $2, $3, $4, 4326), $5::integer)")
+        );
         assert!(plan.sql.contains("t.\"geom\" && b.geom"));
         assert!(plan.sql.contains("ST_Intersects(t.\"geom\", b.geom)"));
         assert!(plan.sql.contains("ST_Intersection(t.\"geom\", b.geom)"));
@@ -533,6 +1563,131 @@ mod tests {
     }
 
     #[test]
+    fn surface_root_query_preserves_whole_features_and_uses_explicit_3d_transform() {
+        let source = surface_source();
+        let plan = build_tile_wkb_query(&source).expect("surface query should build");
+
+        assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
+        assert!(RDNAPTRANS2018_EPSG_1149_PIPELINE.contains("+proj=cart +ellps=GRS80"));
+        assert!(RDNAPTRANS2018_EPSG_1149_PIPELINE.contains("+proj=helmert +x=0 +y=0 +z=0"));
+        assert!(RDNAPTRANS2018_EPSG_1149_PIPELINE.contains("+inv +proj=cart +ellps=WGS84"));
+        assert!(plan.sql.contains("ST_InverseTransformPipeline"));
+        assert!(
+            plan.sql
+                .contains("ST_TransformPipeline(t.\"geom\", $6, 4979)")
+        );
+        assert!(plan.sql.contains("t.\"geom\" && b.geom"));
+        assert!(plan.sql.contains("LIMIT $7"));
+        assert!(!plan.sql.contains("ST_Intersection"));
+        assert!(!plan.sql.contains("ST_Intersects"));
+        assert!(!plan.sql.contains("ST_Area"));
+        assert!(!plan.sql.contains("ST_IsValid"));
+        assert_eq!(plan.attributes, vec!["name", "color"]);
+    }
+
+    #[test]
+    fn already_normalized_surface_query_uses_explicit_identity_operation() {
+        let mut source = surface_source();
+        source.srid = 4979;
+        source.vertical_reference = VerticalReference::Crs(VerticalCrsReference {
+            crs: "EPSG:4979".to_string(),
+            target: "EPSG:4979".to_string(),
+            operation: Some(VerticalTransform::Identity),
+        });
+
+        let plan = build_tile_wkb_query(&source).expect("identity query should build");
+
+        assert_eq!(plan.bindings, QueryBindings::Standard);
+        assert!(plan.sql.contains("ST_AsBinary(t.\"geom\", 'NDR')"));
+        assert!(
+            plan.sql
+                .contains("ST_MakeEnvelope($1, $2, $3, $4, $5::integer)")
+        );
+        assert!(!plan.sql.contains("ST_Transform("));
+        assert!(!plan.sql.contains("ST_TransformPipeline"));
+    }
+
+    #[test]
+    fn only_known_postgis_proj_failures_map_to_crs_errors() {
+        assert!(is_coordinate_transform_failure(
+            "XX000",
+            "could not parse coordinate operation '+proj=pipeline ...'"
+        ));
+        assert!(is_coordinate_transform_failure(
+            "XX000",
+            "transform: Coordinate to transform falls outside grid (2052)"
+        ));
+        assert!(!is_coordinate_transform_failure(
+            "XX000",
+            "cache lookup failed for relation 42"
+        ));
+        assert!(!is_coordinate_transform_failure(
+            "57014",
+            "canceling statement due to statement timeout"
+        ));
+    }
+
+    #[test]
+    fn surface_root_subtree_query_uses_bbox_without_xy_overlay() {
+        let source = surface_source();
+        let plan =
+            build_subtree_occupancy_query(&source).expect("surface subtree query should build");
+
+        assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
+        assert!(plan.sql.contains("ST_InverseTransformPipeline"));
+        assert!(plan.sql.contains("t.\"geom\" && q.geom"));
+        assert!(plan.sql.contains("LIMIT $7"));
+        assert!(!plan.sql.contains("ST_Intersection"));
+        assert!(!plan.sql.contains("ST_Area"));
+        assert!(!plan.sql.contains("ST_IsValid"));
+    }
+
+    #[test]
+    fn surface_profile_requires_xyz_but_allows_polygon_and_multipolygon() {
+        let source = surface_source();
+        let valid = SourceGeometryProfile {
+            row_count: 2,
+            srids: vec![7415],
+            geometry_types: vec!["MULTIPOLYGON".to_string(), "POLYGON".to_string()],
+            zm_flags: vec![2],
+        };
+        validate_source_geometry_profile("surface", &source, &valid)
+            .expect("configured PolygonZ and MultiPolygonZ should pass");
+
+        let no_z = SourceGeometryProfile {
+            zm_flags: vec![0],
+            ..valid
+        };
+        assert!(matches!(
+            validate_source_geometry_profile("surface", &source, &no_z),
+            Err(SourceValidationError::CoordinateDimensionProfile { .. })
+        ));
+    }
+
+    #[test]
+    fn transformed_surface_extent_must_fit_the_root_region() {
+        let source = surface_source();
+        validate_surface_extent_contract(
+            "surface",
+            &source.bounds,
+            [5.861, 50.971, 5.899, 50.999, 40.0, 90.0],
+        )
+        .expect("contained transformed extent should pass");
+
+        for actual in [
+            [5.85, 50.971, 5.899, 50.999, 40.0, 90.0],
+            [5.861, 50.971, 5.899, 50.999, 34.0, 90.0],
+            [5.861, 50.971, 5.91, 50.999, 40.0, 90.0],
+            [5.861, 50.971, 5.899, 50.999, 40.0, 101.0],
+        ] {
+            assert!(matches!(
+                validate_surface_extent_contract("surface", &source.bounds, actual),
+                Err(SourceValidationError::TransformedExtentOutsideBounds { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn tile_wkb_query_rejects_unsafe_attribute_identifiers() {
         let mut source = fixture_source();
         source.attributes.push("name; DROP TABLE x".to_string());
@@ -549,7 +1704,7 @@ mod tests {
         let mut source = fixture_source();
         source.attributes = vec!["name".to_string()];
         source.base_height_column = Some("custom_base_m".to_string());
-        source.height_column = "custom_height_m".to_string();
+        source.height_column = Some("custom_height_m".to_string());
 
         let plan = build_tile_wkb_query(&source).expect("query should build");
 
@@ -576,10 +1731,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL and the PostGIS fixtures"]
     async fn fixture_tile_query_clips_cross_boundary_features_and_rejects_overflow() {
-        let Ok(database_url) = env::var("DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required for the ignored PostGIS integration test");
 
         let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
             .await
@@ -596,6 +1751,13 @@ mod tests {
             .expect("load fixture data");
 
         let mut source = fixture_source();
+        let profile = validate_source(&client, "poc_buildings", &source)
+            .await
+            .expect("extruded fixture source should satisfy introspection");
+        assert_eq!(profile.row_count, 6);
+        assert_eq!(profile.srids, vec![4326]);
+        assert_eq!(profile.geometry_types, vec!["MULTIPOLYGON"]);
+        assert_eq!(profile.zm_flags, vec![0]);
         let root_features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
             .await
             .expect("root tile should query");
@@ -778,8 +1940,12 @@ mod tests {
             serde_json::json!(["EXT_mesh_features", "EXT_structural_metadata"])
         );
         assert_eq!(
-            content_document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"],
+            content_document["meshes"][0]["primitives"][0]["attributes"]["NORMAL"],
             2
+        );
+        assert_eq!(
+            content_document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"],
+            3
         );
         assert_eq!(
             content_document["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"],
@@ -912,5 +2078,112 @@ mod tests {
                 max_features_per_tile: 2
             }
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL, the PostGIS fixtures, and RDNAPTRANS2018 grids"]
+    async fn surface_fixture_preserves_xyz_through_query_and_content_route() {
+        let database_url = env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required for the ignored PostGIS integration test");
+
+        let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
+            .await
+            .expect("connect to PostGIS surface fixture database");
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("PostGIS connection error: {error}");
+            }
+        });
+        client
+            .batch_execute(include_str!(
+                "../../../fixtures/postgis/surface_buildings_7415.sql"
+            ))
+            .await
+            .expect("load surface fixture data");
+
+        let catalog = fixture_catalog();
+        let source = catalog
+            .sources
+            .get("surface_buildings_7415")
+            .cloned()
+            .expect("surface source should be configured");
+        assert_eq!(source.max_level, 0, "native surfaces are root-owned");
+        let profile = validate_source(&client, "surface_buildings_7415", &source)
+            .await
+            .expect("surface fixture and RDNAP grids should satisfy introspection");
+        assert_eq!(profile.row_count, 2);
+        assert_eq!(profile.srids, vec![7415]);
+        assert_eq!(profile.geometry_types, vec!["MULTIPOLYGON", "POLYGON"]);
+        assert_eq!(profile.zm_flags, vec![2]);
+        crate::server::validate_catalog_sources(&catalog)
+            .await
+            .expect("server startup should fail-fast validate configured surface sources");
+
+        let features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
+            .await
+            .expect("surface root tile should query");
+        assert_eq!(features.len(), 2);
+        for feature in &features {
+            let geometry = decode_surface_geometry_z_wkb(&feature.geometry_wkb)
+                .expect("query WKB should remain XYZ");
+            assert!(geometry.polygons().iter().all(|polygon| {
+                polygon
+                    .exterior
+                    .points
+                    .iter()
+                    .all(|point| point.z.is_finite() && point.z > 170.0)
+            }));
+            assert!(feature.attributes.contains_key("identificatie"));
+            assert!(!feature.attributes.contains_key("height_m"));
+        }
+
+        let child_error = query_tile_geometry_wkb(
+            &client,
+            &source,
+            TileCoord::new(1, 0, 0).expect("valid quadtree coordinate"),
+        )
+        .await
+        .expect_err("root-owned surface query must reject child levels");
+        assert!(matches!(child_error, TileQueryError::Config(_)));
+
+        let app = crate::server::build_app(catalog).expect("surface fixture app should build");
+        let below_root_contract = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sources/surface_buildings_7415/content/1/0/0.glb")
+                    .body(Body::empty())
+                    .expect("surface child request should build"),
+            )
+            .await
+            .expect("surface child request should route");
+        assert_eq!(below_root_contract.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sources/surface_buildings_7415/content/0/0/0.glb")
+                    .body(Body::empty())
+                    .expect("surface content request should build"),
+            )
+            .await
+            .expect("surface content request should route");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("surface GLB body should read");
+        let json_length =
+            u32::from_le_bytes(body[12..16].try_into().expect("JSON length")) as usize;
+        let document: serde_json::Value = serde_json::from_slice(&body[20..20 + json_length])
+            .expect("surface GLB JSON should parse");
+        assert_eq!(
+            document["meshes"][0]["primitives"][0]["attributes"]["NORMAL"],
+            2
+        );
+        assert_eq!(document["materials"][0]["doubleSided"], true);
+        assert_eq!(
+            document["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"],
+            2
+        );
     }
 }

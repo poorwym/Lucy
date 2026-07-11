@@ -8,14 +8,16 @@ use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
+use tokio_postgres::NoTls;
 use tower::ServiceBuilder;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Level, Span, error, info};
 
-use lucy_core::source::SourceCatalog;
+use lucy_core::source::{SourceCatalog, SourceModel};
 
 use crate::error::ServerError;
+use crate::postgis::{SourceValidationError, validate_source};
 use crate::routes;
 use crate::settings::ServerSettings;
 use crate::state::AppState;
@@ -116,6 +118,7 @@ pub async fn run_server(
         source_count = catalog.sources.len(),
         "source catalog loaded"
     );
+    validate_catalog_sources(&catalog).await?;
     let app = build_app_with_settings(
         catalog,
         ServerSettings {
@@ -127,6 +130,61 @@ pub async fn run_server(
     info!(address = %addr, config_path = %config_path.display(), "Lucy server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+pub async fn validate_catalog_sources(catalog: &SourceCatalog) -> Result<(), ServerError> {
+    for (source_id, source) in &catalog.sources {
+        // Preserve the existing extrusion startup contract. Native surface
+        // sources need eager validation because their vertical transform and
+        // grid dependencies must never fall back or fail mid-request.
+        if source.source_model != SourceModel::SurfaceGeometryZ {
+            continue;
+        }
+        let connection_string = resolve_startup_connection(source_id, &source.connection)?;
+        let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+            .await
+            .map_err(|source_error| SourceValidationError::Database {
+                source_id: source_id.clone(),
+                stage: "connection",
+                source: source_error,
+            })?;
+        let logged_source_id = source_id.clone();
+        tokio::spawn(async move {
+            if let Err(connection_error) = connection.await {
+                error!(
+                    source_id = %logged_source_id,
+                    error = %connection_error,
+                    "PostGIS validation connection failed"
+                );
+            }
+        });
+
+        let profile = validate_source(&client, source_id, source).await?;
+        info!(
+            source_id,
+            row_count = profile.row_count,
+            srids = ?profile.srids,
+            geometry_types = ?profile.geometry_types,
+            zm_flags = ?profile.zm_flags,
+            "PostGIS source geometry contract validated"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_startup_connection(
+    source_id: &str,
+    connection: &str,
+) -> Result<String, SourceValidationError> {
+    let trimmed = connection.trim();
+    if trimmed == "${DATABASE_URL}" {
+        std::env::var("DATABASE_URL").map_err(|error| SourceValidationError::ConnectionConfig {
+            source_id: source_id.to_string(),
+            message: format!("DATABASE_URL is required: {error}"),
+        })
+    } else {
+        Ok(trimmed.to_string())
+    }
 }
 
 async fn add_cors(request: Request, next: Next) -> Response {

@@ -16,10 +16,8 @@ impl AppState {
     pub fn new(catalog: SourceCatalog, settings: ServerSettings) -> Result<Self, ServerError> {
         let default_source_id =
             catalog
-                .sources
-                .keys()
-                .next()
-                .cloned()
+                .default_source_id()
+                .map(str::to_string)
                 .ok_or(ServerError::Config(ConfigError::Validation(
                     "at least one source must be configured".to_string(),
                 )))?;

@@ -8,12 +8,12 @@ use tokio_postgres::NoTls;
 use tracing::{debug, error};
 
 use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
-use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh};
-use lucy_core::source::{DEFAULT_BASE_HEIGHT_M, SourceConfig};
+use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh, wkb_surface_geometry_z_to_mesh};
+use lucy_core::source::{ConfigError, DEFAULT_BASE_HEIGHT_M, SourceConfig, SourceModel};
 use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
-use crate::postgis::{TileFeatureWkb, query_tile_geometry_wkb};
+use crate::postgis::{TileFeatureWkb, TileQueryError, query_tile_geometry_wkb};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
@@ -89,18 +89,35 @@ async fn content_tile_response(
     );
     if features.is_empty() {
         return Err(RouteError::not_found(format!(
-            "tile level={} x={} y={} has no fixture features",
+            "tile level={} x={} y={} has no features",
             tile.level, tile.x, tile.y
         )));
     }
 
-    let frame = MeshFrame::from_tile_region(tile.geographic_region_degrees(&source.bounds)?);
+    let (frame, node_transform) = content_mesh_placement(source, tile)?;
     let mut content_features = Vec::with_capacity(features.len());
     let started = Instant::now();
     for feature in features {
-        let (base_height_m, height_m) = feature_heights(source, &feature)?;
-        let mesh =
-            wkb_footprint_to_extruded_mesh(&feature.geometry_wkb, frame, base_height_m, height_m)?;
+        let mesh = match source.source_model {
+            SourceModel::ExtrudedFootprint => {
+                let (base_height_m, height_m) = feature_heights(source, &feature)?;
+                wkb_footprint_to_extruded_mesh(
+                    &feature.geometry_wkb,
+                    frame,
+                    base_height_m,
+                    height_m,
+                )
+            }
+            SourceModel::SurfaceGeometryZ => {
+                wkb_surface_geometry_z_to_mesh(&feature.geometry_wkb, frame)
+            }
+        }
+        .map_err(|error| {
+            RouteError::from(TileQueryError::SourceContract(format!(
+                "source {source_id} feature {} could not be converted to a mesh: {error}",
+                feature.id
+            )))
+        })?;
         let base_color = feature_base_color(source, &feature)?;
         let properties = source
             .attributes
@@ -116,6 +133,7 @@ async fn content_tile_response(
             id: feature.id,
             mesh,
             base_color,
+            double_sided: source.source_model == SourceModel::SurfaceGeometryZ,
             properties,
         });
     }
@@ -136,13 +154,24 @@ async fn content_tile_response(
     );
 
     let started = Instant::now();
-    let glb = encode_feature_content_tile_glb(&content_features, frame.gltf_to_ecef_transform())?;
+    let glb = encode_feature_content_tile_glb(&content_features, node_transform)?;
     debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         glb_bytes = glb.len(),
         "GLB encoded"
     );
     Ok(bytes_response(StatusCode::OK, "model/gltf-binary", glb))
+}
+
+fn content_mesh_placement(
+    source: &SourceConfig,
+    tile: TileCoord,
+) -> Result<(MeshFrame, [f64; 16]), ConfigError> {
+    let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+    let tile_region = tile.geographic_region_degrees(&source.bounds)?;
+    let tile_frame = MeshFrame::from_tile_region(tile_region);
+    let node_transform = source_frame.gltf_node_transform_for(tile_frame);
+    Ok((tile_frame, node_transform))
 }
 
 fn feature_base_color(
@@ -205,7 +234,10 @@ fn feature_heights(
         }
         None => DEFAULT_BASE_HEIGHT_M,
     };
-    let height_m = parse_required_feature_f32(feature, &source.height_column)?;
+    let height_column = source
+        .extrusion_height_column()
+        .ok_or_else(|| RouteError::config("extruded_footprint source is missing height_column"))?;
+    let height_m = parse_required_feature_f32(feature, height_column)?;
     Ok((base_height_m, height_m))
 }
 
@@ -245,6 +277,8 @@ fn parse_optional_feature_f32(
 mod tests {
     use std::collections::BTreeMap;
 
+    use lucy_core::geometry::{FootprintGeometry, Point2D, Polygon2D, Ring2D};
+    use lucy_core::mesh::footprint_to_extruded_mesh;
     use lucy_core::source::SourceCatalog;
 
     use super::*;
@@ -263,7 +297,7 @@ mod tests {
     fn feature_heights_use_configured_column_names() {
         let mut source = fixture_source();
         source.base_height_column = Some("bottom_m".to_string());
-        source.height_column = "height_delta_m".to_string();
+        source.height_column = Some("height_delta_m".to_string());
 
         let feature = TileFeatureWkb {
             id: "42".to_string(),
@@ -284,7 +318,7 @@ mod tests {
     fn feature_heights_default_missing_base_height_to_zero() {
         let mut source = fixture_source();
         source.base_height_column = None;
-        source.height_column = "height_delta_m".to_string();
+        source.height_column = Some("height_delta_m".to_string());
 
         let feature = TileFeatureWkb {
             id: "42".to_string(),
@@ -343,5 +377,126 @@ mod tests {
             parse_hex_color("orange"),
             Err("expected #RRGGBB or #RRGGBBAA")
         );
+    }
+
+    #[test]
+    fn root_content_placement_is_relative_identity() {
+        let source = fixture_source();
+        let (frame, node_transform) = content_mesh_placement(&source, TileCoord::root())
+            .expect("root placement should build");
+        let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+        assert!((frame.origin_longitude_deg - source_frame.origin_longitude_deg).abs() < 1.0e-12);
+        assert!((frame.origin_latitude_deg - source_frame.origin_latitude_deg).abs() < 1.0e-12);
+
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        for (component, (actual, expected)) in node_transform.into_iter().zip(identity).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() < 1.0e-8,
+                "matrix component {component}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_frames_keep_footprints_local_and_oriented_near_longitude_axes() {
+        let cases = [
+            ("longitude 0", -1.0, 1.0, 128),
+            ("longitude 90", 89.0, 91.0, 128),
+            ("longitude 180", 178.0, 180.0, 255),
+        ];
+
+        for (label, west, east, tile_x) in cases {
+            let mut source = fixture_source();
+            source.bounds.west = west;
+            source.bounds.east = east;
+            source.bounds.south = 9.0;
+            source.bounds.north = 11.0;
+            source.bounds.min_height_m = 0.0;
+            source.bounds.max_height_m = 100.0;
+            let tile = TileCoord::new(8, tile_x, 128).expect("valid tile");
+            let tile_region = tile
+                .geographic_region_degrees(&source.bounds)
+                .expect("tile region");
+            let (frame, _) =
+                content_mesh_placement(&source, tile).expect("content placement should build");
+
+            assert!(
+                (frame.origin_longitude_deg - (tile_region.west + tile_region.east) / 2.0).abs()
+                    < 1.0e-12,
+                "{label}: frame must use the requested tile centre"
+            );
+            let lon = frame.origin_longitude_deg;
+            let lat = frame.origin_latitude_deg;
+            let delta = 0.000_1;
+            let geometry = FootprintGeometry::Polygon(Polygon2D {
+                exterior: Ring2D {
+                    points: vec![
+                        Point2D {
+                            x: lon - delta,
+                            y: lat - delta,
+                        },
+                        Point2D {
+                            x: lon + delta,
+                            y: lat - delta,
+                        },
+                        Point2D {
+                            x: lon + delta,
+                            y: lat + delta,
+                        },
+                        Point2D {
+                            x: lon - delta,
+                            y: lat + delta,
+                        },
+                        Point2D {
+                            x: lon - delta,
+                            y: lat - delta,
+                        },
+                    ],
+                },
+                interiors: Vec::new(),
+            });
+            let mesh = footprint_to_extruded_mesh(&geometry, frame, 0.0, 10.0)
+                .expect("local footprint should mesh");
+
+            assert!(
+                mesh.vertices.iter().all(|vertex| {
+                    vertex.position[0].abs() < 20.0 && vertex.position[1].abs() < 20.0
+                }),
+                "{label}: tile-local positions should remain near zero"
+            );
+            let southwest = mesh.vertices[0].position;
+            let southeast = mesh.vertices[1].position;
+            let northeast = mesh.vertices[2].position;
+            assert!(
+                southeast[0] - southwest[0] > 10.0,
+                "{label}: increasing longitude must point east"
+            );
+            assert!(
+                (southeast[1] - southwest[1]).abs() < 0.1,
+                "{label}: an east edge must not rotate into north"
+            );
+            assert!(
+                northeast[1] - southeast[1] > 10.0,
+                "{label}: increasing latitude must point north"
+            );
+            assert!(
+                mesh.vertices[0..4]
+                    .iter()
+                    .all(|vertex| vertex.normal[2] > 0.999),
+                "{label}: top normals must remain tile-local up"
+            );
+            assert!(mesh.vertices.iter().all(|vertex| {
+                let length = vertex
+                    .normal
+                    .iter()
+                    .map(|component| component * component)
+                    .sum::<f32>()
+                    .sqrt();
+                (length - 1.0).abs() < 1.0e-5
+            }));
+        }
     }
 }

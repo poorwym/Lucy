@@ -1,3 +1,4 @@
+pub mod geometry;
 pub mod glb;
 pub mod mesh;
 pub mod source;

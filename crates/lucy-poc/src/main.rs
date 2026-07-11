@@ -2,7 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use lucy_core::source::DEFAULT_CONFIG_PATH;
+use lucy_core::source::{DEFAULT_CONFIG_PATH, SourceModel};
 use lucy_core::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_core::tile::TileCoord;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
@@ -54,20 +54,28 @@ async fn main() -> ExitCode {
             );
 
             for (source_id, source) in catalog.sources {
-                let base_height = source
-                    .base_height_column_or_default()
-                    .unwrap_or("<default 0.0>");
+                let geometry_contract = match source.source_model {
+                    SourceModel::ExtrudedFootprint => format!(
+                        "{}+{}",
+                        source
+                            .base_height_column_or_default()
+                            .unwrap_or("<default 0.0>"),
+                        source
+                            .extrusion_height_column()
+                            .expect("validated extrusion source has height_column")
+                    ),
+                    SourceModel::SurfaceGeometryZ => "native vertex Z".to_string(),
+                };
 
                 println!(
-                    "{source_id}: {}.{} geom={} id={} srid={} model={:?} z={}+{} levels={}..{} subtree_levels={}",
+                    "{source_id}: {}.{} geom={} id={} srid={} model={:?} z={} levels={}..{} subtree_levels={}",
                     source.schema,
                     source.table,
                     source.geometry_column,
                     source.id_column,
                     source.srid,
                     source.source_model,
-                    base_height,
-                    source.height_column,
+                    geometry_contract,
                     source.min_level,
                     source.max_level,
                     source.subtree_levels
@@ -80,7 +88,7 @@ async fn main() -> ExitCode {
                     }
                 }
 
-                match generate_tileset_json(&source, &TilesetOptions::default()) {
+                match generate_tileset_json(&source, &TilesetOptions::from_source(&source)) {
                     Ok(tileset_json) => println!("{source_id}: tileset.json\n{tileset_json}"),
                     Err(error) => warn!(source_id, error = %error, "failed to generate tileset"),
                 }

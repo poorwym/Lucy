@@ -11,12 +11,13 @@ use lucy_core::source::ConfigError;
 use lucy_core::tile::TileCoordError;
 
 use crate::ConfigLoadError;
-use crate::postgis::TileQueryError;
+use crate::postgis::{SourceValidationError, TileQueryError};
 
 #[derive(Debug)]
 pub enum ServerError {
     Config(ConfigError),
     ConfigLoad(ConfigLoadError),
+    SourceValidation(SourceValidationError),
     Io(std::io::Error),
     Runtime(String),
 }
@@ -26,6 +27,7 @@ impl fmt::Display for ServerError {
         match self {
             ServerError::Config(error) => write!(f, "{error}"),
             ServerError::ConfigLoad(error) => write!(f, "{error}"),
+            ServerError::SourceValidation(error) => write!(f, "{error}"),
             ServerError::Io(error) => write!(f, "{error}"),
             ServerError::Runtime(message) => write!(f, "{message}"),
         }
@@ -43,6 +45,12 @@ impl From<ConfigError> for ServerError {
 impl From<ConfigLoadError> for ServerError {
     fn from(error: ConfigLoadError) -> Self {
         Self::ConfigLoad(error)
+    }
+}
+
+impl From<SourceValidationError> for ServerError {
+    fn from(error: SourceValidationError) -> Self {
+        Self::SourceValidation(error)
     }
 }
 
@@ -173,7 +181,16 @@ impl From<TileQueryError> for RouteError {
             | TileQueryError::TerminalFeatureLimitExceeded { .. }) => {
                 Self::conflict("tile_overflow", error.to_string())
             }
-            error => Self::internal("postgis_error", error.to_string()),
+            error @ TileQueryError::CoordinateTransform { .. } => {
+                Self::internal("crs_transform_error", error.to_string())
+            }
+            error @ TileQueryError::SourceContract(_) => {
+                Self::internal("source_geometry_error", error.to_string())
+            }
+            TileQueryError::Config(error) => Self::config(error.to_string()),
+            error @ TileQueryError::Postgres(_) => {
+                Self::internal("postgis_error", error.to_string())
+            }
         }
     }
 }
@@ -209,5 +226,15 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn source_contract_failure_maps_to_server_error() {
+        let response = RouteError::from(TileQueryError::SourceContract(
+            "feature 42 is missing Z".to_string(),
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

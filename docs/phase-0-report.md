@@ -1,5 +1,10 @@
 # Lucy Phase 0 Standards Validation POC
 
+This report describes the original footprint POC. The native EPSG:7415
+PolygonZ/MultiPolygonZ extension is documented separately in
+[`source-geometry-model.md`](source-geometry-model.md), with current validation
+commands and remaining external checks in [`testing.md`](testing.md).
+
 ## Result
 
 The Phase 0 path is implemented as a minimal Rust POC:
@@ -64,9 +69,13 @@ curl -i http://127.0.0.1:8080/content/0/0/0.glb
 GLB content:
 
 - GLB magic/version/length header
-- JSON chunk with glTF 2.0 asset, scene, node, mesh primitive, buffer, bufferViews, and accessors
-- BIN chunk containing little-endian `UNSIGNED_INT` indices followed by `FLOAT` `VEC3` positions
+- JSON chunk with glTF 2.0 asset, scene, relative tile-frame node matrix, mesh primitive, buffer, bufferViews, and accessors
+- BIN chunk containing little-endian `UNSIGNED_INT` indices followed by glTF Y-up `FLOAT` `VEC3` positions and normals
 - position accessor `min` and `max`
+
+The tileset root remains the only ENU-to-ECEF placement. Content uses a
+per-request tile-local ENU frame for `f32` precision; its GLB node transform is
+only relative to the source ENU root frame and is identity for root content.
 
 ## Cesium Frontend Demo
 
@@ -111,11 +120,18 @@ The tests cover:
 
 External glTF validator status:
 
-- Not required to run in CI for Phase 0.
 - The GLB encoder tests parse and validate the generated GLB structure locally.
-- A Phase 1 task should add an official glTF validator step if GLB generation becomes a release artifact.
+- The official Khronos glTF Validator is required for the native-surface
+  acceptance target but is not yet wired into this repository.
+- Automated Cesium browser coverage is likewise still pending; neither check
+  should be reported as completed based only on local Rust tests.
 
-## Known Phase 1 Gaps
+## Historical Phase 1 Gap List
+
+The following list records the state when the Phase 0 report was written. It is
+not the current native-surface implementation status; use
+[`source-geometry-model.md`](source-geometry-model.md) and
+[`testing.md`](testing.md) for the current contract and remaining validation.
 
 - Feature metadata, picking IDs, batch tables, and 3D Tiles structural metadata are not emitted.
 - The root subtree currently marks availability broadly for the POC instead of deriving sparse availability from PostGIS.
