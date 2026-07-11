@@ -82,7 +82,11 @@ pub fn generate_subtree(
     let layout = subtree_layout(source, subtree_root)?;
     let availability = SubtreeAvailabilityBits {
         tile: layout.local_tiles.iter().map(Option::is_some).collect(),
-        content: layout.local_tiles.iter().map(Option::is_some).collect(),
+        content: layout
+            .local_tiles
+            .iter()
+            .map(|tile| tile.is_some_and(|tile| tile.level >= source.tileset.content_start_level))
+            .collect(),
         child_subtree: layout.child_roots.iter().map(Option::is_some).collect(),
     };
 

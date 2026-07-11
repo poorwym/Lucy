@@ -71,7 +71,10 @@ pub fn encode_content_tile_glb(meshes: &[TriangleMesh]) -> Result<Vec<u8>, GlbEr
 
 /// Encode feature-aware 3D Tiles content with vertex colors, feature IDs, and
 /// an embedded structural metadata property table.
-pub fn encode_feature_content_tile_glb(features: &[ContentFeature]) -> Result<Vec<u8>, GlbError> {
+pub fn encode_feature_content_tile_glb(
+    features: &[ContentFeature],
+    gltf_to_ecef: [f64; 16],
+) -> Result<Vec<u8>, GlbError> {
     if features.is_empty() {
         return Err(GlbError::EmptyMesh);
     }
@@ -256,7 +259,7 @@ pub fn encode_feature_content_tile_glb(features: &[ContentFeature]) -> Result<Ve
         },
         "scene": 0,
         "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0 }],
+        "nodes": [{ "mesh": 0, "matrix": gltf_to_ecef }],
         "materials": [
             {
                 "name": "Lucy feature colors",
@@ -829,7 +832,8 @@ mod tests {
     #[test]
     fn feature_content_emits_material_colors_and_pickable_metadata() {
         let features = fixture_content_features();
-        let glb = encode_feature_content_tile_glb(&features).expect("feature GLB should encode");
+        let glb = encode_feature_content_tile_glb(&features, identity_transform())
+            .expect("feature GLB should encode");
         let parsed = parse_glb(&glb);
         let document = &parsed.document;
 
@@ -893,14 +897,16 @@ mod tests {
     fn feature_content_rejects_invalid_colors_and_metadata_ids() {
         let mut features = fixture_content_features();
         features[0].base_color[0] = 1.5;
-        let error = encode_feature_content_tile_glb(&features).expect_err("color should fail");
+        let error = encode_feature_content_tile_glb(&features, identity_transform())
+            .expect_err("color should fail");
         assert!(error.to_string().contains("base color component 0"));
 
         let mut features = fixture_content_features();
         features[0]
             .properties
             .insert("bad-property".to_string(), Some("x".to_string()));
-        let error = encode_feature_content_tile_glb(&features).expect_err("property should fail");
+        let error = encode_feature_content_tile_glb(&features, identity_transform())
+            .expect_err("property should fail");
         assert!(error.to_string().contains("must match"));
     }
 
@@ -1010,4 +1016,10 @@ mod tests {
             bin,
         }
     }
+}
+#[cfg(test)]
+fn identity_transform() -> [f64; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
 }

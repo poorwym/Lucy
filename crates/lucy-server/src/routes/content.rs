@@ -38,6 +38,12 @@ async fn content_tile_response(
     tile: TileCoord,
 ) -> Result<Response, RouteError> {
     ensure_configured_level(source, tile)?;
+    if tile.level < source.tileset.content_start_level {
+        return Err(RouteError::not_found(format!(
+            "tile level={} is below content_start_level={}",
+            tile.level, source.tileset.content_start_level
+        )));
+    }
     let connection = resolve_connection_string(&source.connection)?;
     let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
     tokio::spawn(async move {
@@ -54,7 +60,7 @@ async fn content_tile_response(
         )));
     }
 
-    let frame = MeshFrame::from_source_bounds(&source.bounds);
+    let frame = MeshFrame::from_tile_region(tile.geographic_region_degrees(&source.bounds)?);
     let mut content_features = Vec::with_capacity(features.len());
     for feature in features {
         let (base_height_m, height_m) = feature_heights(source, &feature)?;
@@ -82,7 +88,7 @@ async fn content_tile_response(
     Ok(bytes_response(
         StatusCode::OK,
         "model/gltf-binary",
-        encode_feature_content_tile_glb(&content_features)?,
+        encode_feature_content_tile_glb(&content_features, frame.gltf_to_ecef_transform())?,
     ))
 }
 

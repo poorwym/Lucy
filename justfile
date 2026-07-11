@@ -50,5 +50,8 @@ clean:
     {{ compose }} down --volumes --remove-orphans
 
 # decode a glb in base64
-decode-glb url="":
-    curl -s {{ url }} | node -e "const fs=require('fs'); const chunks=[]; process.stdin.on('data',c=>chunks.push(c)); process.stdin.on('end',()=>{const b=Buffer.concat(chunks); const jsonLen=b.readUInt32LE(12); const jsonType=b.toString('ascii',16,20); if(jsonType!=='JSON') throw new Error('first chunk is not JSON'); const json=b.slice(20,20+jsonLen).toString('utf8').replace(/\0+$/,'').trim(); console.log(JSON.stringify(JSON.parse(json), null, 2));});"
+decode-glb model_url="":
+    curl -s {{ model_url }} | node -e "const fs=require('fs'); const chunks=[]; process.stdin.on('data',c=>chunks.push(c)); process.stdin.on('end',()=>{const b=Buffer.concat(chunks); const jsonLen=b.readUInt32LE(12); const jsonType=b.toString('ascii',16,20); if(jsonType!=='JSON') throw new Error('first chunk is not JSON'); const json=b.slice(20,20+jsonLen).toString('utf8').replace(/\0+$/,'').trim(); console.log(JSON.stringify(JSON.parse(json), null, 2));});"
+
+preview-glb model_url="":
+    open "https://sandbox.babylonjs.com/?asset={{ model_url }}"

@@ -1,8 +1,9 @@
 use std::fmt;
 
-use crate::source::SourceBounds;
+use crate::tile::GeographicRegionDegrees;
 
-const EARTH_RADIUS_M: f64 = 6_378_137.0;
+const WGS84_A: f64 = 6_378_137.0;
+const WGS84_F: f64 = 1.0 / 298.257_223_563;
 const WKB_POINT: u32 = 1;
 const WKB_LINESTRING: u32 = 2;
 const WKB_POLYGON: u32 = 3;
@@ -42,14 +43,51 @@ pub struct MeshVertex {
 pub struct MeshFrame {
     pub origin_longitude_deg: f64,
     pub origin_latitude_deg: f64,
+    pub origin_height_m: f64,
+    origin_ecef: [f64; 3],
 }
 
 impl MeshFrame {
-    pub fn from_source_bounds(bounds: &SourceBounds) -> Self {
+    pub fn from_tile_region(region: GeographicRegionDegrees) -> Self {
+        let origin_longitude_deg = (region.west + region.east) / 2.0;
+        let origin_latitude_deg = (region.south + region.north) / 2.0;
+        let origin_height_m = region.min_height_m;
+        let origin_ecef =
+            geodetic_to_ecef(origin_longitude_deg, origin_latitude_deg, origin_height_m);
         Self {
-            origin_longitude_deg: (bounds.west + bounds.east) / 2.0,
-            origin_latitude_deg: (bounds.south + bounds.north) / 2.0,
+            origin_longitude_deg,
+            origin_latitude_deg,
+            origin_height_m,
+            origin_ecef,
         }
+    }
+
+    /// Column-major transform from Lucy's glTF-local axes [East, Up, -North]
+    /// to WGS84 ECEF.
+    pub fn gltf_to_ecef_transform(self) -> [f64; 16] {
+        let lon = self.origin_longitude_deg.to_radians();
+        let lat = self.origin_latitude_deg.to_radians();
+        let (sin_lon, cos_lon) = lon.sin_cos();
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let [x, y, z] = self.origin_ecef;
+        [
+            -sin_lon,
+            cos_lon,
+            0.0,
+            0.0,
+            cos_lat * cos_lon,
+            cos_lat * sin_lon,
+            sin_lat,
+            0.0,
+            sin_lat * cos_lon,
+            sin_lat * sin_lon,
+            -cos_lat,
+            0.0,
+            x,
+            y,
+            z,
+            1.0,
+        ]
     }
 
     fn project(self, lon_deg: f64, lat_deg: f64) -> Result<[f32; 3], MeshError> {
@@ -59,14 +97,36 @@ impl MeshFrame {
             ));
         }
 
-        let origin_lat_rad = self.origin_latitude_deg.to_radians();
-        let x = (lon_deg - self.origin_longitude_deg).to_radians()
-            * EARTH_RADIUS_M
-            * origin_lat_rad.cos();
-        let y = (lat_deg - self.origin_latitude_deg).to_radians() * EARTH_RADIUS_M;
-
-        Ok([x as f32, y as f32, 0.0])
+        let point = geodetic_to_ecef(lon_deg, lat_deg, self.origin_height_m);
+        let delta = [
+            point[0] - self.origin_ecef[0],
+            point[1] - self.origin_ecef[1],
+            point[2] - self.origin_ecef[2],
+        ];
+        let lon = self.origin_longitude_deg.to_radians();
+        let lat = self.origin_latitude_deg.to_radians();
+        let (sin_lon, cos_lon) = lon.sin_cos();
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let east = -sin_lon * delta[0] + cos_lon * delta[1];
+        let north =
+            -sin_lat * cos_lon * delta[0] - sin_lat * sin_lon * delta[1] + cos_lat * delta[2];
+        let up = cos_lat * cos_lon * delta[0] + cos_lat * sin_lon * delta[1] + sin_lat * delta[2];
+        Ok([east as f32, north as f32, up as f32])
     }
+}
+
+fn geodetic_to_ecef(lon_deg: f64, lat_deg: f64, height_m: f64) -> [f64; 3] {
+    let lon = lon_deg.to_radians();
+    let lat = lat_deg.to_radians();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let e2 = WGS84_F * (2.0 - WGS84_F);
+    let n = WGS84_A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    [
+        (n + height_m) * cos_lat * cos_lon,
+        (n + height_m) * cos_lat * sin_lon,
+        (n * (1.0 - e2) + height_m) * sin_lat,
+    ]
 }
 
 pub fn wkb_footprint_to_mesh(wkb: &[u8], frame: MeshFrame) -> Result<TriangleMesh, MeshError> {
@@ -640,10 +700,26 @@ mod tests {
     use super::*;
 
     fn fixture_frame() -> MeshFrame {
-        MeshFrame {
-            origin_longitude_deg: -122.400525,
-            origin_latitude_deg: 37.79310,
-        }
+        MeshFrame::from_tile_region(GeographicRegionDegrees {
+            west: -122.400525,
+            south: 37.79310,
+            east: -122.400525,
+            north: 37.79310,
+            min_height_m: 0.0,
+            max_height_m: 100.0,
+        })
+    }
+
+    #[test]
+    fn tile_frame_origin_is_local_zero_and_transform_targets_ecef() {
+        let frame = fixture_frame();
+        let origin = frame
+            .project(frame.origin_longitude_deg, frame.origin_latitude_deg)
+            .expect("origin should project");
+        assert!(origin.iter().all(|component| component.abs() < 1.0e-5));
+
+        let transform = frame.gltf_to_ecef_transform();
+        assert_eq!(&transform[12..15], &frame.origin_ecef);
     }
 
     fn sansome_office_ring() -> Vec<(f64, f64)> {

@@ -155,7 +155,9 @@ pub async fn query_subtree_availability(
         match *slot {
             SubtreeQuerySlot::Tile { index, .. } => {
                 availability.tile[index] = has_features;
-                availability.content[index] = has_features && !overflow;
+                availability.content[index] = has_features
+                    && !overflow
+                    && slot.tile().level >= source.tileset.content_start_level;
             }
             SubtreeQuerySlot::ChildSubtree { index, .. } => {
                 availability.child_subtree[index] = has_features;

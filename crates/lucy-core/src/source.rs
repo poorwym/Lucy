@@ -8,6 +8,7 @@ use crate::tile::MAX_TILE_LEVEL;
 pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
+pub const DEFAULT_CONTENT_START_LEVEL: u8 = 0;
 pub const DEFAULT_ROOT_GEOMETRIC_ERROR_M: f64 = 512.0;
 pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree";
 pub const MAX_PICKABLE_FEATURES_PER_TILE: u32 = 1 << 24;
@@ -263,6 +264,8 @@ impl MaterialConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TilesetConfig {
+    #[serde(default = "default_content_start_level")]
+    pub content_start_level: u8,
     #[serde(default = "default_root_geometric_error_m")]
     pub root_geometric_error_m: f64,
     #[serde(default = "default_content_uri_template")]
@@ -273,6 +276,11 @@ pub struct TilesetConfig {
 
 impl TilesetConfig {
     fn validate(&self, source_id: &str, has_descendants: bool) -> Result<(), ConfigError> {
+        if self.content_start_level > MAX_TILE_LEVEL {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: tileset.content_start_level must be <= {MAX_TILE_LEVEL}"
+            )));
+        }
         if !self.root_geometric_error_m.is_finite() || self.root_geometric_error_m < 0.0 {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: tileset.root_geometric_error_m must be finite and nonnegative"
@@ -303,11 +311,16 @@ impl TilesetConfig {
 impl Default for TilesetConfig {
     fn default() -> Self {
         Self {
+            content_start_level: DEFAULT_CONTENT_START_LEVEL,
             root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M,
             content_uri_template: DEFAULT_CONTENT_URI_TEMPLATE.to_string(),
             subtree_uri_template: DEFAULT_SUBTREE_URI_TEMPLATE.to_string(),
         }
     }
+}
+
+fn default_content_start_level() -> u8 {
+    DEFAULT_CONTENT_START_LEVEL
 }
 
 fn default_root_geometric_error_m() -> f64 {
@@ -464,6 +477,7 @@ sources:
         assert_eq!(
             source.tileset,
             TilesetConfig {
+                content_start_level: DEFAULT_CONTENT_START_LEVEL,
                 root_geometric_error_m: DEFAULT_ROOT_GEOMETRIC_ERROR_M,
                 content_uri_template: DEFAULT_CONTENT_URI_TEMPLATE.to_string(),
                 subtree_uri_template: DEFAULT_SUBTREE_URI_TEMPLATE.to_string(),
