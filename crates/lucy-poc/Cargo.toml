@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
-tokio.workspace = true
-tokio-postgres.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+lucy-core = { path = "../lucy-core" }
+lucy-server = { path = "../lucy-server" }

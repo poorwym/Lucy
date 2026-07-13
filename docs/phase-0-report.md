@@ -1,5 +1,10 @@
 # Lucy Phase 0 Standards Validation POC
 
+This report describes the original footprint POC. The native EPSG:7415
+PolygonZ/MultiPolygonZ extension is documented separately in
+[`source-geometry-model.md`](source-geometry-model.md), with current validation
+commands and remaining external checks in [`testing.md`](testing.md).
+
 ## Result
 
 The Phase 0 path is implemented as a minimal Rust POC:
@@ -11,7 +16,7 @@ The Phase 0 path is implemented as a minimal Rust POC:
 - Converts supported WKB `Polygon` and `MultiPolygon` footprints into internal triangle meshes.
 - Extrudes feature meshes from `base_height_m` to `base_height_m + height_m`.
 - Encodes one GLB content tile from one or more extruded feature meshes.
-- Serves POC routes for CesiumJS smoke testing.
+- Serves POC tile routes consumed by the frontend Cesium demo.
 
 ## POC Routes
 
@@ -30,7 +35,6 @@ Routes:
 | `/tileset.json` | 3D Tiles 1.1 implicit tileset. |
 | `/subtrees/0/0/0.subtree` | Root subtree binary. |
 | `/content/{level}/{x}/{y}.glb` | PostGIS-backed GLB content tile. |
-| `/cesium-smoke.html` | CesiumJS smoke page loading `/tileset.json`. |
 | `/phase-0-report.md` | This report. |
 
 The root content tile is expected to contain fixture geometry:
@@ -65,31 +69,34 @@ curl -i http://127.0.0.1:8080/content/0/0/0.glb
 GLB content:
 
 - GLB magic/version/length header
-- JSON chunk with glTF 2.0 asset, scene, node, mesh primitive, buffer, bufferViews, and accessors
-- BIN chunk containing little-endian `UNSIGNED_INT` indices followed by `FLOAT` `VEC3` positions
+- JSON chunk with glTF 2.0 asset, scene, relative tile-frame node matrix, mesh primitive, buffer, bufferViews, and accessors
+- BIN chunk containing little-endian `UNSIGNED_INT` indices followed by glTF Y-up `FLOAT` `VEC3` positions and normals
 - position accessor `min` and `max`
 
-## Cesium Smoke Test
+The tileset root remains the only ENU-to-ECEF placement. Content uses a
+per-request tile-local ENU frame for `f32` precision; its GLB node transform is
+only relative to the source ENU root frame and is identity for root content.
 
-Open:
+## Cesium Frontend Demo
 
-```text
-http://127.0.0.1:8080/cesium-smoke.html
+Run the frontend demo while the Rust tile server is running:
+
+```sh
+cd frontend
+bun run dev
 ```
 
 Expected behavior:
 
-- CesiumJS requests `/tileset.json`.
-- CesiumJS requests `/subtrees/0/0/0.subtree`.
-- CesiumJS can resolve `/content/0/0/0.glb` from the content URI template.
+- CesiumJS requests `http://127.0.0.1:8080/tileset.json`.
+- CesiumJS requests `http://127.0.0.1:8080/subtrees/0/0/0.subtree`.
+- CesiumJS can resolve `http://127.0.0.1:8080/content/0/0/0.glb` from the content URI template.
 - The root tile contains non-empty extruded GLB geometry from the PostGIS fixture.
 - The root tile transform places local meter geometry at the configured San Francisco block.
 - The smoke scene includes a basic OpenStreetMap imagery layer for visual context.
 
-The smoke page uses CesiumJS from the public Cesium CDN and OpenStreetMap tile
-imagery, so browser execution requires network access to those hosts. The Rust
-test suite validates the generated tileset, subtree, WKB-to-mesh, and GLB
-structure locally without that CDN.
+The React/Vite frontend owns the Cesium viewer. The Rust server intentionally
+does not embed inline HTML.
 
 ## Validation
 
@@ -109,15 +116,22 @@ The tests cover:
 - WKB-to-mesh conversion and unsupported geometry errors
 - GLB header/chunks/JSON/binary payload
 - real PostGIS WKB to mesh to GLB content tile
-- POC HTTP route handling for tileset, subtree, smoke page, and report
+- POC HTTP route handling for tileset, subtree, root status, and report
 
 External glTF validator status:
 
-- Not required to run in CI for Phase 0.
 - The GLB encoder tests parse and validate the generated GLB structure locally.
-- A Phase 1 task should add an official glTF validator step if GLB generation becomes a release artifact.
+- The official Khronos glTF Validator is required for the native-surface
+  acceptance target but is not yet wired into this repository.
+- Automated Cesium browser coverage is likewise still pending; neither check
+  should be reported as completed based only on local Rust tests.
 
-## Known Phase 1 Gaps
+## Historical Phase 1 Gap List
+
+The following list records the state when the Phase 0 report was written. It is
+not the current native-surface implementation status; use
+[`source-geometry-model.md`](source-geometry-model.md) and
+[`testing.md`](testing.md) for the current contract and remaining validation.
 
 - Feature metadata, picking IDs, batch tables, and 3D Tiles structural metadata are not emitted.
 - The root subtree currently marks availability broadly for the POC instead of deriving sparse availability from PostGIS.
@@ -125,4 +139,4 @@ External glTF validator status:
 - No HTTP connection pooling, caching, compression, or production error handling exists.
 - The POC serves one fixed source and does not perform source discovery or schema introspection.
 - Materials are not encoded into GLB yet.
-- The Cesium smoke page is manual and CDN-backed; an automated browser smoke test should be added when the service shape stabilizes.
+- The Cesium frontend demo is manual; an automated browser smoke test should be added when the service shape stabilizes.

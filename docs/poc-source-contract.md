@@ -1,8 +1,14 @@
 # Lucy Phase 0 POC Source Contract
 
-This contract defines the fixed input source for Phase 0. The POC does not
-perform source auto-discovery: it loads one known PostGIS table from the source
-config in `config/poc-sources.yaml`.
+This document remains the compatibility contract for the original
+`extruded_footprint` path. Native `PolygonZ` / `MultiPolygonZ` sources use a
+separate, strategy-specific contract documented in
+[`source-geometry-model.md`](source-geometry-model.md); they do not inherit the
+height-column or two-dimensional clipping assumptions below.
+
+This contract defines the fixed input source for Phase 0. Lucy does not perform
+database source auto-discovery: it loads explicitly configured PostGIS sources
+from `config/poc-sources.yaml`.
 
 ## Fixed Source
 
@@ -23,6 +29,7 @@ config in `config/poc-sources.yaml`.
 | Max level | `16` |
 | Subtree levels | `4` |
 | Feature limit | `1000` features per tile |
+| Root geometric error | `512.0` meters |
 
 ## Sample Table Schema
 
@@ -83,7 +90,7 @@ west:  -122.40130
 south:   37.79245
 east:  -122.39975
 north:   37.79375
-min height: 18 m
+min height: 0 m
 max height: 100 m
 ```
 
@@ -99,32 +106,183 @@ maximum z: 100 m
 
 ## WKB-to-Mesh Assumptions
 
-Phase 0 mesh conversion accepts OGC 2D WKB `Polygon` and `MultiPolygon`
-footprints from `ST_AsBinary`. EWKB type flags for Z, M, or embedded SRID are
-not interpreted. Polygon interior rings, points, lines, geometry collections,
-curves, and solids are intentionally unsupported until the basic footprint path
-is complete.
+Footprint mesh conversion accepts OGC/ISO WKB and PostGIS EWKB `Polygon` and
+`MultiPolygon` values from `ST_AsBinary`. A second, adapter-internal XY
+`MultiLineString` carries the portions of the original feature boundary that
+remain inside the tile. Both decoders require exactly XY coordinates; XYZ is
+rejected instead of silently losing Z. Polygon interior rings are triangulated
+and extruded. General point, line, geometry-collection, curve, measured, and
+solid source models remain unsupported.
 
 The WKB coordinates are interpreted as EPSG:4326 `[longitude, latitude]`
-decimal degrees. The internal footprint mesh projects those positions into a
-local tangent meter frame centered on the configured source bounds, using an
-equirectangular approximation suitable for the small POC fixture extent. GLB
-content extrudes each footprint from `base_height_m` to
+decimal degrees. For each content request, the mesh converts WGS 84 geodetic
+coordinates through ECEF into an exact tile-local ENU frame centered on that
+tile's geographic region. This keeps `f32` vertex coordinates local even for a
+global source. GLB content extrudes each footprint from `base_height_m` to
 `base_height_m + height_m` and emits vertices as `[east_m, north_m, up_m]`.
 When encoded into GLB, those internal ENU positions are converted to glTF's
 Y-up convention as `[east_m, up_m, -north_m]`.
+
+## Content Tile Query Semantics
+
+For extruded footprints, content uses deterministic clipping rather than
+assigning a whole feature to one tile or repeating the whole feature in every
+intersecting tile. For every requested level, the configured bounds are
+partitioned into QUADTREE tile envelopes. PostGIS first uses the source
+geometry index to find intersections, then computes `ST_Intersection` with the
+tile envelope, extracts polygonal components, and discards empty or zero-area
+results. The resulting WKB is therefore contained by the tile's horizontal
+bounds.
+
+The adapter also intersects `ST_Boundary` of the original source feature with
+the tile envelope and returns the extracted linear components as an XY
+`MultiLineString`. Mesh generation uses the clipped polygon for the top and
+bottom caps, but creates side walls only where a clipped ring overlaps this
+original-boundary mask. Edges introduced solely by the tile envelope are not
+sealed. This is essential for translucent extrusions: refinement reconstructs
+one continuous outer shell instead of revealing an artificial wall at every
+quadtree cut.
+
+A building crossing a tile boundary produces one clipped fragment in each
+intersected tile. Every fragment retains the source feature id and attributes,
+and stable id ordering makes repeated requests deterministic. At a given level,
+the union of the fragments equals the source footprint within the configured
+bounds. Their caps meet at tile edges and their retained source-boundary walls
+form the same outer shell as the uncut feature, without uncontrolled
+whole-feature duplication. Content availability uses the same positive-area
+intersection rule and does not need to compute boundary masks.
+
+Native `PolygonZ` and `MultiPolygonZ` sources deliberately do not use that XY
+overlay. PostGIS transforms each requested EPSG:4979 tile envelope back into
+the source CRS, applies the indexed bounding-box operator, and returns each
+candidate as a complete XYZ feature. Lucy validates and triangulates the
+complete faces in the source-wide ENU frame, clips the triangles against the
+tile's longitude/latitude rectangle, and emits the retained vertices in the
+tile-local ENU frame. Tile cuts introduce no caps or walls, and a candidate
+that leaves no positive three-dimensional triangle area is omitted.
+
+Crossing native triangles use closed clip planes so adjacent fragments share
+the same seam vertices. Faces lying wholly on a quadtree split use half-open
+ownership instead: west and south boundaries are included, internal east and
+north boundaries are excluded, and the outermost east and north source edges
+remain included. A vertical face on an internal split plane is therefore
+emitted exactly once. Native source geometry is never passed through
+`ST_Intersection`, `ST_CollectionExtract`, `ST_Area`, or another operation that
+could flatten a vertical face in XY.
+
+`max_features_per_tile` is an overflow threshold, not a truncation setting.
+For footprints, Lucy asks PostGIS for at most one row beyond the threshold.
+For native surfaces, bbox matches are only candidates, so Lucy streams the
+matches, clips them, and applies the threshold only to features that emit a
+positive-area tile fragment. The stream stops as soon as the first fragment
+beyond the threshold proves overflow, so candidate WKB is not buffered without
+bound. An overflow fails with the structured
+`tile_overflow`/HTTP 409 response instead of returning an arbitrary prefix. A
+caller can request deeper tiles while the configured `max_level` permits it;
+an overflow at the deepest level requires changing the data or configuration.
+
+## Sparse Subtree Availability
+
+For footprints, subtree availability is derived from the same positive-area
+clipping predicate as content. For native surfaces, PostGIS returns each
+whole-feature candidate once together with the bbox-matched slot indices;
+Lucy then applies the same source-frame triangulation and triangle clip used by
+content before counting a slot. This prevents holes, disjoint MultiPolygons,
+and half-open split-plane ownership from advertising empty content. Lucy sends
+the bounding boxes for every valid local tile and child subtree root to
+PostGIS as arrays. With the default `subtree_levels: 4`, this covers 85 local
+tiles and 256 child roots in one database round trip instead of one query per
+tile.
+
+An occupied tile is tile-available. It is content-available only when its count
+does not exceed `max_features_per_tile`; an overflowing non-leaf remains
+tile-available so traversal can continue into descendants. Tile availability
+is closed over ancestors: an occupied local tile or child-subtree root marks
+its local ancestor chain tile-available without inventing ancestor content.
+Overflow at `max_level` is a terminal `tile_overflow` error because it cannot be
+resolved by subdivision. Child subtree bits are set only for occupied child
+roots at or below `max_level`. Branches with no occupied descendant remain
+zero, while the global implicit root tile remains available even for an empty
+source.
+
+Availability arrays always retain the fixed size required by the configured
+`subtree_levels`. Final partial subtrees clear bits beyond `max_level` rather
+than shortening the arrays. Mixed arrays are encoded as Morton-ordered,
+little-endian bitstreams with 8-byte-aligned buffer views and deterministic
+padding.
+
+Both `/sources/{source_id}/subtrees/{level}/{x}/{y}.subtree` and the legacy
+default-source alias serve populated subtree roots at levels divisible by
+`subtree_levels`. Malformed coordinates and non-root levels return structured
+400 responses, configured-level misses return 404, and a direct request for an
+empty non-root subtree returns 404. Binary encoding and content type are the
+same for root and non-root responses.
+
+## Geometric Error and LOD Policy
+
+Each source configures `tileset.root_geometric_error_m`. Lucy writes that value
+to both the tileset-level and root-tile `geometricError`; multi-level sources
+require a finite positive value. Existing configs that omit the nested
+`tileset` object retain the safe `512.0` meter default.
+
+The [3D Tiles 1.1 implicit tiling
+rules](https://docs.ogc.org/cs/22-025r4/22-025r4.html) derive each child's error
+as half its parent's error. Lucy therefore defines the absolute-level sequence
+as `error(level) = root_geometric_error_m / 2^level`. Subtree boundaries do not
+restart that sequence. With the fixture values, level 4 is `32.0` meters and
+level 16 is `0.0078125` meters.
+
+The root uses `REPLACE` refinement. Parent and child content are alternate HLOD
+representations: once selected descendants are ready, they render in place of
+their parent rather than as an additive layer. `availableLevels = max_level +
+1`, final-partial zero bits, and zero child-subtree bits beyond `max_level`
+provide the traversal stop; a nonzero geometric error at the deepest tile does
+not advertise another level.
+
+Content and subtree URI templates are also source-level generation options:
+`tileset.content_uri_template` and `tileset.subtree_uri_template`. Both must
+contain `{level}`, `{x}`, and `{y}`. The defaults map directly to Lucy's built-in
+relative routes and preserve existing configs. Custom templates are emitted
+verbatim for deployments that provide matching proxy or application routes;
+they do not create new Axum routes. Process concerns such as the listen address,
+config path, and CORS policy remain global server settings rather than source
+metadata.
 
 ## GLB Content Tile Assumptions
 
 Phase 0 GLB content encoding writes one glTF 2.0 binary asset for one content
 tile. One or more internal feature meshes are concatenated into one mesh
 primitive. The binary buffer stores little-endian `UNSIGNED_INT` triangle
-indices followed by tightly packed glTF Y-up `FLOAT` `VEC3` positions. The GLB
-contains one scene, one node, and one mesh primitive with mode `TRIANGLES`.
-Materials, feature metadata, batch/structural metadata, normals, texture
-coordinates, and per-feature primitives are intentionally deferred until the
-single-content-tile path is stable. The POC emits roof, bottom, and wall
-triangles for each extruded fixture footprint.
+indices, tightly packed glTF Y-up `FLOAT` `VEC3` positions, per-vertex
+normals, `COLOR_0`, and per-vertex `_FEATURE_ID_0`. The GLB contains one scene,
+one node, one material, and one mesh primitive with mode `TRIANGLES`; feature
+separation does not add draw calls.
+
+The tileset root owns the only ENU-to-ECEF placement. Content vertices are
+generated in a per-request tile-local ENU frame to preserve `f32` precision.
+The GLB node matrix is only the relative tile-frame-to-root-frame transform,
+conjugated for glTF Y-up and the 3D Tiles runtime Z-up conversion. It is
+identity for root content and is never a second ECEF transform. See
+[`source-geometry-model.md`](source-geometry-model.md#transform-and-axis-ownership)
+for the complete matrix chain.
+
+The material uses a white PBR `baseColorFactor`, so vertex colors carry the
+configured feature color. A non-NULL `material.color_column` value accepts
+`#RRGGBB` or `#RRGGBBAA` and normalizes each channel to `0..=1`. Missing or NULL
+values use `material.default_base_color`. Malformed source colors fail the
+content request explicitly. If any alpha is below `1`, the material uses
+`BLEND`; otherwise it uses `OPAQUE`.
+
+[`EXT_mesh_features`](https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_mesh_features)
+maps `_FEATURE_ID_0` to row indices in one embedded
+[`EXT_structural_metadata`](https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_structural_metadata)
+property table. The table preserves the source feature id as `featureId` and
+every field listed in `attributes` as a STRING column, enabling Cesium feature
+picking and property inspection. NULL values use a NUL-string `noData`
+sentinel; PostgreSQL text cannot contain NUL, so real empty strings remain
+distinct. Both extensions are optional in `extensionsUsed`, leaving core glTF
+geometry, normals, and color as a rendering fallback. Textures and typed
+non-string metadata remain deferred.
 
 ## Minimal Source Config
 
@@ -140,7 +298,6 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:
@@ -157,6 +314,10 @@ sources:
     max_level: 16
     subtree_levels: 4
     max_features_per_tile: 1000
+    tileset:
+      root_geometric_error_m: 512.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
     attributes:
       - name
       - building_type
@@ -167,14 +328,76 @@ sources:
       default_base_color: [0.72, 0.70, 0.65, 1.0]
 ```
 
-Startup validation for this fixed source should check:
+## Runtime Usage Map
 
-1. The configured schema/table exists.
-2. `id_column` exists and is integer-like.
-3. `geometry_column` exists, has SRID `4326`, and contains only Polygon or MultiPolygon features.
-4. The configured vertical columns exist, `base_height_m` defaults to `0.0`, and `height_m > 0`.
-5. The configured attributes exist.
-6. A GiST index exists on `geom`.
+This section records the Phase 1.2.5 comparison between
+`config/poc-sources.yaml`, this contract, and the current `lucy-core` /
+`lucy-server` implementation. Values below should come from source config
+unless explicitly listed as a retained Phase 0 constraint.
+
+| Config field | Runtime usage |
+| --- | --- |
+| Source id map key | Selected from the loaded `SourceCatalog`; source-scoped routes use `/sources/{source_id}/...`, and legacy routes use explicit `default_source` (falling back deterministically only when it is omitted). |
+| `connection` | Resolved by `lucy-server` content routes. Literal connection strings are used as-is; the POC `${DATABASE_URL}` placeholder is resolved from the process environment. |
+| `schema`, `table` | Quoted after identifier validation and used to build the PostGIS tile query target. |
+| `geometry_column` | Quoted after identifier validation and used for indexed bbox filtering and `ST_AsBinary(..., 'NDR')`; footprints additionally use it for XY intersection, while native surfaces are returned whole for core triangle clipping. |
+| `id_column` | Quoted after identifier validation, selected as the feature id, and used for stable ordering. |
+| `srid` | Declares and validates the PostGIS source geometry SRID. Tile envelopes are transformed into it; footprint output is normalized to EPSG:4326 and native XYZ output to EPSG:4979. |
+| `source_model` | Selects the adapter normalization and mesh strategy. `extruded_footprint` produces standard EPSG:4326 XY; `surface_geometry_z` produces standard EPSG:4979 XYZ. |
+| `coordinate_operation` | Optional only for native 3D surfaces. It selects an explicit supported source-to-EPSG:4979 pipeline; it is omitted for already-normalized EPSG:4979 and for footprints. |
+| `base_height_column` | If present, automatically selected by the PostGIS tile query and used as the extrusion base. Missing or NULL values default to `0.0`. |
+| `height_column` | Automatically selected by the PostGIS tile query and required as positive extrusion height input. |
+| `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
+| `bounds` | Drives the root region, tile bbox mapping, source ENU/root transform origin, per-request tile-local ENU frames, and vertical bounding interval. |
+| `min_level` | Validated as the retained implicit-root constraint `0`; tile-addressed routes reject requests below the configured bound before database work. |
+| `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, footprint or native-triangle clipping depth, terminal overflow detection, and child-subtree availability. |
+| `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
+| `max_features_per_tile` | Enforced as an overflow threshold on exact footprint rows or emitted native-surface fragments; capped at `2^24` so FLOAT picking IDs remain exact, and overflow returns `tile_overflow` instead of silently truncating content. |
+| `tileset.root_geometric_error_m` | Drives both emitted root error values and the implicit `root / 2^level` LOD sequence; defaults to `512.0`. |
+| `tileset.content_uri_template` | Emitted as the implicit content URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in content route. |
+| `tileset.subtree_uri_template` | Emitted as the subtree URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in subtree route. |
+| `attributes` | Selected from PostGIS and written as STRING columns in the GLB structural metadata table; height columns are still selected for extrusion even when omitted from this list. |
+| `material.color_column` | Selected automatically, parsed as `#RRGGBB` or `#RRGGBBAA`, and emitted through per-vertex `COLOR_0`; missing/NULL values fall back to the default. |
+| `material.default_base_color` | Validated as four finite `0..=1` components and emitted when no per-feature color is available. |
+
+## Retained Footprint Constraints
+
+The following assumptions remain deliberate constraints:
+
+1. `extruded_footprint` accepts any positive SRID registered in the deployed
+   PostGIS `spatial_ref_sys` table and supported by PROJ. Query and clipping
+   stay in the source CRS; the adapter always returns EPSG:4326 XY.
+2. `min_level` must be `0`; generalizing the implicit root to a nonzero level is
+   deferred. Populated non-root subtree roots are served at configured subtree
+   boundaries.
+3. Geometry types are checked by source introspection and again by the WKB
+   decoder; the footprint SQL still relies on configured table contents rather
+   than adding a redundant type predicate to every tile request.
+4. Extrusion columns are interpreted as local metres above the configured
+   region base. This is part of the footprint model and no longer repeated as
+   a separate `vertical_reference` setting.
+5. GLB output includes flat normals, material color, picking IDs, and STRING
+   structural metadata. Textures and native numeric metadata column types
+   remain deferred.
+6. Every source is introspected at startup. Footprint sources probe the
+   PostGIS source-SRID/4326 transform; native surfaces additionally validate
+   their explicit 3D grid contract and transformed extent.
+
+The reusable source introspector checks:
+
+1. The configured schema/table and required columns exist.
+2. `id_column` values are non-null, non-empty when rendered as text, and
+   unique.
+3. `geometry_column` values are non-null/non-empty, use the configured SRID and
+   dimensions, contain only configured Polygon/MultiPolygon types, and have
+   finite coordinates.
+4. Configured vertical, material, and metadata columns exist.
+5. For native surfaces, transformed XYZ vertex extrema fit the configured root
+   longitude/latitude/height bounds.
+
+Positive extrusion-height constraints remain the source table's responsibility
+and are also rejected by mesh construction if invalid. GiST index diagnostics
+remain future operational work.
 
 ## Loading the Fixture
 
@@ -193,3 +416,23 @@ DATABASE_URL=postgres://lucy:lucy@localhost:5432/lucy
 
 The fixture script is idempotent: it recreates `public.poc_buildings`, inserts
 six features, adds the GiST index, and analyzes the table.
+
+## Native Surface Fixture
+
+`fixtures/postgis/surface_buildings_7415.sql` is a separate deterministic
+fixture for the `surface_geometry_z` strategy. It contains EPSG:7415 source Z
+coordinates, no extrusion height columns, a PolygonZ interior ring, and a
+MultiPolygonZ closed shell with vertical faces. Load it with:
+
+```sh
+just load-surface-fixture
+just verify-rdnap-grids
+just fixture-server
+```
+
+The deterministic catalog sets this surface source to `max_level: 2`. PostGIS
+selects whole candidate features with a source-CRS bounding-box filter at every
+requested level; it does not pass them through the footprint
+`ST_Intersection` or positive two-dimensional area filter. Lucy then clips the
+triangulated XYZ faces to each tile, including vertical walls, and applies the
+half-open east/north ownership rule at internal split planes.

@@ -1,12 +1,16 @@
 services:
   postgres:
-    image: postgis/postgis:18-3.6
+    build:
+      context: .
+      dockerfile: docker/postgis/Dockerfile
+    image: lucy-postgis:18-3.6-rdnaptrans2018
     platform: linux/amd64
     container_name: lucy-postgres
     environment:
       POSTGRES_DB: lucy
       POSTGRES_USER: lucy
       POSTGRES_PASSWORD: lucy
+      PROJ_NETWORK: "OFF"
     ports:
       - "5432:5432"
     volumes:

@@ -1,0 +1,240 @@
+use std::fmt;
+
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::Serialize;
+
+use lucy_core::glb::GlbError;
+use lucy_core::mesh::MeshError;
+use lucy_core::source::ConfigError;
+use lucy_core::tile::TileCoordError;
+
+use crate::ConfigLoadError;
+use crate::postgis::{SourceValidationError, TileQueryError};
+
+#[derive(Debug)]
+pub enum ServerError {
+    Config(ConfigError),
+    ConfigLoad(ConfigLoadError),
+    SourceValidation(SourceValidationError),
+    Io(std::io::Error),
+    Runtime(String),
+}
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerError::Config(error) => write!(f, "{error}"),
+            ServerError::ConfigLoad(error) => write!(f, "{error}"),
+            ServerError::SourceValidation(error) => write!(f, "{error}"),
+            ServerError::Io(error) => write!(f, "{error}"),
+            ServerError::Runtime(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+impl From<ConfigError> for ServerError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<ConfigLoadError> for ServerError {
+    fn from(error: ConfigLoadError) -> Self {
+        Self::ConfigLoad(error)
+    }
+}
+
+impl From<SourceValidationError> for ServerError {
+    fn from(error: SourceValidationError) -> Self {
+        Self::SourceValidation(error)
+    }
+}
+
+impl From<std::io::Error> for ServerError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug)]
+pub struct RouteError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl RouteError {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "config_error",
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for RouteError {
+    fn into_response(self) -> Response {
+        match self.status {
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
+                tracing::debug!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request rejected"
+                );
+            }
+            StatusCode::CONFLICT => {
+                tracing::warn!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request conflict"
+                );
+            }
+            _ => {
+                tracing::error!(
+                    error.code = self.code,
+                    error.message = %self.message,
+                    http.status_code = self.status.as_u16(),
+                    "request failed"
+                );
+            }
+        }
+        (
+            self.status,
+            Json(ErrorBody {
+                error: ErrorDetail {
+                    code: self.code,
+                    message: self.message,
+                },
+            }),
+        )
+            .into_response()
+    }
+}
+
+impl From<ConfigError> for RouteError {
+    fn from(error: ConfigError) -> Self {
+        Self::config(error.to_string())
+    }
+}
+
+impl From<GlbError> for RouteError {
+    fn from(error: GlbError) -> Self {
+        Self::internal("glb_error", error.to_string())
+    }
+}
+
+impl From<MeshError> for RouteError {
+    fn from(error: MeshError) -> Self {
+        Self::internal("mesh_error", error.to_string())
+    }
+}
+
+impl From<TileCoordError> for RouteError {
+    fn from(error: TileCoordError) -> Self {
+        Self::bad_request(error.to_string())
+    }
+}
+
+impl From<TileQueryError> for RouteError {
+    fn from(error: TileQueryError) -> Self {
+        match error {
+            error @ (TileQueryError::FeatureLimitExceeded { .. }
+            | TileQueryError::TerminalFeatureLimitExceeded { .. }) => {
+                Self::conflict("tile_overflow", error.to_string())
+            }
+            error @ TileQueryError::CoordinateTransform { .. } => {
+                Self::internal("crs_transform_error", error.to_string())
+            }
+            error @ TileQueryError::SourceContract(_) => {
+                Self::internal("source_geometry_error", error.to_string())
+            }
+            TileQueryError::Config(error) => Self::config(error.to_string()),
+            error @ TileQueryError::Postgres(_) => {
+                Self::internal("postgis_error", error.to_string())
+            }
+        }
+    }
+}
+
+impl From<tokio_postgres::Error> for RouteError {
+    fn from(error: tokio_postgres::Error) -> Self {
+        Self::from(TileQueryError::from(error))
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: ErrorDetail,
+}
+
+#[derive(Serialize)]
+struct ErrorDetail {
+    code: &'static str,
+    message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    #[test]
+    fn tile_feature_overflow_maps_to_structured_conflict() {
+        let response = RouteError::from(TileQueryError::FeatureLimitExceeded {
+            max_features_per_tile: 100,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn source_contract_failure_maps_to_server_error() {
+        let response = RouteError::from(TileQueryError::SourceContract(
+            "feature 42 is missing Z".to_string(),
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

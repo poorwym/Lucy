@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::{ConfigError, SourceBounds};
+use crate::source::{ConfigError, SourceBounds};
+
+pub const MAX_TILE_LEVEL: u8 = u32::BITS as u8 - 1;
 
 /// Phase 0 QUADTREE math.
 ///
