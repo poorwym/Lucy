@@ -13,6 +13,10 @@ const WGS84_F: f64 = 1.0 / 298.257_223_563;
 const MIN_CLOSED_RING_POINTS: usize = 4;
 const COORDINATE_EPSILON: f64 = 1.0e-12;
 const BOUNDARY_MATCH_EPSILON_DEG: f64 = 1.0e-9;
+const SURFACE_CLIP_EPSILON_DEG: f64 = 1.0e-12;
+const SURFACE_CLIP_MAX_RELATIVE_EPSILON: f64 = 1.0e-6;
+const SURFACE_CLIP_ULP_TOLERANCE: f64 = 8.0;
+const SURFACE_CLIP_HEIGHT_EPSILON_M: f64 = 1.0e-9;
 const PROJECTED_EPSILON: f64 = 1.0e-9;
 const NORMAL_EPSILON: f64 = 1.0e-12;
 const MAX_TRIANGULATION_DEVIATION: f64 = 1.0e-8;
@@ -207,22 +211,7 @@ impl MeshFrame {
         latitude_deg: f64,
         ellipsoidal_height_m: f64,
     ) -> Result<[f64; 3], MeshError> {
-        if !self.origin_longitude_deg.is_finite()
-            || !self.origin_latitude_deg.is_finite()
-            || !self.origin_height_m.is_finite()
-        {
-            return Err(MeshError::InvalidFrame(
-                "frame origin coordinates must be finite".to_string(),
-            ));
-        }
-        if !(-180.0..=180.0).contains(&self.origin_longitude_deg)
-            || !(-90.0..=90.0).contains(&self.origin_latitude_deg)
-        {
-            return Err(MeshError::InvalidFrame(format!(
-                "frame origin longitude/latitude must be within [-180, 180] / [-90, 90], got ({}, {})",
-                self.origin_longitude_deg, self.origin_latitude_deg
-            )));
-        }
+        self.validate()?;
         if !longitude_deg.is_finite()
             || !latitude_deg.is_finite()
             || !ellipsoidal_height_m.is_finite()
@@ -253,6 +242,26 @@ impl MeshFrame {
         ])
     }
 
+    fn validate(self) -> Result<(), MeshError> {
+        if !self.origin_longitude_deg.is_finite()
+            || !self.origin_latitude_deg.is_finite()
+            || !self.origin_height_m.is_finite()
+        {
+            return Err(MeshError::InvalidFrame(
+                "frame origin coordinates must be finite".to_string(),
+            ));
+        }
+        if !(-180.0..=180.0).contains(&self.origin_longitude_deg)
+            || !(-90.0..=90.0).contains(&self.origin_latitude_deg)
+        {
+            return Err(MeshError::InvalidFrame(format!(
+                "frame origin longitude/latitude must be within [-180, 180] / [-90, 90], got ({}, {})",
+                self.origin_longitude_deg, self.origin_latitude_deg
+            )));
+        }
+        Ok(())
+    }
+
     fn project_local_height(
         self,
         longitude_deg: f64,
@@ -278,6 +287,23 @@ impl Default for SurfaceMeshOptions {
             max_non_planar_distance_m: DEFAULT_MAX_NON_PLANAR_DISTANCE_M,
         }
     }
+}
+
+/// Horizontal EPSG:4979 bounds used to clip one native surface tile.
+///
+/// Clipping itself treats all four bounds as closed so crossing faces retain
+/// identical seam vertices. `include_east` and `include_north` implement
+/// half-open ownership only for positive-area faces that lie wholly on an
+/// internal split plane. West and south boundaries are always owned by the
+/// tile; the outermost east and north tiles must set the corresponding flag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceTileClip {
+    pub west_deg: f64,
+    pub south_deg: f64,
+    pub east_deg: f64,
+    pub north_deg: f64,
+    pub include_east: bool,
+    pub include_north: bool,
 }
 
 #[tracing::instrument(level = "debug", skip(wkb, frame), fields(input_wkb_bytes = wkb.len()))]
@@ -381,20 +407,183 @@ pub fn surface_geometry_z_to_mesh_with_options(
     frame: MeshFrame,
     options: SurfaceMeshOptions,
 ) -> Result<TriangleMesh, MeshError> {
+    prepare_surface_geometry_z_with_options(geometry, frame, options)?.to_mesh()
+}
+
+/// A validated native surface triangulated once in a stable source frame.
+///
+/// Reusing this value lets subtree availability test many tile rectangles
+/// without repeating ring validation, planarity checks, or earcut.
+pub struct PreparedSurfaceGeometryZ {
+    source_frame: MeshFrame,
+    polygons: Vec<PreparedSurfacePolygon>,
+}
+
+pub fn prepare_surface_geometry_z(
+    geometry: &SurfaceGeometryZ,
+    source_frame: MeshFrame,
+) -> Result<PreparedSurfaceGeometryZ, MeshError> {
+    prepare_surface_geometry_z_with_options(geometry, source_frame, SurfaceMeshOptions::default())
+}
+
+pub fn prepare_surface_geometry_z_with_options(
+    geometry: &SurfaceGeometryZ,
+    source_frame: MeshFrame,
+    options: SurfaceMeshOptions,
+) -> Result<PreparedSurfaceGeometryZ, MeshError> {
+    validate_surface_mesh_options(options)?;
+    source_frame.validate()?;
+    if geometry.polygons().is_empty() {
+        return Err(MeshError::EmptyGeometry);
+    }
+    let polygons = geometry
+        .polygons()
+        .iter()
+        .enumerate()
+        .map(|(polygon_index, polygon)| {
+            prepare_surface_polygon(polygon, source_frame, options, polygon_index)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(PreparedSurfaceGeometryZ {
+        source_frame,
+        polygons,
+    })
+}
+
+impl PreparedSurfaceGeometryZ {
+    pub fn to_mesh(&self) -> Result<TriangleMesh, MeshError> {
+        let mut mesh = TriangleMesh::new();
+        for (polygon_index, polygon) in self.polygons.iter().enumerate() {
+            append_prepared_surface_polygon(&mut mesh, polygon, polygon_index)?;
+        }
+        ensure_nonempty_mesh(mesh, "native surface")
+    }
+
+    pub fn to_tile_mesh(
+        &self,
+        tile_frame: MeshFrame,
+        clip: SurfaceTileClip,
+    ) -> Result<Option<TriangleMesh>, MeshError> {
+        validate_surface_tile_clip(clip)?;
+        tile_frame.validate()?;
+        let mut mesh = TriangleMesh::new();
+        for (polygon_index, polygon) in self.polygons.iter().enumerate() {
+            append_clipped_surface_polygon(
+                &mut mesh,
+                polygon,
+                self.source_frame,
+                tile_frame,
+                clip,
+                polygon_index,
+            )?;
+        }
+
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            Ok(None)
+        } else {
+            tracing::debug!(
+                vertex_count = mesh.vertices.len(),
+                triangle_count = mesh.indices.len() / 3,
+                context = "tile-clipped native surface",
+                "mesh generated"
+            );
+            Ok(Some(mesh))
+        }
+    }
+
+    /// Return whether clipping produces any positive-area triangle.
+    ///
+    /// Availability queries use this path to apply exactly the same clip and
+    /// half-open ownership rules as content generation without allocating a
+    /// throwaway mesh for every feature/tile candidate pair.
+    pub fn has_tile_content(&self, clip: SurfaceTileClip) -> Result<bool, MeshError> {
+        validate_surface_tile_clip(clip)?;
+        for (polygon_index, polygon) in self.polygons.iter().enumerate() {
+            for triangle in polygon.triangles.chunks_exact(3) {
+                if !clip_prepared_surface_triangle(polygon, triangle, clip, polygon_index)?
+                    .is_empty()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Triangulate a native surface in a stable source frame, clip its triangles
+/// to one horizontal tile rectangle, and emit positions in a tile-local frame.
+///
+/// `Ok(None)` is a normal broad-phase miss: the source feature's bounding box
+/// overlapped the tile, but triangle clipping produced no positive 3D area.
+pub fn surface_geometry_z_to_tile_mesh(
+    geometry: &SurfaceGeometryZ,
+    source_frame: MeshFrame,
+    tile_frame: MeshFrame,
+    clip: SurfaceTileClip,
+) -> Result<Option<TriangleMesh>, MeshError> {
+    surface_geometry_z_to_tile_mesh_with_options(
+        geometry,
+        source_frame,
+        tile_frame,
+        clip,
+        SurfaceMeshOptions::default(),
+    )
+}
+
+pub fn surface_geometry_z_to_tile_mesh_with_options(
+    geometry: &SurfaceGeometryZ,
+    source_frame: MeshFrame,
+    tile_frame: MeshFrame,
+    clip: SurfaceTileClip,
+    options: SurfaceMeshOptions,
+) -> Result<Option<TriangleMesh>, MeshError> {
+    prepare_surface_geometry_z_with_options(geometry, source_frame, options)?
+        .to_tile_mesh(tile_frame, clip)
+}
+
+fn validate_surface_mesh_options(options: SurfaceMeshOptions) -> Result<(), MeshError> {
     if !options.max_non_planar_distance_m.is_finite() || options.max_non_planar_distance_m < 0.0 {
         return Err(MeshError::InvalidSurfaceOptions(
             "max_non_planar_distance_m must be finite and nonnegative".to_string(),
         ));
     }
-    if geometry.polygons().is_empty() {
-        return Err(MeshError::EmptyGeometry);
-    }
+    Ok(())
+}
 
-    let mut mesh = TriangleMesh::new();
-    for (polygon_index, polygon) in geometry.polygons().iter().enumerate() {
-        append_surface_polygon(&mut mesh, polygon, frame, options, polygon_index)?;
+fn validate_surface_tile_clip(clip: SurfaceTileClip) -> Result<(), MeshError> {
+    for (field, value) in [
+        ("west_deg", clip.west_deg),
+        ("south_deg", clip.south_deg),
+        ("east_deg", clip.east_deg),
+        ("north_deg", clip.north_deg),
+    ] {
+        if !value.is_finite() {
+            return Err(MeshError::InvalidSurfaceClip(format!(
+                "{field} must be finite"
+            )));
+        }
     }
-    ensure_nonempty_mesh(mesh, "native surface")
+    if clip.west_deg >= clip.east_deg {
+        return Err(MeshError::InvalidSurfaceClip(
+            "west_deg must be less than east_deg".to_string(),
+        ));
+    }
+    if clip.south_deg >= clip.north_deg {
+        return Err(MeshError::InvalidSurfaceClip(
+            "south_deg must be less than north_deg".to_string(),
+        ));
+    }
+    if !(-180.0..=180.0).contains(&clip.west_deg)
+        || !(-180.0..=180.0).contains(&clip.east_deg)
+        || !(-90.0..=90.0).contains(&clip.south_deg)
+        || !(-90.0..=90.0).contains(&clip.north_deg)
+    {
+        return Err(MeshError::InvalidSurfaceClip(
+            "longitude/latitude bounds must be within [-180, 180] / [-90, 90]".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_footprint_mesh(
@@ -594,6 +783,14 @@ fn interpolate_point2(start: Point2D, end: Point2D, parameter: f64) -> Point2D {
     }
 }
 
+fn interpolate_point3(start: Point3D, end: Point3D, parameter: f64) -> Point3D {
+    Point3D {
+        x: start.x + (end.x - start.x) * parameter,
+        y: start.y + (end.y - start.y) * parameter,
+        z: start.z + (end.z - start.z) * parameter,
+    }
+}
+
 fn dot2(left: [f64; 2], right: [f64; 2]) -> f64 {
     left[0] * right[0] + left[1] * right[1]
 }
@@ -602,13 +799,24 @@ fn cross2_vectors(left: [f64; 2], right: [f64; 2]) -> f64 {
     left[0] * right[1] - left[1] * right[0]
 }
 
-fn append_surface_polygon(
-    mesh: &mut TriangleMesh,
+#[derive(Debug, Clone, Copy)]
+struct SurfaceClipVertex {
+    geodetic: Point3D,
+    source_position: [f64; 3],
+}
+
+struct PreparedSurfacePolygon {
+    vertices: Vec<SurfaceClipVertex>,
+    triangles: Vec<usize>,
+    source_face_normal: [f64; 3],
+}
+
+fn prepare_surface_polygon(
     polygon: &Polygon3D,
-    frame: MeshFrame,
+    source_frame: MeshFrame,
     options: SurfaceMeshOptions,
     polygon_index: usize,
-) -> Result<(), MeshError> {
+) -> Result<PreparedSurfacePolygon, MeshError> {
     let mut source_rings = Vec::with_capacity(polygon.interiors.len() + 1);
     source_rings.push(normalize_ring3(&polygon.exterior, polygon_index, 0)?);
     for (interior_index, ring) in polygon.interiors.iter().enumerate() {
@@ -619,7 +827,7 @@ fn append_surface_polygon(
         .iter()
         .map(|ring| {
             ring.iter()
-                .map(|point| frame.project_geodetic(point.x, point.y, point.z))
+                .map(|point| source_frame.project_geodetic(point.x, point.y, point.z))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -655,8 +863,312 @@ fn append_surface_polygon(
     }
 
     let triangles = triangulate_rings(&projected_rings, polygon_index)?;
-    let positions = local_rings.into_iter().flatten().collect::<Vec<_>>();
-    append_indexed_face(mesh, &positions, &triangles, face_normal, polygon_index)
+    let vertices = source_rings
+        .into_iter()
+        .flatten()
+        .zip(local_rings.into_iter().flatten())
+        .map(|(geodetic, source_position)| SurfaceClipVertex {
+            geodetic,
+            source_position,
+        })
+        .collect();
+    Ok(PreparedSurfacePolygon {
+        vertices,
+        triangles,
+        source_face_normal: face_normal,
+    })
+}
+
+fn append_prepared_surface_polygon(
+    mesh: &mut TriangleMesh,
+    prepared: &PreparedSurfacePolygon,
+    polygon_index: usize,
+) -> Result<(), MeshError> {
+    let positions = prepared
+        .vertices
+        .iter()
+        .map(|vertex| vertex.source_position)
+        .collect::<Vec<_>>();
+    append_indexed_face(
+        mesh,
+        &positions,
+        &prepared.triangles,
+        prepared.source_face_normal,
+        polygon_index,
+    )
+}
+
+fn append_clipped_surface_polygon(
+    mesh: &mut TriangleMesh,
+    prepared: &PreparedSurfacePolygon,
+    source_frame: MeshFrame,
+    tile_frame: MeshFrame,
+    clip: SurfaceTileClip,
+    polygon_index: usize,
+) -> Result<(), MeshError> {
+    let tile_face_normal = transform_local_vector_between_frames(
+        prepared.source_face_normal,
+        source_frame,
+        tile_frame,
+    );
+
+    for triangle in prepared.triangles.chunks_exact(3) {
+        let clipped = clip_prepared_surface_triangle(prepared, triangle, clip, polygon_index)?;
+        if clipped.is_empty() {
+            continue;
+        }
+        let positions = clipped
+            .iter()
+            .map(|vertex| {
+                transform_local_position_between_frames(
+                    vertex.source_position,
+                    source_frame,
+                    tile_frame,
+                )
+            })
+            .collect::<Vec<_>>();
+        append_clipped_convex_polygon(mesh, &positions, tile_face_normal, polygon_index)?;
+    }
+    Ok(())
+}
+
+fn clip_prepared_surface_triangle(
+    prepared: &PreparedSurfacePolygon,
+    triangle: &[usize],
+    clip: SurfaceTileClip,
+    polygon_index: usize,
+) -> Result<Vec<SurfaceClipVertex>, MeshError> {
+    let mut vertices = [
+        prepared.vertices[triangle[0]],
+        prepared.vertices[triangle[1]],
+        prepared.vertices[triangle[2]],
+    ];
+    let triangle_normal = cross3(
+        sub3(vertices[1].source_position, vertices[0].source_position),
+        sub3(vertices[2].source_position, vertices[0].source_position),
+    );
+    if length3(triangle_normal) <= NORMAL_EPSILON {
+        return Err(MeshError::DegenerateTriangle { polygon_index });
+    }
+    if dot3(triangle_normal, prepared.source_face_normal) < 0.0 {
+        vertices.swap(1, 2);
+    }
+
+    let clipped = clip_surface_triangle(vertices, clip);
+    if clipped.len() < 3
+        || !surface_clip_polygon_is_owned(&clipped, clip)
+        || !surface_clip_polygon_has_positive_area(&clipped)
+    {
+        Ok(Vec::new())
+    } else {
+        Ok(clipped)
+    }
+}
+
+fn surface_clip_polygon_has_positive_area(vertices: &[SurfaceClipVertex]) -> bool {
+    (1..vertices.len().saturating_sub(1)).any(|index| {
+        let triangle = [
+            vertices[0].source_position,
+            vertices[index].source_position,
+            vertices[index + 1].source_position,
+        ];
+        length3(cross3(
+            sub3(triangle[1], triangle[0]),
+            sub3(triangle[2], triangle[0]),
+        )) > NORMAL_EPSILON
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SurfaceClipAxis {
+    Longitude,
+    Latitude,
+}
+
+fn clip_surface_triangle(
+    triangle: [SurfaceClipVertex; 3],
+    clip: SurfaceTileClip,
+) -> Vec<SurfaceClipVertex> {
+    let mut vertices = triangle.to_vec();
+    for (axis, boundary, keep_greater) in [
+        (SurfaceClipAxis::Longitude, clip.west_deg, true),
+        (SurfaceClipAxis::Longitude, clip.east_deg, false),
+        (SurfaceClipAxis::Latitude, clip.south_deg, true),
+        (SurfaceClipAxis::Latitude, clip.north_deg, false),
+    ] {
+        vertices = clip_surface_polygon_to_boundary(vertices, axis, boundary, keep_greater);
+        if vertices.len() < 3 {
+            return Vec::new();
+        }
+    }
+
+    deduplicate_surface_clip_vertices(
+        vertices,
+        surface_clip_axis_epsilon(SurfaceClipAxis::Longitude, clip),
+        surface_clip_axis_epsilon(SurfaceClipAxis::Latitude, clip),
+    )
+}
+
+fn clip_surface_polygon_to_boundary(
+    vertices: Vec<SurfaceClipVertex>,
+    axis: SurfaceClipAxis,
+    boundary: f64,
+    keep_greater: bool,
+) -> Vec<SurfaceClipVertex> {
+    let Some(mut previous) = vertices.last().copied() else {
+        return Vec::new();
+    };
+    let mut previous_inside = surface_clip_vertex_is_inside(previous, axis, boundary, keep_greater);
+    let mut output = Vec::with_capacity(vertices.len() + 1);
+
+    for current in vertices {
+        let current_inside = surface_clip_vertex_is_inside(current, axis, boundary, keep_greater);
+        if previous_inside != current_inside {
+            output.push(surface_clip_intersection(previous, current, axis, boundary));
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    output
+}
+
+fn surface_clip_vertex_is_inside(
+    vertex: SurfaceClipVertex,
+    axis: SurfaceClipAxis,
+    boundary: f64,
+    keep_greater: bool,
+) -> bool {
+    let coordinate = surface_clip_coordinate(vertex, axis);
+    if keep_greater {
+        coordinate >= boundary
+    } else {
+        coordinate <= boundary
+    }
+}
+
+fn surface_clip_intersection(
+    start: SurfaceClipVertex,
+    end: SurfaceClipVertex,
+    axis: SurfaceClipAxis,
+    boundary: f64,
+) -> SurfaceClipVertex {
+    let start_coordinate = surface_clip_coordinate(start, axis);
+    let end_coordinate = surface_clip_coordinate(end, axis);
+    let denominator = end_coordinate - start_coordinate;
+    let parameter = if denominator == 0.0 {
+        0.5
+    } else {
+        ((boundary - start_coordinate) / denominator).clamp(0.0, 1.0)
+    };
+    let mut intersection = SurfaceClipVertex {
+        geodetic: interpolate_point3(start.geodetic, end.geodetic, parameter),
+        source_position: interpolate3(start.source_position, end.source_position, parameter),
+    };
+    match axis {
+        SurfaceClipAxis::Longitude => intersection.geodetic.x = boundary,
+        SurfaceClipAxis::Latitude => intersection.geodetic.y = boundary,
+    }
+    intersection
+}
+
+fn surface_clip_coordinate(vertex: SurfaceClipVertex, axis: SurfaceClipAxis) -> f64 {
+    match axis {
+        SurfaceClipAxis::Longitude => vertex.geodetic.x,
+        SurfaceClipAxis::Latitude => vertex.geodetic.y,
+    }
+}
+
+fn surface_clip_axis_epsilon(axis: SurfaceClipAxis, clip: SurfaceTileClip) -> f64 {
+    let (low, high) = match axis {
+        SurfaceClipAxis::Longitude => (clip.west_deg, clip.east_deg),
+        SurfaceClipAxis::Latitude => (clip.south_deg, clip.north_deg),
+    };
+    let span = high - low;
+    let magnitude = low.abs().max(high.abs());
+    let ulp = if magnitude == 0.0 {
+        f64::MIN_POSITIVE
+    } else {
+        magnitude.next_up() - magnitude
+    };
+    SURFACE_CLIP_EPSILON_DEG
+        .min(ulp * SURFACE_CLIP_ULP_TOLERANCE)
+        .min(span * SURFACE_CLIP_MAX_RELATIVE_EPSILON)
+}
+
+fn deduplicate_surface_clip_vertices(
+    vertices: Vec<SurfaceClipVertex>,
+    longitude_epsilon: f64,
+    latitude_epsilon: f64,
+) -> Vec<SurfaceClipVertex> {
+    let mut deduplicated = Vec::with_capacity(vertices.len());
+    for vertex in vertices {
+        if deduplicated.last().is_none_or(|previous| {
+            !surface_clip_vertices_equal(*previous, vertex, longitude_epsilon, latitude_epsilon)
+        }) {
+            deduplicated.push(vertex);
+        }
+    }
+    if deduplicated.len() >= 2
+        && surface_clip_vertices_equal(
+            deduplicated[0],
+            *deduplicated.last().expect("nonempty clipped polygon"),
+            longitude_epsilon,
+            latitude_epsilon,
+        )
+    {
+        deduplicated.pop();
+    }
+    deduplicated
+}
+
+fn surface_clip_vertices_equal(
+    left: SurfaceClipVertex,
+    right: SurfaceClipVertex,
+    longitude_epsilon: f64,
+    latitude_epsilon: f64,
+) -> bool {
+    (left.geodetic.x - right.geodetic.x).abs() <= longitude_epsilon
+        && (left.geodetic.y - right.geodetic.y).abs() <= latitude_epsilon
+        && (left.geodetic.z - right.geodetic.z).abs() <= SURFACE_CLIP_HEIGHT_EPSILON_M
+        && left
+            .source_position
+            .into_iter()
+            .zip(right.source_position)
+            .all(|(left, right)| (left - right).abs() <= SURFACE_CLIP_HEIGHT_EPSILON_M)
+}
+
+fn surface_clip_polygon_is_owned(vertices: &[SurfaceClipVertex], clip: SurfaceTileClip) -> bool {
+    (clip.include_east
+        || !vertices
+            .iter()
+            .all(|vertex| vertex.geodetic.x == clip.east_deg))
+        && (clip.include_north
+            || !vertices
+                .iter()
+                .all(|vertex| vertex.geodetic.y == clip.north_deg))
+}
+
+fn append_clipped_convex_polygon(
+    mesh: &mut TriangleMesh,
+    positions: &[[f64; 3]],
+    desired_normal: [f64; 3],
+    polygon_index: usize,
+) -> Result<(), MeshError> {
+    for index in 1..positions.len().saturating_sub(1) {
+        let triangle = [positions[0], positions[index], positions[index + 1]];
+        let triangle_normal = cross3(
+            sub3(triangle[1], triangle[0]),
+            sub3(triangle[2], triangle[0]),
+        );
+        if length3(triangle_normal) <= NORMAL_EPSILON {
+            continue;
+        }
+        append_indexed_face(mesh, &triangle, &[0, 1, 2], desired_normal, polygon_index)?;
+    }
+    Ok(())
 }
 
 struct PreparedFootprint {
@@ -1230,6 +1742,144 @@ fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn interpolate3(start: [f64; 3], end: [f64; 3], parameter: f64) -> [f64; 3] {
+    add3(start, scale3(sub3(end, start), parameter))
+}
+
+fn transform_local_position_between_frames(
+    position: [f64; 3],
+    source_frame: MeshFrame,
+    target_frame: MeshFrame,
+) -> [f64; 3] {
+    let source_transform = source_frame.enu_to_ecef_transform();
+    let ecef = add3(
+        source_frame.origin_ecef,
+        add3(
+            scale3(
+                [
+                    source_transform[0],
+                    source_transform[1],
+                    source_transform[2],
+                ],
+                position[0],
+            ),
+            add3(
+                scale3(
+                    [
+                        source_transform[4],
+                        source_transform[5],
+                        source_transform[6],
+                    ],
+                    position[1],
+                ),
+                scale3(
+                    [
+                        source_transform[8],
+                        source_transform[9],
+                        source_transform[10],
+                    ],
+                    position[2],
+                ),
+            ),
+        ),
+    );
+    let target_transform = target_frame.enu_to_ecef_transform();
+    let delta = sub3(ecef, target_frame.origin_ecef);
+    [
+        dot3(
+            [
+                target_transform[0],
+                target_transform[1],
+                target_transform[2],
+            ],
+            delta,
+        ),
+        dot3(
+            [
+                target_transform[4],
+                target_transform[5],
+                target_transform[6],
+            ],
+            delta,
+        ),
+        dot3(
+            [
+                target_transform[8],
+                target_transform[9],
+                target_transform[10],
+            ],
+            delta,
+        ),
+    ]
+}
+
+fn transform_local_vector_between_frames(
+    vector: [f64; 3],
+    source_frame: MeshFrame,
+    target_frame: MeshFrame,
+) -> [f64; 3] {
+    let source_transform = source_frame.enu_to_ecef_transform();
+    let ecef = add3(
+        scale3(
+            [
+                source_transform[0],
+                source_transform[1],
+                source_transform[2],
+            ],
+            vector[0],
+        ),
+        add3(
+            scale3(
+                [
+                    source_transform[4],
+                    source_transform[5],
+                    source_transform[6],
+                ],
+                vector[1],
+            ),
+            scale3(
+                [
+                    source_transform[8],
+                    source_transform[9],
+                    source_transform[10],
+                ],
+                vector[2],
+            ),
+        ),
+    );
+    let target_transform = target_frame.enu_to_ecef_transform();
+    [
+        dot3(
+            [
+                target_transform[0],
+                target_transform[1],
+                target_transform[2],
+            ],
+            ecef,
+        ),
+        dot3(
+            [
+                target_transform[4],
+                target_transform[5],
+                target_transform[6],
+            ],
+            ecef,
+        ),
+        dot3(
+            [
+                target_transform[8],
+                target_transform[9],
+                target_transform[10],
+            ],
+            ecef,
+        ),
+    ]
+}
+
 fn scale3(vector: [f64; 3], scale: f64) -> [f64; 3] {
     [vector[0] * scale, vector[1] * scale, vector[2] * scale]
 }
@@ -1285,6 +1935,7 @@ pub enum MeshError {
     Wkb(WkbError),
     InvalidFrame(String),
     InvalidSurfaceOptions(String),
+    InvalidSurfaceClip(String),
     EmptyGeometry,
     MeshIsEmpty(&'static str),
     InvalidExtrusion {
@@ -1359,6 +2010,9 @@ impl fmt::Display for MeshError {
             Self::InvalidFrame(message) => write!(f, "invalid mesh frame: {message}"),
             Self::InvalidSurfaceOptions(message) => {
                 write!(f, "invalid surface mesh options: {message}")
+            }
+            Self::InvalidSurfaceClip(message) => {
+                write!(f, "invalid surface tile clip: {message}")
             }
             Self::EmptyGeometry => write!(f, "polygonal geometry is empty"),
             Self::MeshIsEmpty(context) => write!(f, "{context} produced an empty mesh"),
@@ -1545,6 +2199,58 @@ mod tests {
                 .sqrt();
             assert!((length - 1.0).abs() < 1.0e-5, "normal={:?}", vertex.normal);
         }
+    }
+
+    fn surface_clip(
+        west_deg: f64,
+        south_deg: f64,
+        east_deg: f64,
+        north_deg: f64,
+        include_east: bool,
+        include_north: bool,
+    ) -> SurfaceTileClip {
+        SurfaceTileClip {
+            west_deg,
+            south_deg,
+            east_deg,
+            north_deg,
+            include_east,
+            include_north,
+        }
+    }
+
+    fn mesh_area(mesh: &TriangleMesh) -> f64 {
+        mesh.indices
+            .chunks_exact(3)
+            .map(|triangle| {
+                let positions = [
+                    mesh.vertices[triangle[0] as usize].position.map(f64::from),
+                    mesh.vertices[triangle[1] as usize].position.map(f64::from),
+                    mesh.vertices[triangle[2] as usize].position.map(f64::from),
+                ];
+                length3(cross3(
+                    sub3(positions[1], positions[0]),
+                    sub3(positions[2], positions[0]),
+                )) / 2.0
+            })
+            .sum()
+    }
+
+    fn mesh_positions_in_frame(
+        mesh: &TriangleMesh,
+        mesh_frame: MeshFrame,
+        target_frame: MeshFrame,
+    ) -> Vec<[f64; 3]> {
+        mesh.vertices
+            .iter()
+            .map(|vertex| {
+                transform_local_position_between_frames(
+                    vertex.position.map(f64::from),
+                    mesh_frame,
+                    target_frame,
+                )
+            })
+            .collect()
     }
 
     fn transform_vector(matrix: [f64; 16], vector: [f64; 4]) -> [f64; 4] {
@@ -1946,6 +2652,428 @@ mod tests {
             .expect("MultiPolygonZ should produce one mesh");
         assert_eq!(mesh.vertices.len(), 8);
         assert_eq!(mesh.indices.len(), 12);
+    }
+
+    #[test]
+    fn native_surface_tile_clip_conserves_area_and_shares_a_seam() {
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.0025, 50.0025, 20.0],
+                [5.0075, 50.0025, 20.0],
+                [5.0075, 50.0075, 20.0],
+                [5.0025, 50.0075, 20.0],
+                [5.0025, 50.0025, 20.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        let source_frame = fixture_frame();
+        let full = surface_geometry_z_to_mesh(&geometry, source_frame).expect("full surface");
+        let west_frame = MeshFrame::from_geodetic_origin(5.0025, 50.005, 0.0);
+        let east_frame = MeshFrame::from_geodetic_origin(5.0075, 50.005, 0.0);
+        let west = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            source_frame,
+            west_frame,
+            surface_clip(5.0, 50.0, 5.005, 50.01, false, true),
+        )
+        .expect("west clip")
+        .expect("west fragment");
+        let east = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            source_frame,
+            east_frame,
+            surface_clip(5.005, 50.0, 5.01, 50.01, true, true),
+        )
+        .expect("east clip")
+        .expect("east fragment");
+
+        let full_area = mesh_area(&full);
+        let split_area = mesh_area(&west) + mesh_area(&east);
+        assert!(
+            (full_area - split_area).abs() / full_area < 1.0e-6,
+            "full={full_area} split={split_area}"
+        );
+        assert_unit_normals(&west);
+        assert_unit_normals(&east);
+
+        let west_positions = mesh_positions_in_frame(&west, west_frame, source_frame);
+        let east_positions = mesh_positions_in_frame(&east, east_frame, source_frame);
+        let shared_count = west_positions
+            .iter()
+            .filter(|west_position| {
+                east_positions
+                    .iter()
+                    .any(|east_position| length3(sub3(**west_position, *east_position)) < 1.0e-4)
+            })
+            .count();
+        assert!(
+            shared_count >= 2,
+            "expected a shared seam, got {shared_count}"
+        );
+
+        let full_normal = full.vertices[0].normal.map(f64::from);
+        for (mesh, frame) in [(&west, west_frame), (&east, east_frame)] {
+            let source_normal = transform_local_vector_between_frames(
+                mesh.vertices[0].normal.map(f64::from),
+                frame,
+                source_frame,
+            );
+            assert!(dot3(source_normal, full_normal) > 0.999_999);
+        }
+    }
+
+    #[test]
+    fn native_surface_tile_clip_preserves_crossing_vertical_faces() {
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.002, 50.005, 10.0],
+                [5.008, 50.005, 10.0],
+                [5.008, 50.005, 25.0],
+                [5.002, 50.005, 25.0],
+                [5.002, 50.005, 10.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        let source_frame = fixture_frame();
+        for (frame, clip) in [
+            (
+                MeshFrame::from_geodetic_origin(5.0025, 50.005, 0.0),
+                surface_clip(5.0, 50.0, 5.005, 50.01, false, true),
+            ),
+            (
+                MeshFrame::from_geodetic_origin(5.0075, 50.005, 0.0),
+                surface_clip(5.005, 50.0, 5.01, 50.01, true, true),
+            ),
+        ] {
+            let mesh = surface_geometry_z_to_tile_mesh(&geometry, source_frame, frame, clip)
+                .expect("vertical clip")
+                .expect("vertical fragment");
+            assert!(mesh_area(&mesh) > 1.0);
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|vertex| vertex.normal[2].abs() < 0.01)
+            );
+        }
+    }
+
+    #[test]
+    fn native_surface_tile_clip_assigns_split_plane_and_outer_boundary_once() {
+        let vertical_face = |longitude: f64| {
+            SurfaceGeometryZ::Polygon(Polygon3D {
+                exterior: ring3(&[
+                    [longitude, 50.002, 10.0],
+                    [longitude, 50.008, 10.0],
+                    [longitude, 50.008, 25.0],
+                    [longitude, 50.002, 25.0],
+                    [longitude, 50.002, 10.0],
+                ]),
+                interiors: Vec::new(),
+            })
+        };
+        let horizontal_split_face = |latitude: f64| {
+            SurfaceGeometryZ::Polygon(Polygon3D {
+                exterior: ring3(&[
+                    [5.002, latitude, 10.0],
+                    [5.008, latitude, 10.0],
+                    [5.008, latitude, 25.0],
+                    [5.002, latitude, 25.0],
+                    [5.002, latitude, 10.0],
+                ]),
+                interiors: Vec::new(),
+            })
+        };
+        let source_frame = fixture_frame();
+        let frame = source_frame;
+        let west_clip = surface_clip(5.0, 50.0, 5.005, 50.01, false, true);
+        let east_clip = surface_clip(5.005, 50.0, 5.01, 50.01, true, true);
+        let south_clip = surface_clip(5.0, 50.0, 5.01, 50.005, true, false);
+        let north_clip = surface_clip(5.0, 50.005, 5.01, 50.01, true, true);
+
+        assert!(
+            surface_geometry_z_to_tile_mesh(&vertical_face(5.005), source_frame, frame, west_clip,)
+                .expect("west owner check")
+                .is_none()
+        );
+        assert!(
+            surface_geometry_z_to_tile_mesh(&vertical_face(5.005), source_frame, frame, east_clip,)
+                .expect("east owner check")
+                .is_some()
+        );
+        assert!(
+            surface_geometry_z_to_tile_mesh(&vertical_face(5.01), source_frame, frame, east_clip,)
+                .expect("outer boundary owner check")
+                .is_some()
+        );
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &horizontal_split_face(50.005),
+                source_frame,
+                frame,
+                south_clip,
+            )
+            .expect("south owner check")
+            .is_none()
+        );
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &horizontal_split_face(50.005),
+                source_frame,
+                frame,
+                north_clip,
+            )
+            .expect("north owner check")
+            .is_some()
+        );
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &horizontal_split_face(50.01),
+                source_frame,
+                frame,
+                north_clip,
+            )
+            .expect("outer north boundary owner check")
+            .is_some()
+        );
+
+        let near_east = (0..4).fold(5.005_f64, |coordinate, _| coordinate.next_down());
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &vertical_face(near_east),
+                source_frame,
+                frame,
+                west_clip,
+            )
+            .expect("near-east interior check")
+            .is_some()
+        );
+        let near_north = (0..4).fold(50.005_f64, |coordinate, _| coordinate.next_down());
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &horizontal_split_face(near_north),
+                source_frame,
+                frame,
+                south_clip,
+            )
+            .expect("near-north interior check")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn native_surface_tile_clip_keeps_geometry_near_sub_epsilon_tile_edges() {
+        let west = 5.0;
+        let east = 5.000_000_000_000_5;
+        for longitude in [(west + east) / 2.0, east - (east - west) / 8.0] {
+            let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+                exterior: ring3(&[
+                    [longitude, 50.002, 10.0],
+                    [longitude, 50.008, 10.0],
+                    [longitude, 50.008, 25.0],
+                    [longitude, 50.002, 25.0],
+                    [longitude, 50.002, 10.0],
+                ]),
+                interiors: Vec::new(),
+            });
+            let mesh = surface_geometry_z_to_tile_mesh(
+                &geometry,
+                fixture_frame(),
+                MeshFrame::from_geodetic_origin(longitude, 50.005, 0.0),
+                surface_clip(west, 50.0, east, 50.01, false, true),
+            )
+            .expect("narrow longitude clip should be valid")
+            .expect("interior vertical face must not snap to the east boundary");
+            assert!(mesh_area(&mesh) > 1.0);
+        }
+
+        let south = 50.0;
+        let north = 50.000_000_000_000_5;
+        let latitude = north - (north - south) / 8.0;
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.002, latitude, 10.0],
+                [5.008, latitude, 10.0],
+                [5.008, latitude, 25.0],
+                [5.002, latitude, 25.0],
+                [5.002, latitude, 10.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        let mesh = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            fixture_frame(),
+            MeshFrame::from_geodetic_origin(5.005, latitude, 0.0),
+            surface_clip(5.0, south, 5.01, north, true, false),
+        )
+        .expect("narrow latitude clip should be valid")
+        .expect("interior vertical face must not snap to the north boundary");
+        assert!(mesh_area(&mesh) > 1.0);
+    }
+
+    #[test]
+    fn surface_clip_intersection_uses_true_parameter_for_sub_epsilon_edges() {
+        let start = SurfaceClipVertex {
+            geodetic: Point3D {
+                x: -1.0e-17,
+                y: -1.0e-17,
+                z: 10.0,
+            },
+            source_position: [0.0, 0.0, 0.0],
+        };
+        let end = SurfaceClipVertex {
+            geodetic: Point3D {
+                x: 9.0e-17,
+                y: 9.0e-17,
+                z: 20.0,
+            },
+            source_position: [100.0, 200.0, 300.0],
+        };
+
+        for axis in [SurfaceClipAxis::Longitude, SurfaceClipAxis::Latitude] {
+            let intersection = surface_clip_intersection(start, end, axis, 0.0);
+            let coordinate = surface_clip_coordinate(intersection, axis);
+            assert_eq!(coordinate, 0.0);
+            assert!((intersection.source_position[0] - 10.0).abs() < 1.0e-12);
+            assert!((intersection.source_position[1] - 20.0).abs() < 1.0e-12);
+            assert!((intersection.source_position[2] - 30.0).abs() < 1.0e-12);
+            assert!((intersection.geodetic.z - 11.0).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn native_surface_tile_clip_filters_touches_holes_and_multipolygon_gaps() {
+        let source_frame = fixture_frame();
+        let frame = source_frame;
+        let touching = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.005, 50.002, 20.0],
+                [5.008, 50.002, 20.0],
+                [5.008, 50.008, 20.0],
+                [5.005, 50.008, 20.0],
+                [5.005, 50.002, 20.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &touching,
+                source_frame,
+                frame,
+                surface_clip(5.0, 50.0, 5.005, 50.01, true, true),
+            )
+            .expect("line touch")
+            .is_none()
+        );
+
+        let with_hole = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.0025, 50.0025, 20.0],
+                [5.0075, 50.0025, 20.0],
+                [5.0075, 50.0075, 20.0],
+                [5.0025, 50.0075, 20.0],
+                [5.0025, 50.0025, 20.0],
+            ]),
+            interiors: vec![ring3(&[
+                [5.004, 50.004, 20.0],
+                [5.004, 50.006, 20.0],
+                [5.006, 50.006, 20.0],
+                [5.006, 50.004, 20.0],
+                [5.004, 50.004, 20.0],
+            ])],
+        });
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &with_hole,
+                source_frame,
+                frame,
+                surface_clip(5.0045, 50.0045, 5.0055, 50.0055, true, true),
+            )
+            .expect("hole clip")
+            .is_none()
+        );
+
+        let face = |west: f64| Polygon3D {
+            exterior: ring3(&[
+                [west, 50.002, 20.0],
+                [west + 0.001, 50.002, 20.0],
+                [west + 0.001, 50.003, 20.0],
+                [west, 50.003, 20.0],
+                [west, 50.002, 20.0],
+            ]),
+            interiors: Vec::new(),
+        };
+        let disjoint = SurfaceGeometryZ::MultiPolygon(vec![face(5.001), face(5.008)]);
+        assert!(
+            surface_geometry_z_to_tile_mesh(
+                &disjoint,
+                source_frame,
+                frame,
+                surface_clip(5.004, 50.0, 5.006, 50.01, true, true),
+            )
+            .expect("multipolygon gap")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn prepared_surface_availability_matches_mesh_emission() {
+        let face = |west: f64| Polygon3D {
+            exterior: ring3(&[
+                [west, 50.002, 20.0],
+                [west + 0.001, 50.002, 20.0],
+                [west + 0.001, 50.003, 20.0],
+                [west, 50.003, 20.0],
+                [west, 50.002, 20.0],
+            ]),
+            interiors: Vec::new(),
+        };
+        let geometry = SurfaceGeometryZ::MultiPolygon(vec![face(5.001), face(5.008)]);
+        let frame = fixture_frame();
+        let prepared = prepare_surface_geometry_z(&geometry, frame).expect("prepared surface");
+
+        for clip in [
+            surface_clip(5.0, 50.0, 5.004, 50.01, false, true),
+            surface_clip(5.004, 50.0, 5.006, 50.01, false, true),
+            surface_clip(5.006, 50.0, 5.01, 50.01, true, true),
+        ] {
+            assert_eq!(
+                prepared.has_tile_content(clip).expect("availability clip"),
+                prepared
+                    .to_tile_mesh(frame, clip)
+                    .expect("content clip")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_native_surface_tile_clip_is_structured() {
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.001, 50.001, 20.0],
+                [5.002, 50.001, 20.0],
+                [5.001, 50.002, 20.0],
+                [5.001, 50.001, 20.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        let error = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            fixture_frame(),
+            fixture_frame(),
+            surface_clip(5.0, 50.0, 5.0, 50.01, true, true),
+        )
+        .expect_err("zero-width clip should fail");
+        assert!(matches!(error, MeshError::InvalidSurfaceClip(_)));
+
+        let error = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            fixture_frame(),
+            MeshFrame::from_geodetic_origin(181.0, 50.0, 0.0),
+            surface_clip(5.0, 50.0, 5.01, 50.01, true, true),
+        )
+        .expect_err("invalid tile frame should fail");
+        assert!(matches!(error, MeshError::InvalidFrame(_)));
     }
 
     #[test]

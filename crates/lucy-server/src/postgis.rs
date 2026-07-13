@@ -1,17 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::time::Instant;
 
+use futures_util::TryStreamExt;
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{GenericClient, Row};
 
 use lucy_core::geometry::{
     FootprintFragment, NormalizedGeometry, decode_footprint_wkb, decode_multi_line_string_wkb,
     decode_surface_geometry_z_wkb,
 };
+use lucy_core::mesh::{MeshFrame, SurfaceTileClip, prepare_surface_geometry_z};
 use lucy_core::source::{
     ConfigError, CoordinateOperation, GeometryType, SourceBounds, SourceConfig, SourceModel,
 };
-use lucy_core::subtree::{SubtreeAvailabilityBits, subtree_layout};
+use lucy_core::subtree::{SubtreeAvailabilityBits, SubtreeLayout, subtree_layout};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
 
 const TARGET_GEOGRAPHIC_2D_SRID: i32 = 4326;
@@ -34,10 +37,9 @@ const RDNAPTRANS2018_EPSG_1149_PIPELINE: &str = "+proj=pipeline \
 /// of the original feature boundary that remain inside the tile. The boundary
 /// mask prevents clip edges from becoming artificial extrusion walls. Native
 /// surface features contain the whole source geometry normalized to Lucy's
-/// explicit EPSG:4979 target contract. Validated native-surface sources are
-/// root-owned (`max_level = 0`), because PostGIS XY overlay would collapse
-/// vertical PolygonZ faces and whole-feature child duplication would violate
-/// tile bounds.
+/// explicit EPSG:4979 target contract. Content generation triangulates them in
+/// a stable source frame and clips the triangles per tile, because PostGIS XY
+/// overlay would collapse vertical PolygonZ faces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedFeature {
     pub id: String,
@@ -64,7 +66,9 @@ pub async fn query_normalized_features(
 }
 
 /// Query an explicit target-geodetic bbox and return decoded, normalized
-/// geometry. WKB and source-CRS details do not cross this adapter boundary.
+/// geometry. Native surfaces are returned as whole-feature broad-phase
+/// candidates and are clipped safely after 3D triangulation. WKB and
+/// source-CRS details do not cross this adapter boundary.
 #[tracing::instrument(
     name = "postgis.tile_geometry",
     skip(client, source, bbox),
@@ -77,7 +81,7 @@ pub async fn query_normalized_features(
         bbox.south = bbox.south,
         bbox.east = bbox.east,
         bbox.north = bbox.north,
-        query_limit = source.max_features_per_tile + 1,
+        max_features_per_tile = source.max_features_per_tile,
     )
 )]
 async fn query_normalized_features_for_bbox(
@@ -86,6 +90,16 @@ async fn query_normalized_features_for_bbox(
     bbox: GeographicRegionDegrees,
 ) -> Result<Vec<NormalizedFeature>, TileQueryError> {
     validate_query_bbox(bbox)?;
+
+    if source.source_model == SourceModel::SurfaceGeometryZ {
+        let mut features = Vec::new();
+        for_each_normalized_surface_feature_for_bbox(client, source, bbox, |feature| {
+            features.push(feature);
+            Ok::<(), TileQueryError>(())
+        })
+        .await?;
+        return Ok(features);
+    }
 
     let plan = build_normalized_geometry_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
@@ -133,38 +147,137 @@ async fn query_normalized_features_for_bbox(
 
     let mut features = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = row.try_get::<_, String>(0)?;
-        let geometry_wkb = row.try_get::<_, Vec<u8>>(1)?;
-        let source_boundary_wkb = row.try_get::<_, Option<Vec<u8>>>(2)?;
-        let geometry = decode_normalized_geometry(
+        features.push(normalized_feature_from_row(
+            row,
             source.source_model,
-            &geometry_wkb,
-            source_boundary_wkb.as_deref(),
-        )
-        .map_err(|error| {
-            TileQueryError::SourceContract(format!(
-                "feature {id} did not match the adapter's normalized geometry contract: {error}"
-            ))
-        })?;
-        let mut attributes = BTreeMap::new();
-
-        for (index, attribute) in plan.attributes.iter().enumerate() {
-            attributes.insert(
-                attribute.clone(),
-                row.try_get::<_, Option<String>>(index + 3)?,
-            );
-        }
-
-        features.push(NormalizedFeature {
-            id,
-            geometry,
-            encoded_size_bytes: geometry_wkb.len()
-                + source_boundary_wkb.as_ref().map_or(0, Vec::len),
-            attributes,
-        });
+            &plan.attributes,
+        )?);
     }
 
     Ok(features)
+}
+
+/// Stream whole native-surface candidates for one tile and let the caller
+/// apply exact 3D clipping before deciding feature limits.
+pub async fn for_each_normalized_surface_feature<E, F>(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    tile: TileCoord,
+    consumer: F,
+) -> Result<(), E>
+where
+    E: From<TileQueryError>,
+    F: FnMut(NormalizedFeature) -> Result<(), E>,
+{
+    if source.source_model != SourceModel::SurfaceGeometryZ {
+        return Err(E::from(TileQueryError::Config(ConfigError::Validation(
+            "streaming surface candidates require source_model = surface_geometry_z".to_string(),
+        ))));
+    }
+    if tile.level < source.min_level || tile.level > source.max_level {
+        return Err(E::from(TileQueryError::Config(ConfigError::Validation(
+            format!(
+                "tile level={} is outside configured levels {}..={}",
+                tile.level, source.min_level, source.max_level
+            ),
+        ))));
+    }
+    let bbox = tile
+        .geographic_region_degrees(&source.bounds)
+        .map_err(TileQueryError::from)
+        .map_err(E::from)?;
+    for_each_normalized_surface_feature_for_bbox(client, source, bbox, consumer).await
+}
+
+async fn for_each_normalized_surface_feature_for_bbox<E, F>(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    bbox: GeographicRegionDegrees,
+    mut consumer: F,
+) -> Result<(), E>
+where
+    E: From<TileQueryError>,
+    F: FnMut(NormalizedFeature) -> Result<(), E>,
+{
+    validate_query_bbox(bbox)
+        .map_err(TileQueryError::from)
+        .map_err(E::from)?;
+    let plan = build_normalized_geometry_query(source)
+        .map_err(TileQueryError::from)
+        .map_err(E::from)?;
+    let started = Instant::now();
+    let rows = match plan.bindings {
+        QueryBindings::Standard => {
+            let params: [&(dyn ToSql + Sync); 5] = [
+                &bbox.west,
+                &bbox.south,
+                &bbox.east,
+                &bbox.north,
+                &source.srid,
+            ];
+            client.query_raw(&plan.sql, params).await
+        }
+        QueryBindings::Rdnaptrans2018Epsg1149 => {
+            let params: [&(dyn ToSql + Sync); 6] = [
+                &bbox.west,
+                &bbox.south,
+                &bbox.east,
+                &bbox.north,
+                &source.srid,
+                &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+            ];
+            client.query_raw(&plan.sql, params).await
+        }
+    }
+    .map_err(|error| E::from(plan.map_query_error(source, error)))?;
+    tokio::pin!(rows);
+    let mut row_count = 0_usize;
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .map_err(|error| E::from(plan.map_query_error(source, error)))?
+    {
+        row_count += 1;
+        let feature = normalized_feature_from_row(row, source.source_model, &plan.attributes)
+            .map_err(E::from)?;
+        consumer(feature)?;
+    }
+    tracing::debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        row_count,
+        "PostGIS native-surface candidates streamed"
+    );
+    Ok(())
+}
+
+fn normalized_feature_from_row(
+    row: Row,
+    source_model: SourceModel,
+    attributes: &[String],
+) -> Result<NormalizedFeature, TileQueryError> {
+    let id = row.try_get::<_, String>(0)?;
+    let geometry_wkb = row.try_get::<_, Vec<u8>>(1)?;
+    let source_boundary_wkb = row.try_get::<_, Option<Vec<u8>>>(2)?;
+    let geometry =
+        decode_normalized_geometry(source_model, &geometry_wkb, source_boundary_wkb.as_deref())
+            .map_err(|error| {
+                TileQueryError::SourceContract(format!(
+                    "feature {id} did not match the adapter's normalized geometry contract: {error}"
+                ))
+            })?;
+    let mut decoded_attributes = BTreeMap::new();
+    for (index, attribute) in attributes.iter().enumerate() {
+        decoded_attributes.insert(
+            attribute.clone(),
+            row.try_get::<_, Option<String>>(index + 3)?,
+        );
+    }
+    Ok(NormalizedFeature {
+        id,
+        geometry,
+        encoded_size_bytes: geometry_wkb.len() + source_boundary_wkb.as_ref().map_or(0, Vec::len),
+        attributes: decoded_attributes,
+    })
 }
 
 fn decode_normalized_geometry(
@@ -211,7 +324,7 @@ fn decode_normalized_geometry(
         tile.level = subtree_root.level,
         tile.x = subtree_root.x,
         tile.y = subtree_root.y,
-        query_limit = source.max_features_per_tile + 1,
+        max_features_per_tile = source.max_features_per_tile,
     )
 )]
 pub async fn query_subtree_availability(
@@ -242,6 +355,21 @@ pub async fn query_subtree_availability(
         south.push(bbox.south);
         east.push(bbox.east);
         north.push(bbox.north);
+    }
+
+    if source.source_model == SourceModel::SurfaceGeometryZ {
+        return query_surface_subtree_availability(
+            client,
+            source,
+            subtree_root,
+            &layout,
+            &slots,
+            &west,
+            &south,
+            &east,
+            &north,
+        )
+        .await;
     }
 
     let plan = build_subtree_occupancy_query(source)?;
@@ -289,11 +417,7 @@ pub async fn query_subtree_availability(
         ))));
     }
 
-    let mut availability = SubtreeAvailabilityBits {
-        tile: vec![false; layout.local_tiles.len()],
-        content: vec![false; layout.local_tiles.len()],
-        child_subtree: vec![false; layout.child_roots.len()],
-    };
+    let mut feature_counts = vec![0; slots.len()];
     for row in rows {
         let slot_index = usize::try_from(row.try_get::<_, i64>(0)?).map_err(|_| {
             ConfigError::Validation("PostGIS returned a negative subtree slot".to_string())
@@ -301,15 +425,41 @@ pub async fn query_subtree_availability(
         let feature_count = u64::try_from(row.try_get::<_, i64>(1)?).map_err(|_| {
             ConfigError::Validation("PostGIS returned a negative feature count".to_string())
         })?;
-        let slot = slots.get(slot_index).ok_or_else(|| {
+        slots.get(slot_index).ok_or_else(|| {
             ConfigError::Validation(format!(
                 "PostGIS returned out-of-range subtree slot {slot_index}"
             ))
         })?;
+        feature_counts[slot_index] = feature_count;
+    }
+
+    availability_from_feature_counts(source, subtree_root, &layout, &slots, &feature_counts)
+}
+
+fn availability_from_feature_counts(
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+    layout: &SubtreeLayout,
+    slots: &[SubtreeQuerySlot],
+    feature_counts: &[u64],
+) -> Result<SubtreeAvailabilityBits, TileQueryError> {
+    if feature_counts.len() != slots.len() {
+        return Err(ConfigError::Validation(format!(
+            "received {} feature counts for {} subtree slots",
+            feature_counts.len(),
+            slots.len()
+        ))
+        .into());
+    }
+    let mut availability = SubtreeAvailabilityBits {
+        tile: vec![false; layout.local_tiles.len()],
+        content: vec![false; layout.local_tiles.len()],
+        child_subtree: vec![false; layout.child_roots.len()],
+    };
+    for (slot, &feature_count) in slots.iter().zip(feature_counts) {
         let tile = slot.tile();
         let has_features = feature_count > 0;
         let overflow = feature_count > u64::from(source.max_features_per_tile);
-
         if overflow && tile.level == source.max_level {
             return Err(TileQueryError::TerminalFeatureLimitExceeded {
                 level: tile.level,
@@ -322,21 +472,156 @@ pub async fn query_subtree_availability(
         match *slot {
             SubtreeQuerySlot::Tile { index, .. } => {
                 availability.tile[index] = has_features;
-                availability.content[index] = has_features
-                    && !overflow
-                    && slot.tile().level >= source.tileset.content_start_level;
+                availability.content[index] =
+                    has_features && !overflow && tile.level >= source.tileset.content_start_level;
             }
             SubtreeQuerySlot::ChildSubtree { index, .. } => {
                 availability.child_subtree[index] = has_features;
             }
         }
     }
-
     if subtree_root == TileCoord::root() {
         availability.tile[0] = true;
     }
+    close_tile_availability_over_ancestors(subtree_root, layout, &mut availability);
 
     Ok(availability)
+}
+
+fn close_tile_availability_over_ancestors(
+    subtree_root: TileCoord,
+    layout: &SubtreeLayout,
+    availability: &mut SubtreeAvailabilityBits,
+) {
+    let local_indices = layout
+        .local_tiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tile)| tile.map(|tile| ((tile.level, tile.x, tile.y), index)))
+        .collect::<HashMap<_, _>>();
+    let mut occupied_descendants = layout
+        .local_tiles
+        .iter()
+        .zip(&availability.tile)
+        .filter_map(|(tile, &available)| available.then_some(*tile).flatten())
+        .collect::<Vec<_>>();
+    occupied_descendants.extend(
+        layout
+            .child_roots
+            .iter()
+            .zip(&availability.child_subtree)
+            .filter_map(|(tile, &available)| available.then_some(*tile).flatten()),
+    );
+
+    for mut tile in occupied_descendants {
+        loop {
+            if let Some(&index) = local_indices.get(&(tile.level, tile.x, tile.y)) {
+                availability.tile[index] = true;
+            }
+            if tile.level == subtree_root.level {
+                break;
+            }
+            tile = TileCoord {
+                level: tile.level - 1,
+                x: tile.x / 2,
+                y: tile.y / 2,
+            };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_surface_subtree_availability(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    subtree_root: TileCoord,
+    layout: &SubtreeLayout,
+    slots: &[SubtreeQuerySlot],
+    west: &[f64],
+    south: &[f64],
+    east: &[f64],
+    north: &[f64],
+) -> Result<SubtreeAvailabilityBits, TileQueryError> {
+    let plan = build_surface_subtree_candidates_query(source)?;
+    let started = Instant::now();
+    let rows = match plan.bindings {
+        QueryBindings::Standard => {
+            let params: [&(dyn ToSql + Sync); 5] = [&west, &south, &east, &north, &source.srid];
+            client.query_raw(&plan.sql, params).await
+        }
+        QueryBindings::Rdnaptrans2018Epsg1149 => {
+            let params: [&(dyn ToSql + Sync); 6] = [
+                &west,
+                &south,
+                &east,
+                &north,
+                &source.srid,
+                &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+            ];
+            client.query_raw(&plan.sql, params).await
+        }
+    }
+    .map_err(|source_error| plan.map_query_error(source, source_error))?;
+    tokio::pin!(rows);
+
+    let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+    let capped_count = u64::from(source.max_features_per_tile) + 1;
+    let mut feature_counts = vec![0_u64; slots.len()];
+    let mut candidate_feature_count = 0_usize;
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .map_err(|error| plan.map_query_error(source, error))?
+    {
+        candidate_feature_count += 1;
+        let feature_id = row.try_get::<_, String>(0)?;
+        let geometry_wkb = row.try_get::<_, Vec<u8>>(1)?;
+        let matched_slots = row.try_get::<_, Vec<i64>>(2)?;
+        let geometry = decode_surface_geometry_z_wkb(&geometry_wkb).map_err(|error| {
+            TileQueryError::SourceContract(format!(
+                "feature {feature_id} did not match the adapter's normalized geometry contract: {error}"
+            ))
+        })?;
+        let prepared = prepare_surface_geometry_z(&geometry, source_frame).map_err(|error| {
+            TileQueryError::SourceContract(format!(
+                "feature {feature_id} could not be prepared for subtree availability: {error}"
+            ))
+        })?;
+
+        for raw_slot_index in matched_slots {
+            let slot_index = usize::try_from(raw_slot_index).map_err(|_| {
+                ConfigError::Validation(
+                    "PostGIS returned a negative native-surface subtree slot".to_string(),
+                )
+            })?;
+            let slot = slots.get(slot_index).ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "PostGIS returned out-of-range native-surface subtree slot {slot_index}"
+                ))
+            })?;
+            if feature_counts[slot_index] >= capped_count {
+                continue;
+            }
+
+            let clip = surface_tile_clip(source, slot.tile())?;
+            let has_fragment = prepared.has_tile_content(clip).map_err(|error| {
+                TileQueryError::SourceContract(format!(
+                    "feature {feature_id} could not be clipped for subtree availability: {error}"
+                ))
+            })?;
+            if has_fragment {
+                feature_counts[slot_index] += 1;
+            }
+        }
+    }
+    tracing::debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        query_slot_count = slots.len(),
+        candidate_feature_count,
+        "PostGIS native-surface subtree candidates streamed"
+    );
+
+    availability_from_feature_counts(source, subtree_root, layout, slots, &feature_counts)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -351,6 +636,25 @@ impl SubtreeQuerySlot {
             Self::Tile { tile, .. } | Self::ChildSubtree { tile, .. } => tile,
         }
     }
+}
+
+pub(crate) fn surface_tile_clip(
+    source: &SourceConfig,
+    tile: TileCoord,
+) -> Result<SurfaceTileClip, ConfigError> {
+    let region = tile.geographic_region_degrees(&source.bounds)?;
+    let tile_count = 1_u32
+        .checked_shl(u32::from(tile.level))
+        .ok_or_else(|| ConfigError::Validation(format!("tile level {} is too deep", tile.level)))?;
+    let outer_index = tile_count - 1;
+    Ok(SurfaceTileClip {
+        west_deg: region.west,
+        south_deg: region.south,
+        east_deg: region.east,
+        north_deg: region.north,
+        include_east: tile.x == outer_index,
+        include_north: tile.y == outer_index,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1275,6 +1579,12 @@ struct SubtreeOccupancyQueryPlan {
     source_model: SourceModel,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SurfaceSubtreeCandidatesQueryPlan {
+    sql: String,
+    bindings: QueryBindings,
+}
+
 impl NormalizedGeometryQueryPlan {
     fn map_query_error(
         &self,
@@ -1292,6 +1602,21 @@ impl SubtreeOccupancyQueryPlan {
         source_error: tokio_postgres::Error,
     ) -> TileQueryError {
         map_plan_query_error(self.source_model, self.bindings, source, source_error)
+    }
+}
+
+impl SurfaceSubtreeCandidatesQueryPlan {
+    fn map_query_error(
+        &self,
+        source: &SourceConfig,
+        source_error: tokio_postgres::Error,
+    ) -> TileQueryError {
+        map_plan_query_error(
+            SourceModel::SurfaceGeometryZ,
+            self.bindings,
+            source,
+            source_error,
+        )
     }
 }
 
@@ -1379,7 +1704,7 @@ fn build_normalized_geometry_query(
                      CROSS JOIN LATERAL (SELECT {source_boundary} AS geom) AS source_boundary"
                 ),
                 predicate,
-                "$6",
+                Some("$6"),
                 QueryBindings::Standard,
             )
         }
@@ -1390,7 +1715,7 @@ fn build_normalized_geometry_query(
                 "ST_MakeEnvelope($1, $2, $3, $4, $5::integer) AS geom".to_string(),
                 String::new(),
                 format!("t.{geometry_column} && b.geom"),
-                "$6",
+                None,
                 QueryBindings::Standard,
             ),
             SurfaceTransform::Rdnaptrans2018Epsg1149 => (
@@ -1405,7 +1730,7 @@ fn build_normalized_geometry_query(
                 ),
                 String::new(),
                 format!("t.{geometry_column} && b.geom"),
-                "$7",
+                None,
                 QueryBindings::Rdnaptrans2018Epsg1149,
             ),
         },
@@ -1425,6 +1750,9 @@ fn build_normalized_geometry_query(
         attributes.push(attribute.clone());
     }
 
+    let order_and_limit = limit_parameter.map_or_else(String::new, |parameter| {
+        format!("ORDER BY t.{id_column} LIMIT {parameter}")
+    });
     let sql = format!(
         "WITH tile_bbox AS (SELECT {tile_bbox}) \
          SELECT {} \
@@ -1432,8 +1760,7 @@ fn build_normalized_geometry_query(
          CROSS JOIN tile_bbox AS b \
          {joins} \
          WHERE {predicate} \
-         ORDER BY t.{id_column} \
-         LIMIT {limit_parameter}",
+         {order_and_limit}",
         select_columns.join(", ")
     );
 
@@ -1448,43 +1775,20 @@ fn build_normalized_geometry_query(
 fn build_subtree_occupancy_query(
     source: &SourceConfig,
 ) -> Result<SubtreeOccupancyQueryPlan, ConfigError> {
+    if source.source_model != SourceModel::ExtrudedFootprint {
+        return Err(ConfigError::Validation(
+            "bbox-only subtree occupancy requires source_model = extruded_footprint".to_string(),
+        ));
+    }
     let schema = quote_identifier(&source.schema, "schema")?;
     let table = quote_identifier(&source.table, "table")?;
     let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
-    let (bbox_expression, joins, predicate, limit_parameter, bindings) = match source.source_model {
-        SourceModel::ExtrudedFootprint => {
-            let table_geometry = format!("t.{geometry_column}");
-            let clipped_geometry = clipped_geometry_expression(&table_geometry, "q.geom");
-            (
-                "ST_Transform(ST_MakeEnvelope(u.west, u.south, u.east, u.north, 4326), $5::integer)"
-                    .to_string(),
-                format!("CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped"),
-                positive_area_intersection_predicate(&table_geometry, "q.geom", "clipped.geom"),
-                "$6",
-                QueryBindings::Standard,
-            )
-        }
-        SourceModel::SurfaceGeometryZ => match surface_transform(source)? {
-            SurfaceTransform::Identity => (
-                "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
-                String::new(),
-                format!("t.{geometry_column} && q.geom"),
-                "$6",
-                QueryBindings::Standard,
-            ),
-            SurfaceTransform::Rdnaptrans2018Epsg1149 => (
-                format!(
-                    "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
-                     ST_Force3D(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.0), \
-                     $6, $5::integer)))"
-                ),
-                String::new(),
-                format!("t.{geometry_column} && q.geom"),
-                "$7",
-                QueryBindings::Rdnaptrans2018Epsg1149,
-            ),
-        },
-    };
+    let table_geometry = format!("t.{geometry_column}");
+    let clipped_geometry = clipped_geometry_expression(&table_geometry, "q.geom");
+    let bbox_expression =
+        "ST_Transform(ST_MakeEnvelope(u.west, u.south, u.east, u.north, 4326), $5::integer)";
+    let joins = format!("CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped");
+    let predicate = positive_area_intersection_predicate(&table_geometry, "q.geom", "clipped.geom");
 
     let sql = format!(
         "WITH requested_tiles AS ( \
@@ -1500,7 +1804,7 @@ fn build_subtree_occupancy_query(
              FROM {schema}.{table} AS t \
              {joins} \
              WHERE {predicate} \
-             LIMIT {limit_parameter} \
+             LIMIT $6 \
            ) AS capped \
          ) AS feature_count \
          FROM requested_tiles AS q \
@@ -1509,9 +1813,66 @@ fn build_subtree_occupancy_query(
 
     Ok(SubtreeOccupancyQueryPlan {
         sql,
-        bindings,
-        source_model: source.source_model,
+        bindings: QueryBindings::Standard,
+        source_model: SourceModel::ExtrudedFootprint,
     })
+}
+
+fn build_surface_subtree_candidates_query(
+    source: &SourceConfig,
+) -> Result<SurfaceSubtreeCandidatesQueryPlan, ConfigError> {
+    if source.source_model != SourceModel::SurfaceGeometryZ {
+        return Err(ConfigError::Validation(
+            "surface subtree candidates require source_model = surface_geometry_z".to_string(),
+        ));
+    }
+    let schema = quote_identifier(&source.schema, "schema")?;
+    let table = quote_identifier(&source.table, "table")?;
+    let id_column = quote_identifier(&source.id_column, "id_column")?;
+    let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
+    let (bbox_expression, geometry_wkb, bindings) = match surface_transform(source)? {
+        SurfaceTransform::Identity => (
+            "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
+            "ST_AsBinary(c.source_geom, 'NDR')".to_string(),
+            QueryBindings::Standard,
+        ),
+        SurfaceTransform::Rdnaptrans2018Epsg1149 => (
+            format!(
+                "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
+                 ST_Force3D(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.0), \
+                 $6, $5::integer)))"
+            ),
+            format!(
+                "ST_AsBinary(ST_TransformPipeline(c.source_geom, $6, {TARGET_GEODETIC_3D_SRID}), 'NDR')"
+            ),
+            QueryBindings::Rdnaptrans2018Epsg1149,
+        ),
+    };
+    let sql = format!(
+        "WITH requested_tiles AS ( \
+           SELECT (u.ordinality - 1)::bigint AS slot, \
+                  {bbox_expression} AS geom \
+           FROM unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[]) \
+                WITH ORDINALITY AS u(west, south, east, north, ordinality) \
+         ), requested_extent AS ( \
+           SELECT ST_SetSRID(ST_Extent(geom)::geometry, $5::integer) AS geom \
+           FROM requested_tiles \
+         ), candidate_features AS ( \
+           SELECT t.{id_column}::text AS id, t.{geometry_column} AS source_geom \
+           FROM {schema}.{table} AS t \
+           CROSS JOIN requested_extent AS e \
+           WHERE t.{geometry_column} && e.geom \
+         ) \
+         SELECT c.id, {geometry_wkb} AS geometry_wkb, matched.slots \
+         FROM candidate_features AS c \
+         CROSS JOIN LATERAL ( \
+           SELECT array_agg(q.slot) AS slots \
+           FROM requested_tiles AS q \
+           WHERE c.source_geom && q.geom \
+         ) AS matched \
+         WHERE matched.slots IS NOT NULL"
+    );
+    Ok(SurfaceSubtreeCandidatesQueryPlan { sql, bindings })
 }
 
 fn surface_transform(source: &SourceConfig) -> Result<SurfaceTransform, ConfigError> {
@@ -1653,7 +2014,7 @@ mod tests {
         source.base_height_column = None;
         source.height_column = None;
         source.geometry_types = vec![GeometryType::PolygonZ, GeometryType::MultiPolygonZ];
-        source.max_level = 0;
+        source.max_level = 2;
         source.attributes = vec!["name".to_string()];
         source.bounds.west = 5.86;
         source.bounds.south = 50.97;
@@ -1758,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_root_query_preserves_whole_features_and_uses_explicit_3d_transform() {
+    fn surface_query_preserves_whole_candidates_and_uses_explicit_3d_transform() {
         let source = surface_source();
         let plan = build_normalized_geometry_query(&source).expect("surface query should build");
 
@@ -1772,7 +2133,8 @@ mod tests {
                 .contains("ST_TransformPipeline(t.\"geom\", $6, 4979)")
         );
         assert!(plan.sql.contains("t.\"geom\" && b.geom"));
-        assert!(plan.sql.contains("LIMIT $7"));
+        assert!(!plan.sql.contains("LIMIT"));
+        assert!(!plan.sql.contains("ORDER BY"));
         assert!(!plan.sql.contains("ST_Intersection"));
         assert!(!plan.sql.contains("ST_Intersects"));
         assert!(!plan.sql.contains("ST_Area"));
@@ -1822,18 +2184,78 @@ mod tests {
     }
 
     #[test]
-    fn surface_root_subtree_query_uses_bbox_without_xy_overlay() {
+    fn bbox_only_subtree_query_rejects_native_surfaces() {
         let source = surface_source();
-        let plan =
-            build_subtree_occupancy_query(&source).expect("surface subtree query should build");
+        let error = build_subtree_occupancy_query(&source)
+            .expect_err("surface availability must use exact core clipping");
+        assert!(error.to_string().contains("extruded_footprint"));
+    }
+
+    #[test]
+    fn surface_subtree_candidates_transform_each_feature_for_exact_core_clipping() {
+        let source = surface_source();
+        let plan = build_surface_subtree_candidates_query(&source)
+            .expect("surface candidate query should build");
 
         assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
-        assert!(plan.sql.contains("ST_InverseTransformPipeline"));
-        assert!(plan.sql.contains("t.\"geom\" && q.geom"));
-        assert!(plan.sql.contains("LIMIT $7"));
+        assert!(plan.sql.contains("requested_extent AS"));
+        assert!(plan.sql.contains("ST_Extent(geom)"));
+        assert!(plan.sql.contains("t.\"geom\" && e.geom"));
+        assert!(plan.sql.contains("array_agg(q.slot)"));
+        assert!(!plan.sql.contains("MATERIALIZED"));
+        assert!(!plan.sql.contains("ORDER BY"));
+        assert!(
+            plan.sql
+                .contains("ST_TransformPipeline(c.source_geom, $6, 4979)")
+        );
         assert!(!plan.sql.contains("ST_Intersection"));
         assert!(!plan.sql.contains("ST_Area"));
-        assert!(!plan.sql.contains("ST_IsValid"));
+        assert!(!plan.sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn availability_closes_child_subtree_occupancy_over_local_ancestors() {
+        let mut source = fixture_source();
+        source.subtree_levels = 2;
+        source.max_level = 4;
+        let subtree_root = TileCoord::root();
+        let layout = subtree_layout(&source, subtree_root).expect("subtree layout");
+        let mut slots = Vec::new();
+        for (index, tile) in layout.local_tiles.iter().copied().enumerate() {
+            if let Some(tile) = tile {
+                slots.push(SubtreeQuerySlot::Tile { index, tile });
+            }
+        }
+        for (index, tile) in layout.child_roots.iter().copied().enumerate() {
+            if let Some(tile) = tile {
+                slots.push(SubtreeQuerySlot::ChildSubtree { index, tile });
+            }
+        }
+        let mut feature_counts = vec![0_u64; slots.len()];
+        let child_slot = slots
+            .iter()
+            .position(|slot| matches!(slot, SubtreeQuerySlot::ChildSubtree { index: 0, .. }))
+            .expect("southwest child subtree slot");
+        feature_counts[child_slot] = 1;
+
+        let availability = availability_from_feature_counts(
+            &source,
+            subtree_root,
+            &layout,
+            &slots,
+            &feature_counts,
+        )
+        .expect("availability should build");
+
+        assert!(availability.child_subtree[0]);
+        let southwest_parent = TileCoord::new(1, 0, 0).expect("southwest parent");
+        let parent_index = layout
+            .local_tiles
+            .iter()
+            .position(|tile| *tile == Some(southwest_parent))
+            .expect("parent availability index");
+        assert!(availability.tile[parent_index]);
+        assert!(!availability.content[parent_index]);
     }
 
     #[test]
@@ -1946,6 +2368,9 @@ mod tests {
             .expect("load fixture data");
 
         let mut source = fixture_source();
+        // This integration test exercises deep footprint clipping and child
+        // subtrees independently of the shallower demo catalog setting.
+        source.max_level = 16;
         let profile = validate_source(&client, "poc_buildings", &source)
             .await
             .expect("extruded fixture source should satisfy introspection");
@@ -2021,7 +2446,13 @@ mod tests {
                 .expect("sparse subtree should encode deterministically");
         assert_eq!(first, second);
 
-        let app = crate::server::build_app(fixture_catalog()).expect("fixture app should build");
+        let mut catalog = fixture_catalog();
+        catalog
+            .sources
+            .get_mut("poc_buildings")
+            .expect("fixture catalog source")
+            .max_level = 16;
+        let app = crate::server::build_app(catalog).expect("fixture app should build");
         let response = app
             .clone()
             .oneshot(
@@ -2431,7 +2862,7 @@ mod tests {
             .get("surface_buildings_7415")
             .cloned()
             .expect("surface source should be configured");
-        assert_eq!(source.max_level, 0, "native surfaces are root-owned");
+        assert_eq!(source.max_level, 2, "native surfaces should be tiled");
         let profile = validate_source(&client, "surface_buildings_7415", &source)
             .await
             .expect("surface fixture and RDNAP grids should satisfy introspection");
@@ -2462,27 +2893,56 @@ mod tests {
             assert!(!feature.attributes.contains_key("height_m"));
         }
 
-        let child_error = query_normalized_features(
+        query_normalized_features(
             &client,
             &source,
             TileCoord::new(1, 0, 0).expect("valid quadtree coordinate"),
         )
         .await
-        .expect_err("root-owned surface query must reject child levels");
-        assert!(matches!(child_error, TileQueryError::Config(_)));
+        .expect("surface child tile should accept whole-feature candidates");
+
+        let availability = query_subtree_availability(&client, &source, TileCoord::root())
+            .await
+            .expect("surface subtree availability should use exact core clipping");
+        let layout = subtree_layout(&source, TileCoord::root()).expect("surface subtree layout");
 
         let app = crate::server::build_app(catalog).expect("surface fixture app should build");
-        let below_root_contract = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/sources/surface_buildings_7415/content/1/0/0.glb")
-                    .body(Body::empty())
-                    .expect("surface child request should build"),
-            )
-            .await
-            .expect("surface child request should route");
-        assert_eq!(below_root_contract.status(), StatusCode::NOT_FOUND);
+        let mut occupied_children = 0;
+        let mut empty_children = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                let tile = TileCoord::new(2, x, y).expect("level-two surface tile");
+                let child = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/sources/surface_buildings_7415/content/2/{x}/{y}.glb"
+                            ))
+                            .body(Body::empty())
+                            .expect("surface child request should build"),
+                    )
+                    .await
+                    .expect("surface child request should route");
+                let availability_index = layout
+                    .local_tiles
+                    .iter()
+                    .position(|candidate| *candidate == Some(tile))
+                    .expect("level-two tile should have an availability slot");
+                assert_eq!(
+                    availability.content[availability_index],
+                    child.status() == StatusCode::OK,
+                    "content availability must match route status for {tile:?}"
+                );
+                match child.status() {
+                    StatusCode::OK => occupied_children += 1,
+                    StatusCode::NOT_FOUND => empty_children += 1,
+                    status => panic!("unexpected surface child status {status}"),
+                }
+            }
+        }
+        assert!(occupied_children > 0, "fixture should occupy child tiles");
+        assert!(empty_children > 0, "fixture should leave empty child tiles");
 
         let response = app
             .oneshot(

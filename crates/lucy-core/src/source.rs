@@ -162,12 +162,6 @@ impl SourceConfig {
             )));
         }
 
-        if self.source_model == SourceModel::SurfaceGeometryZ && self.max_level != 0 {
-            return Err(ConfigError::Validation(format!(
-                "{source_id}: surface_geometry_z currently requires max_level = 0 so every whole 3D feature is owned by the root tile without 2D clipping or cross-tile duplication"
-            )));
-        }
-
         if self.subtree_levels == 0 {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: subtree_levels must be greater than zero"
@@ -753,9 +747,9 @@ sources:
         assert!(error.to_string().contains("only valid for EPSG:7415"));
 
         let subdivided = valid.replace("max_level: 0", "max_level: 1");
-        let error = SourceCatalog::from_yaml_str(&subdivided)
-            .expect_err("whole native surfaces must not be duplicated into child tiles");
-        assert!(error.to_string().contains("requires max_level = 0"));
+        let catalog = SourceCatalog::from_yaml_str(&subdivided)
+            .expect("native surfaces should support subdivision into child tiles");
+        assert_eq!(catalog.sources["surfaces"].max_level, 1);
     }
 
     #[test]

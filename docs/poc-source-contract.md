@@ -125,13 +125,14 @@ Y-up convention as `[east_m, up_m, -north_m]`.
 
 ## Content Tile Query Semantics
 
-Content uses deterministic clipping rather than assigning a whole feature to
-one tile or repeating the whole feature in every intersecting tile. For every
-requested level, the configured bounds are partitioned into QUADTREE tile
-envelopes. PostGIS first uses the source geometry index to find intersections,
-then computes `ST_Intersection` with the tile envelope, extracts polygonal
-components, and discards empty or zero-area results. The resulting WKB is
-therefore contained by the tile's horizontal bounds.
+For extruded footprints, content uses deterministic clipping rather than
+assigning a whole feature to one tile or repeating the whole feature in every
+intersecting tile. For every requested level, the configured bounds are
+partitioned into QUADTREE tile envelopes. PostGIS first uses the source
+geometry index to find intersections, then computes `ST_Intersection` with the
+tile envelope, extracts polygonal components, and discards empty or zero-area
+results. The resulting WKB is therefore contained by the tile's horizontal
+bounds.
 
 The adapter also intersects `ST_Boundary` of the original source feature with
 the tile envelope and returns the extracted linear components as an XY
@@ -151,28 +152,58 @@ form the same outer shell as the uncut feature, without uncontrolled
 whole-feature duplication. Content availability uses the same positive-area
 intersection rule and does not need to compute boundary masks.
 
+Native `PolygonZ` and `MultiPolygonZ` sources deliberately do not use that XY
+overlay. PostGIS transforms each requested EPSG:4979 tile envelope back into
+the source CRS, applies the indexed bounding-box operator, and returns each
+candidate as a complete XYZ feature. Lucy validates and triangulates the
+complete faces in the source-wide ENU frame, clips the triangles against the
+tile's longitude/latitude rectangle, and emits the retained vertices in the
+tile-local ENU frame. Tile cuts introduce no caps or walls, and a candidate
+that leaves no positive three-dimensional triangle area is omitted.
+
+Crossing native triangles use closed clip planes so adjacent fragments share
+the same seam vertices. Faces lying wholly on a quadtree split use half-open
+ownership instead: west and south boundaries are included, internal east and
+north boundaries are excluded, and the outermost east and north source edges
+remain included. A vertical face on an internal split plane is therefore
+emitted exactly once. Native source geometry is never passed through
+`ST_Intersection`, `ST_CollectionExtract`, `ST_Area`, or another operation that
+could flatten a vertical face in XY.
+
 `max_features_per_tile` is an overflow threshold, not a truncation setting.
-Lucy asks PostGIS for at most one row beyond the threshold. If that extra row
-exists, the entire content request fails with the structured
+For footprints, Lucy asks PostGIS for at most one row beyond the threshold.
+For native surfaces, bbox matches are only candidates, so Lucy streams the
+matches, clips them, and applies the threshold only to features that emit a
+positive-area tile fragment. The stream stops as soon as the first fragment
+beyond the threshold proves overflow, so candidate WKB is not buffered without
+bound. An overflow fails with the structured
 `tile_overflow`/HTTP 409 response instead of returning an arbitrary prefix. A
-caller can request deeper tiles while the configured `max_level` permits it; an
-overflow at the deepest level requires changing the data or configuration.
+caller can request deeper tiles while the configured `max_level` permits it;
+an overflow at the deepest level requires changing the data or configuration.
 
 ## Sparse Subtree Availability
 
-Subtree availability is derived from the same positive-area clipping predicate
-as content. Lucy sends the bounding boxes for every valid local tile and child
-subtree root to PostGIS as arrays and receives all capped feature counts in one
-ordered query. With the default `subtree_levels: 4`, this covers 85 local tiles
-and 256 child roots in one database round trip instead of one query per tile.
+For footprints, subtree availability is derived from the same positive-area
+clipping predicate as content. For native surfaces, PostGIS returns each
+whole-feature candidate once together with the bbox-matched slot indices;
+Lucy then applies the same source-frame triangulation and triangle clip used by
+content before counting a slot. This prevents holes, disjoint MultiPolygons,
+and half-open split-plane ownership from advertising empty content. Lucy sends
+the bounding boxes for every valid local tile and child subtree root to
+PostGIS as arrays. With the default `subtree_levels: 4`, this covers 85 local
+tiles and 256 child roots in one database round trip instead of one query per
+tile.
 
 An occupied tile is tile-available. It is content-available only when its count
 does not exceed `max_features_per_tile`; an overflowing non-leaf remains
-tile-available so traversal can continue into descendants. Overflow at
-`max_level` is a terminal `tile_overflow` error because it cannot be resolved by
-subdivision. Child subtree bits are set only for occupied child roots at or
-below `max_level`. Empty regions remain zero, while the global implicit root
-tile remains available even for an empty source.
+tile-available so traversal can continue into descendants. Tile availability
+is closed over ancestors: an occupied local tile or child-subtree root marks
+its local ancestor chain tile-available without inventing ancestor content.
+Overflow at `max_level` is a terminal `tile_overflow` error because it cannot be
+resolved by subdivision. Child subtree bits are set only for occupied child
+roots at or below `max_level`. Branches with no occupied descendant remain
+zero, while the global implicit root tile remains available even for an empty
+source.
 
 Availability arrays always retain the fixed size required by the configured
 `subtree_levels`. Final partial subtrees clear bits beyond `max_level` rather
@@ -309,9 +340,9 @@ unless explicitly listed as a retained Phase 0 constraint.
 | Source id map key | Selected from the loaded `SourceCatalog`; source-scoped routes use `/sources/{source_id}/...`, and legacy routes use explicit `default_source` (falling back deterministically only when it is omitted). |
 | `connection` | Resolved by `lucy-server` content routes. Literal connection strings are used as-is; the POC `${DATABASE_URL}` placeholder is resolved from the process environment. |
 | `schema`, `table` | Quoted after identifier validation and used to build the PostGIS tile query target. |
-| `geometry_column` | Quoted after identifier validation and used for bbox filtering, intersection tests, and `ST_AsBinary(..., 'NDR')`. |
+| `geometry_column` | Quoted after identifier validation and used for indexed bbox filtering and `ST_AsBinary(..., 'NDR')`; footprints additionally use it for XY intersection, while native surfaces are returned whole for core triangle clipping. |
 | `id_column` | Quoted after identifier validation, selected as the feature id, and used for stable ordering. |
-| `srid` | Declares and validates the PostGIS source geometry SRID. Tile envelopes are transformed into it; normalized footprint output is transformed back to EPSG:4326. |
+| `srid` | Declares and validates the PostGIS source geometry SRID. Tile envelopes are transformed into it; footprint output is normalized to EPSG:4326 and native XYZ output to EPSG:4979. |
 | `source_model` | Selects the adapter normalization and mesh strategy. `extruded_footprint` produces standard EPSG:4326 XY; `surface_geometry_z` produces standard EPSG:4979 XYZ. |
 | `coordinate_operation` | Optional only for native 3D surfaces. It selects an explicit supported source-to-EPSG:4979 pipeline; it is omitted for already-normalized EPSG:4979 and for footprints. |
 | `base_height_column` | If present, automatically selected by the PostGIS tile query and used as the extrusion base. Missing or NULL values default to `0.0`. |
@@ -319,9 +350,9 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
 | `bounds` | Drives the root region, tile bbox mapping, source ENU/root transform origin, per-request tile-local ENU frames, and vertical bounding interval. |
 | `min_level` | Validated as the retained implicit-root constraint `0`; tile-addressed routes reject requests below the configured bound before database work. |
-| `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, final-partial clipping, terminal overflow detection, and child-subtree availability. |
+| `max_level` | Limited to `31` for `u32` coordinates; drives implicit tileset `availableLevels`, route bounds, footprint or native-triangle clipping depth, terminal overflow detection, and child-subtree availability. |
 | `subtree_levels` | Drives implicit tileset `subtreeLevels`, fixed Morton bitstream sizes, and batched local/child-root availability queries. |
-| `max_features_per_tile` | Enforced as an overflow threshold by querying for one extra row; capped at `2^24` so FLOAT picking IDs remain exact, and overflow returns `tile_overflow` instead of silently truncating content. |
+| `max_features_per_tile` | Enforced as an overflow threshold on exact footprint rows or emitted native-surface fragments; capped at `2^24` so FLOAT picking IDs remain exact, and overflow returns `tile_overflow` instead of silently truncating content. |
 | `tileset.root_geometric_error_m` | Drives both emitted root error values and the implicit `root / 2^level` LOD sequence; defaults to `512.0`. |
 | `tileset.content_uri_template` | Emitted as the implicit content URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in content route. |
 | `tileset.subtree_uri_template` | Emitted as the subtree URI after validating `{level}`, `{x}`, and `{y}`; defaults to Lucy's built-in subtree route. |
@@ -399,7 +430,9 @@ just verify-rdnap-grids
 just fixture-server
 ```
 
-Surface features are root-owned (`max_level: 0`) and selected whole by a
-source-CRS bounding-box filter. They are not duplicated into child tiles and
-are not passed through the footprint `ST_Intersection` or positive
-two-dimensional area filter.
+The deterministic catalog sets this surface source to `max_level: 2`. PostGIS
+selects whole candidate features with a source-CRS bounding-box filter at every
+requested level; it does not pass them through the footprint
+`ST_Intersection` or positive two-dimensional area filter. Lucy then clips the
+triangulated XYZ faces to each tile, including vertical walls, and applies the
+half-open east/north ownership rule at internal split planes.

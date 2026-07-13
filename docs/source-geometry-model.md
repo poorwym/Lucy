@@ -39,7 +39,7 @@ surface_buildings_7415:
     - PolygonZ
     - MultiPolygonZ
   min_level: 0
-  max_level: 0
+  max_level: 2
 ```
 
 The fixture in `fixtures/postgis/surface_buildings_7415.sql` contains one
@@ -192,31 +192,46 @@ Footprints retain positive-area tile clipping. Their top and bottom caps use
 the clipped polygon, while side walls use only the intersection of the
 original feature boundary and the tile. A deep tile wholly inside a large
 feature therefore has caps but no side walls; neighboring fragments together
-reconstruct the feature without visible internal partitions. Native surfaces
-do not use two-dimensional clipping.
+reconstruct the feature without visible internal partitions.
 
-Native surfaces currently use one explicit ownership rule: every complete
-feature belongs to the root tile, and a `surface_geometry_z` source must set
-`min_level: 0`, `max_level: 0`, and `tileset.content_start_level: 0` (the
-default). PostGIS transforms the root EPSG:4979 envelope back into the source
-CRS, applies the indexed bounding-box filter, and returns each matching row as
-one complete feature.
+Native surfaces use a different two-stage policy. PostGIS transforms the
+requested EPSG:4979 tile envelope back into the source CRS, applies the indexed
+bounding-box operator, and streams uncapped matching rows as complete XYZ
+candidates. This is deliberately only a broad phase: native surfaces are never
+passed through `ST_Intersection`, `ST_CollectionExtract`, `ST_Area`, or another
+XY overlay operation. Such operations would collapse or discard legitimate
+vertical `PolygonZ` faces.
 
-This single-tile boundary is deliberate. Applying `ST_Intersection`,
-`ST_CollectionExtract`, or `ST_Area` in XY would silently remove vertical
-faces. Copying a whole building into intersecting child tiles would violate
-their bounding regions and grow combinatorially. Config validation therefore
-rejects subdivided native-surface sources until Lucy has a 3D-safe ownership or
-clipping design. Feature limits count whole root-owned rows; overflow fails
-with `tile_overflow` instead of truncating content.
+Lucy validates and triangulates each complete face in the stable source-wide
+ENU frame, then clips the resulting triangles against the requested tile's
+longitude/latitude rectangle. New edge vertices compute an edge parameter from
+the geographic clip plane and apply that same parameter to the source-frame
+triangle positions before transforming into tile-local ENU. Clipping neither
+re-extrudes the input nor creates caps or walls along tile cuts. A surface that
+crosses a quadtree boundary therefore contributes bounded fragments with the
+same feature id, attributes, material, winding, and face normal to each
+intersected tile. Candidates that leave no positive three-dimensional triangle
+area after clipping are omitted from that tile.
+
+Crossing triangles treat all four clip planes as closed, giving neighboring
+tiles identical seam positions. A positive-area face lying wholly on a split
+plane instead follows half-open ownership: west and south boundaries are
+included, while an internal east or north boundary is excluded. The outermost
+east and north tiles include the source boundary. This assigns a vertical wall
+on an internal split plane to exactly one tile without dropping walls on the
+edge of the configured source. Feature limits still fail with `tile_overflow`
+instead of returning truncated content.
 
 ## Transform and Axis Ownership
 
 There is exactly one ECEF placement transform: the 3D Tiles root transform
 places the source-wide ENU frame into ECEF. Each content request constructs a
 second, tile-local ENU frame at that tile's horizontal centre and minimum
-height. Geometry is projected into this tile frame before the final `f64` to
-`f32` cast, keeping deep-tile buffer coordinates close to zero.
+height. Native faces are triangulated in the source frame. Geodetic clip planes
+supply the edge parameter used to interpolate each source-ENU triangle edge,
+and the resulting positions and normals are transformed into the tile frame
+before the final `f64` to `f32` cast. Coordinates therefore remain local even
+for deep tiles.
 
 The GLB node contains only the relative tile-frame-to-source-frame transform;
 it never contains ECEF translation. Let `T_source` and `T_tile` map their ENU

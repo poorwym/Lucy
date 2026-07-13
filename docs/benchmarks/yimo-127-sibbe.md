@@ -31,7 +31,9 @@ download URL.
 
 Both tools must consume the same PostGIS relation and attributes. Pin and
 record the pg2b3dm release or container digest, Lucy commit, PostGIS/PROJ
-versions, grid checksums, operating system, CPU, and memory.
+versions, grid checksums, operating system, CPU, and memory. Also record Lucy's
+configured bounds, `max_level`, and requested tile coordinates so triangle and
+output-file counts can be interpreted against its tiling policy.
 
 For Lucy, define a cold request as the first content request after starting a
 fresh Lucy process while PostGIS is already healthy. This is a process-cold
@@ -76,8 +78,11 @@ explanation.
 The pg2b3dm Sibbe getting-started guide uses a 3DBAG GeoPackage, imports a 3D
 layer into PostGIS, checks its EPSG:7415 conversion, and then generates 3D
 Tiles. Lucy's comparison must additionally record its explicit
-RDNAPTRANS2018 + EPSG:1149 1m approximation contract and current root-only
-surface ownership. Keep the exact commands used for the comparison beside the
-completed result table:
+RDNAPTRANS2018 + EPSG:1149 1m approximation contract and native-surface tiling
+policy. PostGIS performs only a whole-feature source-CRS bounding-box broad
+phase; Lucy triangulates complete XYZ faces and clips their triangles per tile,
+using half-open east/north ownership for faces on internal split planes. It
+does not apply a two-dimensional PostGIS overlay to vertical faces. Keep the
+exact commands used for the comparison beside the completed result table:
 
 <https://geodan.github.io/pg2b3dm/getting_started.html>

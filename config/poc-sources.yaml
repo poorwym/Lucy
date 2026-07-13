@@ -59,11 +59,11 @@ sources:
       min_height_m: 0.0
       max_height_m: 50000
     min_level: 0
-    max_level: 16
+    max_level: 7
     subtree_levels: 4
-    max_features_per_tile: 1000
+    max_features_per_tile: 5000
     tileset:
-      content_start_level: 12
+      content_start_level: 6
       # root_geometric_error_m: 512.0
       root_geometric_error_m: 20000000.0
       content_uri_template: "content/{level}/{x}/{y}.glb"

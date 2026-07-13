@@ -9,12 +9,18 @@ use tracing::{debug, error};
 
 use lucy_core::geometry::NormalizedGeometry;
 use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
-use lucy_core::mesh::{MeshFrame, footprint_fragment_to_extruded_mesh, surface_geometry_z_to_mesh};
-use lucy_core::source::{ConfigError, DEFAULT_BASE_HEIGHT_M, SourceConfig};
+use lucy_core::mesh::{
+    MeshFrame, SurfaceTileClip, TriangleMesh, footprint_fragment_to_extruded_mesh,
+    surface_geometry_z_to_tile_mesh,
+};
+use lucy_core::source::{ConfigError, DEFAULT_BASE_HEIGHT_M, SourceConfig, SourceModel};
 use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
-use crate::postgis::{NormalizedFeature, TileQueryError, query_normalized_features};
+use crate::postgis::{
+    NormalizedFeature, TileQueryError, for_each_normalized_surface_feature,
+    query_normalized_features, surface_tile_clip,
+};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
@@ -70,75 +76,87 @@ async fn content_tile_response(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "PostGIS connection established"
     );
-    tokio::spawn(async move {
+    let connection_handle = tokio::spawn(async move {
         if let Err(error) = connection_task.await {
             error!(error = %error, "PostGIS connection task failed");
         }
     });
 
+    let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+    let (frame, node_transform) = content_mesh_placement(source, tile)?;
+    let surface_clip = surface_tile_clip(source, tile)?;
     let started = Instant::now();
-    let features = query_normalized_features(&client, source, tile).await?;
-    let wkb_bytes = features
-        .iter()
-        .map(|feature| feature.encoded_size_bytes)
-        .sum::<usize>();
+    let mut candidate_count = 0_usize;
+    let mut wkb_bytes = 0_usize;
+    let mut pending_features = Vec::new();
+    match source.source_model {
+        SourceModel::ExtrudedFootprint => {
+            let features = query_normalized_features(&client, source, tile).await?;
+            candidate_count = features.len();
+            wkb_bytes = features
+                .iter()
+                .map(|feature| feature.encoded_size_bytes)
+                .sum();
+            pending_features.reserve(features.len());
+            for feature in features {
+                append_pending_content_feature(
+                    &mut pending_features,
+                    source_id,
+                    source,
+                    feature,
+                    source_frame,
+                    frame,
+                    surface_clip,
+                )?;
+            }
+        }
+        SourceModel::SurfaceGeometryZ => {
+            let stream_result =
+                for_each_normalized_surface_feature(&client, source, tile, |feature| {
+                    candidate_count += 1;
+                    wkb_bytes += feature.encoded_size_bytes;
+                    append_pending_content_feature(
+                        &mut pending_features,
+                        source_id,
+                        source,
+                        feature,
+                        source_frame,
+                        frame,
+                        surface_clip,
+                    )
+                })
+                .await;
+            if let Err(error) = stream_result {
+                // This connection is request-scoped. Dropping its driver
+                // closes the socket so an overflow/source-contract early exit
+                // does not leave PostgreSQL draining the uncapped query.
+                connection_handle.abort();
+                return Err(error);
+            }
+        }
+    }
     debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        feature_count = features.len(),
+        feature_count = candidate_count,
         wkb_bytes,
-        "tile geometry queried"
+        "tile geometry streamed and meshed"
     );
-    if features.is_empty() {
+    if candidate_count == 0 {
         return Err(RouteError::not_found(format!(
             "tile level={} x={} y={} has no features",
             tile.level, tile.x, tile.y
         )));
     }
-
-    let (frame, node_transform) = content_mesh_placement(source, tile)?;
-    let mut content_features = Vec::with_capacity(features.len());
-    let started = Instant::now();
-    for feature in features {
-        let double_sided = matches!(&feature.geometry, NormalizedGeometry::GeodeticSurface(_));
-        let mesh = match &feature.geometry {
-            NormalizedGeometry::GeographicFootprint(fragment) => {
-                let (base_height_m, height_m) = feature_heights(source, &feature)?;
-                footprint_fragment_to_extruded_mesh(
-                    fragment,
-                    frame,
-                    f64::from(base_height_m),
-                    f64::from(height_m),
-                )
-            }
-            NormalizedGeometry::GeodeticSurface(geometry) => {
-                surface_geometry_z_to_mesh(geometry, frame)
-            }
-        }
-        .map_err(|error| {
-            RouteError::from(TileQueryError::SourceContract(format!(
-                "source {source_id} feature {} could not be converted to a mesh: {error}",
-                feature.id
-            )))
-        })?;
-        let base_color = feature_base_color(source, &feature)?;
-        let properties = source
-            .attributes
-            .iter()
-            .map(|attribute| {
-                (
-                    attribute.clone(),
-                    feature.attributes.get(attribute).cloned().unwrap_or(None),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        content_features.push(ContentFeature {
-            id: feature.id,
-            mesh,
-            base_color,
-            double_sided,
-            properties,
-        });
+    if pending_features.is_empty() {
+        return Err(RouteError::not_found(format!(
+            "tile level={} x={} y={} has no surface fragments after clipping",
+            tile.level, tile.x, tile.y
+        )));
     }
+    if source.source_model == SourceModel::SurfaceGeometryZ {
+        pending_features.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    let content_features = finalize_content_features(source, pending_features)?;
     let vertex_count = content_features
         .iter()
         .map(|feature| feature.mesh.vertices.len())
@@ -165,6 +183,118 @@ async fn content_tile_response(
     Ok(bytes_response(StatusCode::OK, "model/gltf-binary", glb))
 }
 
+struct PendingContentFeature {
+    id: String,
+    attributes: BTreeMap<String, Option<String>>,
+    mesh: TriangleMesh,
+    double_sided: bool,
+}
+
+#[cfg(test)]
+fn build_content_features(
+    source_id: &str,
+    source: &SourceConfig,
+    features: Vec<NormalizedFeature>,
+    source_frame: MeshFrame,
+    tile_frame: MeshFrame,
+    surface_clip: SurfaceTileClip,
+) -> Result<Vec<ContentFeature>, RouteError> {
+    let mut pending_features = Vec::with_capacity(features.len());
+    for feature in features {
+        append_pending_content_feature(
+            &mut pending_features,
+            source_id,
+            source,
+            feature,
+            source_frame,
+            tile_frame,
+            surface_clip,
+        )?;
+    }
+    finalize_content_features(source, pending_features)
+}
+
+fn append_pending_content_feature(
+    pending_features: &mut Vec<PendingContentFeature>,
+    source_id: &str,
+    source: &SourceConfig,
+    feature: NormalizedFeature,
+    source_frame: MeshFrame,
+    tile_frame: MeshFrame,
+    surface_clip: SurfaceTileClip,
+) -> Result<(), RouteError> {
+    let double_sided = matches!(&feature.geometry, NormalizedGeometry::GeodeticSurface(_));
+    let mesh = match &feature.geometry {
+        NormalizedGeometry::GeographicFootprint(fragment) => {
+            let (base_height_m, height_m) = feature_heights(source, &feature)?;
+            footprint_fragment_to_extruded_mesh(
+                fragment,
+                tile_frame,
+                f64::from(base_height_m),
+                f64::from(height_m),
+            )
+            .map(Some)
+        }
+        NormalizedGeometry::GeodeticSurface(geometry) => {
+            surface_geometry_z_to_tile_mesh(geometry, source_frame, tile_frame, surface_clip)
+        }
+    }
+    .map_err(|error| {
+        RouteError::from(TileQueryError::SourceContract(format!(
+            "source {source_id} feature {} could not be converted to a mesh: {error}",
+            feature.id
+        )))
+    })?;
+    let Some(mesh) = mesh else {
+        debug!(
+            feature.id,
+            "broad-phase surface candidate missed tile after clipping"
+        );
+        return Ok(());
+    };
+    if pending_features.len() >= source.max_features_per_tile as usize {
+        return Err(TileQueryError::FeatureLimitExceeded {
+            max_features_per_tile: source.max_features_per_tile,
+        }
+        .into());
+    }
+    pending_features.push(PendingContentFeature {
+        id: feature.id,
+        attributes: feature.attributes,
+        mesh,
+        double_sided,
+    });
+    Ok(())
+}
+
+fn finalize_content_features(
+    source: &SourceConfig,
+    pending_features: Vec<PendingContentFeature>,
+) -> Result<Vec<ContentFeature>, RouteError> {
+    let mut content_features = Vec::with_capacity(pending_features.len());
+    for pending in pending_features {
+        let base_color = feature_base_color(source, &pending.id, &pending.attributes)?;
+        let properties = source
+            .attributes
+            .iter()
+            .map(|attribute| {
+                (
+                    attribute.clone(),
+                    pending.attributes.get(attribute).cloned().unwrap_or(None),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        content_features.push(ContentFeature {
+            id: pending.id,
+            mesh: pending.mesh,
+            base_color,
+            double_sided: pending.double_sided,
+            properties,
+        });
+    }
+    Ok(content_features)
+}
+
 fn content_mesh_placement(
     source: &SourceConfig,
     tile: TileCoord,
@@ -178,23 +308,20 @@ fn content_mesh_placement(
 
 fn feature_base_color(
     source: &SourceConfig,
-    feature: &NormalizedFeature,
+    feature_id: &str,
+    attributes: &BTreeMap<String, Option<String>>,
 ) -> Result<[f32; 4], RouteError> {
     let Some(color_column) = source.material.color_column.as_deref() else {
         return Ok(source.material.default_base_color);
     };
-    let Some(value) = feature
-        .attributes
-        .get(color_column)
-        .and_then(Option::as_deref)
-    else {
+    let Some(value) = attributes.get(color_column).and_then(Option::as_deref) else {
         return Ok(source.material.default_base_color);
     };
 
     parse_hex_color(value).map_err(|message| {
         RouteError::config(format!(
             "feature {} material color {color_column}={value:?} is invalid: {message}",
-            feature.id
+            feature_id
         ))
     })
 }
@@ -280,10 +407,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use lucy_core::geometry::{
-        FootprintFragment, FootprintGeometry, MultiLineString2D, Point2D, Polygon2D, Ring2D,
+        FootprintFragment, FootprintGeometry, MultiLineString2D, Point2D, Point3D, Polygon2D,
+        Polygon3D, Ring2D, Ring3D, SurfaceGeometryZ,
     };
     use lucy_core::mesh::footprint_to_extruded_mesh;
-    use lucy_core::source::SourceCatalog;
+    use lucy_core::source::{SourceCatalog, SourceModel};
 
     use super::*;
 
@@ -302,6 +430,31 @@ mod tests {
             geometry: FootprintGeometry::MultiPolygon(Vec::new()),
             source_boundary: MultiLineString2D { lines: Vec::new() },
         })
+    }
+
+    fn surface_polygon(west: f64, south: f64, size: f64) -> Polygon3D {
+        let point = |x, y| Point3D { x, y, z: 20.0 };
+        Polygon3D {
+            exterior: Ring3D {
+                points: vec![
+                    point(west, south),
+                    point(west + size, south),
+                    point(west + size, south + size),
+                    point(west, south + size),
+                    point(west, south),
+                ],
+            },
+            interiors: Vec::new(),
+        }
+    }
+
+    fn surface_feature(id: &str, geometry: SurfaceGeometryZ, color: &str) -> NormalizedFeature {
+        NormalizedFeature {
+            id: id.to_string(),
+            geometry: NormalizedGeometry::GeodeticSurface(geometry),
+            encoded_size_bytes: 0,
+            attributes: BTreeMap::from([("color".to_string(), Some(color.to_string()))]),
+        }
     }
 
     #[test]
@@ -355,7 +508,8 @@ mod tests {
             attributes: BTreeMap::from([("color".to_string(), Some("#80402080".to_string()))]),
         };
 
-        let color = feature_base_color(&source, &feature).expect("color should parse");
+        let color = feature_base_color(&source, &feature.id, &feature.attributes)
+            .expect("color should parse");
         assert_eq!(
             color,
             [128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0, 128.0 / 255.0]
@@ -373,7 +527,8 @@ mod tests {
         };
 
         assert_eq!(
-            feature_base_color(&source, &feature).expect("default should apply"),
+            feature_base_color(&source, &feature.id, &feature.attributes)
+                .expect("default should apply"),
             source.material.default_base_color
         );
     }
@@ -388,11 +543,109 @@ mod tests {
             attributes: BTreeMap::from([("color".to_string(), Some("orange".to_string()))]),
         };
 
-        assert!(feature_base_color(&source, &feature).is_err());
+        assert!(feature_base_color(&source, &feature.id, &feature.attributes).is_err());
         assert_eq!(
             parse_hex_color("orange"),
             Err("expected #RRGGBB or #RRGGBBAA")
         );
+    }
+
+    #[test]
+    fn surface_content_filters_broad_phase_misses_before_metadata_and_limits() {
+        let mut source = fixture_source();
+        source.source_model = SourceModel::SurfaceGeometryZ;
+        source.base_height_column = None;
+        source.height_column = None;
+        source.bounds.west = 5.0;
+        source.bounds.south = 50.0;
+        source.bounds.east = 5.01;
+        source.bounds.north = 50.01;
+        source.bounds.min_height_m = 0.0;
+        source.bounds.max_height_m = 100.0;
+        source.max_features_per_tile = 1;
+        let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+        let tile_frame = MeshFrame::from_geodetic_origin(5.005, 50.005, 0.0);
+        let clip = SurfaceTileClip {
+            west_deg: 5.004,
+            south_deg: 50.004,
+            east_deg: 5.006,
+            north_deg: 50.006,
+            include_east: false,
+            include_north: false,
+        };
+        let broad_phase_miss = surface_feature(
+            "miss",
+            SurfaceGeometryZ::MultiPolygon(vec![
+                surface_polygon(5.001, 50.001, 0.001),
+                surface_polygon(5.008, 50.008, 0.001),
+            ]),
+            "invalid-color-that-must-not-be-read",
+        );
+        let hit = surface_feature(
+            "hit",
+            SurfaceGeometryZ::Polygon(surface_polygon(5.0045, 50.0045, 0.001)),
+            "#8aa1b1",
+        );
+
+        let features = build_content_features(
+            "surfaces",
+            &source,
+            vec![broad_phase_miss, hit.clone()],
+            source_frame,
+            tile_frame,
+            clip,
+        )
+        .expect("only the emitted surface should count");
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].id, "hit");
+
+        let overflow = surface_feature(
+            "overflow",
+            SurfaceGeometryZ::Polygon(surface_polygon(5.0046, 50.0046, 0.001)),
+            "invalid-color-that-must-not-mask-overflow",
+        );
+        let error = build_content_features(
+            "surfaces",
+            &source,
+            vec![hit.clone(), overflow.clone()],
+            source_frame,
+            tile_frame,
+            clip,
+        )
+        .expect_err("two emitted surfaces should exceed the configured limit");
+        assert!(format!("{error:?}").contains("tile contains more than 1 features"));
+
+        let error = build_content_features(
+            "surfaces",
+            &source,
+            vec![overflow, hit],
+            source_frame,
+            tile_frame,
+            clip,
+        )
+        .expect_err("overflow must win even when invalid metadata arrives first");
+        assert!(format!("{error:?}").contains("tile contains more than 1 features"));
+    }
+
+    #[test]
+    fn surface_tile_clip_uses_half_open_internal_boundaries() {
+        let mut source = fixture_source();
+        source.bounds.west = 5.0;
+        source.bounds.south = 50.0;
+        source.bounds.east = 5.01;
+        source.bounds.north = 50.01;
+
+        let southwest =
+            surface_tile_clip(&source, TileCoord::new(1, 0, 0).expect("southwest tile"))
+                .expect("southwest clip");
+        assert!(!southwest.include_east);
+        assert!(!southwest.include_north);
+
+        let northeast =
+            surface_tile_clip(&source, TileCoord::new(1, 1, 1).expect("northeast tile"))
+                .expect("northeast clip");
+        assert!(northeast.include_east);
+        assert!(northeast.include_north);
     }
 
     #[test]

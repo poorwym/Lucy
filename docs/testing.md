@@ -49,9 +49,12 @@ should use an isolated ephemeral `lucy_test` database.
 The fixture server uses `config/fixture-sources.yaml`, which deliberately
 excludes externally managed sources such as `controlled_airspace`. This keeps
 a clean checkout runnable after loading only the committed SQL fixtures.
-The native-surface fixture is root-owned (`max_level: 0`), so every complete
-PolygonZ face stays inside the one advertised bounding region without XY
-clipping or cross-tile duplication.
+The native-surface fixture uses `max_level: 2`. PostGIS returns complete
+PolygonZ/MultiPolygonZ candidates from a source-CRS bounding-box broad phase;
+it never applies the footprint XY overlay. Core tests triangulate those
+complete faces before clipping them to tile rectangles, verify that vertical
+walls survive, and exercise half-open east/north ownership for faces on
+internal split planes.
 
 The coordinate sentinel uses tight tolerances to detect changes in the pinned
 grids and pipeline. End-to-end WGS 84 datum accuracy remains the separate 1m
@@ -65,8 +68,12 @@ structural metadata, and the relative GLB node matrix. Coordinate tests verify
 the complete source-root / runtime-axis / relative-node / tile-ENU chain
 against direct tile-ENU-to-ECEF placement, require identity at the root, and
 exercise local footprint precision and normals near longitude 0, 90, and 180
-degrees. The YIMO-127 acceptance target additionally calls for the official
-Khronos glTF Validator against a GLB fetched from the surface content route.
+degrees. Native-surface tests additionally cover shared seam agreement between
+adjacent tiles, area and normal preservation, vertical faces, half-open split
+ownership, holes, disjoint multipolygon gaps, and contact without positive
+area. The YIMO-127 acceptance target additionally calls for the
+official Khronos glTF Validator against a GLB fetched from the surface content
+route.
 
 That external validator command is not yet wired into this repository. Until a
 pinned `gltf-validator` dependency and script are added, do not describe the
@@ -114,4 +121,7 @@ curl --fail --output /tmp/surface-buildings-0-0-0.glb \
 ```
 
 This only confirms that content was served. It does not replace the official
-validator or Cesium smoke test.
+validator or Cesium smoke test. To inspect subdivision, first read the root
+subtree availability and request occupied level-1 or level-2 content routes;
+an occupied child must return tile-bounded geometry rather than a copy of the
+whole source feature.

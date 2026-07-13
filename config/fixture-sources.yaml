@@ -23,7 +23,7 @@ sources:
       min_height_m: 0.0
       max_height_m: 100.0
     min_level: 0
-    max_level: 16
+    max_level: 2
     subtree_levels: 4
     max_features_per_tile: 1000
     tileset:
@@ -60,9 +60,8 @@ sources:
       min_height_m: 170.0
       max_height_m: 201.0
     min_level: 0
-    # Whole PolygonZ faces are root-owned until a 3D-safe subdivision policy
-    # can preserve both tile containment and vertical surfaces.
-    max_level: 0
+    # Native XYZ faces are clipped in a stable source frame for each tile.
+    max_level: 2
     subtree_levels: 4
     max_features_per_tile: 100
     tileset:
