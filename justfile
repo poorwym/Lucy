@@ -3,7 +3,7 @@ set dotenv-load := true
 compose := "docker compose"
 db_user := env("POSTGRES_USER", "lucy")
 db_name := env("POSTGRES_DB", "lucy")
-poc_database_url := env("DATABASE_URL", "postgres://lucy:lucy@localhost:5432/lucy")
+database_url := env("DATABASE_URL", "postgres://lucy:lucy@localhost:5432/lucy")
 poc_addr := env("POC_ADDR", "127.0.0.1:8080")
 rdnap_pipeline := "+proj=pipeline +step +inv +proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel +step +proj=hgridshift +grids=nl_nsgi_rdtrans2018.tif +step +proj=vgridshift +grids=nl_nsgi_nlgeo2018.tif +multiplier=1 +step +proj=cart +ellps=GRS80 +step +proj=helmert +x=0 +y=0 +z=0 +step +inv +proj=cart +ellps=WGS84 +step +proj=unitconvert +xy_in=rad +xy_out=deg"
 
@@ -59,15 +59,15 @@ verify-surface-fixture:
 
 # Run server tests against PostGIS without silent database-test skips.
 test-postgis: load-fixtures verify-rdnap-grids verify-surface-fixture
-    DATABASE_URL={{ poc_database_url }} cargo test -p lucy-server -- --include-ignored --nocapture
+    DATABASE_URL={{ database_url }} cargo test -p lucy-server -- --include-ignored --nocapture
 
 # Run the Phase 0 POC HTTP server.
 poc-server config="config/poc-sources.yaml" addr=poc_addr:
-    DATABASE_URL={{ poc_database_url }} cargo run -p lucy-poc -- serve {{ config }} {{ addr }}
+    DATABASE_URL={{ database_url }} cargo run -p lucy-poc -- serve {{ config }} {{ addr }}
 
 # Run only the deterministic fixture catalog (poc_buildings is the default).
 fixture-server config="config/fixture-sources.yaml" addr=poc_addr:
-    DATABASE_URL={{ poc_database_url }} cargo run -p lucy-poc -- serve {{ config }} {{ addr }}
+    DATABASE_URL={{ database_url }} cargo run -p lucy-poc -- serve {{ config }} {{ addr }}
 
 # Stop services and delete volumes.
 clean:
