@@ -61,6 +61,7 @@ impl SourceCatalog {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub connection: String,
     pub schema: String,
@@ -69,7 +70,10 @@ pub struct SourceConfig {
     pub id_column: String,
     pub srid: i32,
     pub source_model: SourceModel,
-    pub vertical_reference: VerticalReference,
+    /// Optional explicit operation used by the PostGIS adapter to normalize a
+    /// 3D surface into Lucy's fixed EPSG:4979 geometry contract.
+    #[serde(default)]
+    pub coordinate_operation: Option<CoordinateOperation>,
     pub base_height_column: Option<String>,
     #[serde(default)]
     pub height_column: Option<String>,
@@ -117,6 +121,12 @@ impl SourceConfig {
         if self.connection.trim().is_empty() {
             return Err(ConfigError::Validation(format!(
                 "{source_id}: connection must not be empty"
+            )));
+        }
+
+        if self.srid <= 0 {
+            return Err(ConfigError::Validation(format!(
+                "{source_id}: srid must be a positive PostGIS spatial_ref_sys identifier"
             )));
         }
 
@@ -192,16 +202,9 @@ impl SourceConfig {
     fn validate_geometry_strategy(&self, source_id: &str) -> Result<(), ConfigError> {
         match self.source_model {
             SourceModel::ExtrudedFootprint => {
-                if self.srid != 4326 {
+                if self.coordinate_operation.is_some() {
                     return Err(ConfigError::Validation(format!(
-                        "{source_id}: extruded_footprint currently requires SRID 4326"
-                    )));
-                }
-                if self.vertical_reference
-                    != VerticalReference::Named(NamedVerticalReference::LocalGroundMeters)
-                {
-                    return Err(ConfigError::Validation(format!(
-                        "{source_id}: extruded_footprint requires vertical_reference: local_ground_meters"
+                        "{source_id}: extruded_footprint does not accept coordinate_operation; the PostGIS adapter automatically normalizes horizontal coordinates to EPSG:4326"
                     )));
                 }
                 if self.height_column.is_none() {
@@ -235,39 +238,16 @@ impl SourceConfig {
                     )));
                 }
 
-                let VerticalReference::Crs(reference) = &self.vertical_reference else {
-                    return Err(ConfigError::Validation(format!(
-                        "{source_id}: surface_geometry_z requires a vertical_reference mapping with crs and target"
-                    )));
-                };
-                let configured_srid = reference.source_srid(source_id)?;
-                if configured_srid != self.srid {
-                    return Err(ConfigError::Validation(format!(
-                        "{source_id}: vertical_reference.crs EPSG:{configured_srid} does not match srid {}",
-                        self.srid
-                    )));
-                }
-                let target_srid = reference.target_srid(source_id)?;
-                if target_srid != 4979 {
-                    return Err(ConfigError::Validation(format!(
-                        "{source_id}: surface_geometry_z currently requires vertical_reference.target: EPSG:4979"
-                    )));
-                }
-
-                match reference.effective_operation(configured_srid) {
-                    VerticalTransform::Rdnaptrans2018Epsg1149 if configured_srid != 7415 => {
+                match self.coordinate_operation {
+                    Some(CoordinateOperation::Rdnaptrans2018Epsg1149) if self.srid != 7415 => {
                         return Err(ConfigError::Validation(format!(
                             "{source_id}: rdnaptrans2018_epsg_1149 is only valid for EPSG:7415"
                         )));
                     }
-                    VerticalTransform::Identity if configured_srid == 7415 => {
+                    None if self.srid != 4979 => {
                         return Err(ConfigError::Validation(format!(
-                            "{source_id}: EPSG:7415 requires rdnaptrans2018_epsg_1149 so NAP heights cannot silently pass through unchanged"
-                        )));
-                    }
-                    VerticalTransform::Identity if configured_srid != 4979 => {
-                        return Err(ConfigError::Validation(format!(
-                            "{source_id}: identity surface transformation requires already-ellipsoidal EPSG:4979 input; configure a supported explicit operation for EPSG:{configured_srid}"
+                            "{source_id}: surface_geometry_z in EPSG:{} needs an explicit supported coordinate_operation to normalize it to EPSG:4979",
+                            self.srid
                         )));
                     }
                     _ => {}
@@ -331,54 +311,9 @@ impl GeometryType {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum VerticalReference {
-    Named(NamedVerticalReference),
-    Crs(VerticalCrsReference),
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum NamedVerticalReference {
-    LocalGroundMeters,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct VerticalCrsReference {
-    pub crs: String,
-    pub target: String,
-    #[serde(default)]
-    pub operation: Option<VerticalTransform>,
-}
-
-impl VerticalCrsReference {
-    pub fn source_srid(&self, source_id: &str) -> Result<i32, ConfigError> {
-        parse_epsg_code(&self.crs).map_err(|message| {
-            ConfigError::Validation(format!("{source_id}: vertical_reference.crs {message}"))
-        })
-    }
-
-    pub fn target_srid(&self, source_id: &str) -> Result<i32, ConfigError> {
-        parse_epsg_code(&self.target).map_err(|message| {
-            ConfigError::Validation(format!("{source_id}: vertical_reference.target {message}"))
-        })
-    }
-
-    pub fn effective_operation(&self, source_srid: i32) -> VerticalTransform {
-        self.operation.unwrap_or(if source_srid == 7415 {
-            VerticalTransform::Rdnaptrans2018Epsg1149
-        } else {
-            VerticalTransform::Identity
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum VerticalTransform {
-    Identity,
+pub enum CoordinateOperation {
     #[serde(rename = "rdnaptrans2018_epsg_1149")]
     Rdnaptrans2018Epsg1149,
 }
@@ -609,23 +544,6 @@ fn require_identifier(value: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn parse_epsg_code(value: &str) -> Result<i32, &'static str> {
-    let value = value.trim();
-    let Some((authority, code)) = value.split_once(':') else {
-        return Err("must use EPSG:<positive integer> syntax");
-    };
-    if !authority.eq_ignore_ascii_case("EPSG") {
-        return Err("must use the EPSG authority");
-    }
-    let code = code
-        .parse::<i32>()
-        .map_err(|_| "must contain a valid EPSG integer code")?;
-    if code <= 0 {
-        return Err("must contain a positive EPSG code");
-    }
-    Ok(code)
-}
-
 fn push_unique_attribute(attributes: &mut Vec<String>, attribute: &str) {
     if !attributes.iter().any(|existing| existing == attribute) {
         attributes.push(attribute.to_string());
@@ -674,7 +592,6 @@ sources:
     id_column: feature_id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: bottom_m
     height_column: top_delta_m
     geometry_types:
@@ -719,6 +636,29 @@ sources:
     }
 
     #[test]
+    fn accepts_non_4326_footprint_source_srid_for_adapter_normalization() {
+        let raw =
+            include_str!("../../../config/poc-sources.yaml").replace("srid: 4326", "srid: 28992");
+        let catalog = SourceCatalog::from_yaml_str(&raw)
+            .expect("projected footprints should be normalized by the PostGIS adapter");
+
+        assert!(catalog.sources.values().all(|source| source.srid == 28992));
+    }
+
+    #[test]
+    fn rejects_removed_coordinate_fields_instead_of_ignoring_them() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "    source_model: extruded_footprint\n",
+            "    source_model: extruded_footprint\n    vertical_reference: local_ground_meters\n",
+            1,
+        );
+        let error = SourceCatalog::from_yaml_str(&raw)
+            .expect_err("removed coordinate fields should require an explicit migration");
+
+        assert!(error.to_string().contains("vertical_reference"));
+    }
+
+    #[test]
     fn loads_surface_geometry_z_without_extrusion_columns() {
         let raw = r#"
 sources:
@@ -730,9 +670,7 @@ sources:
     id_column: identificatie
     srid: 7415
     source_model: surface_geometry_z
-    vertical_reference:
-      crs: EPSG:7415
-      target: EPSG:4979
+    coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types:
       - PolygonZ
       - MultiPolygonZ
@@ -759,29 +697,14 @@ sources:
         assert_eq!(source.base_height_column, None);
         assert_eq!(source.height_column, None);
         assert_eq!(source.content_query_attributes(), vec!["status"]);
-        let VerticalReference::Crs(reference) = &source.vertical_reference else {
-            panic!("surface vertical reference should be CRS-backed");
-        };
         assert_eq!(
-            reference
-                .source_srid("sibbe_lod12")
-                .expect("EPSG code should parse"),
-            7415
-        );
-        assert_eq!(
-            reference
-                .target_srid("sibbe_lod12")
-                .expect("target EPSG code should parse"),
-            4979
-        );
-        assert_eq!(
-            reference.effective_operation(7415),
-            VerticalTransform::Rdnaptrans2018Epsg1149
+            source.coordinate_operation,
+            Some(CoordinateOperation::Rdnaptrans2018Epsg1149)
         );
     }
 
     #[test]
-    fn rejects_surface_geometry_without_z_or_vertical_crs_contract() {
+    fn rejects_surface_geometry_without_z_or_supported_coordinate_operation() {
         let valid = r#"
 sources:
   surfaces:
@@ -792,9 +715,7 @@ sources:
     id_column: id
     srid: 7415
     source_model: surface_geometry_z
-    vertical_reference:
-      crs: EPSG:7415
-      target: EPSG:4979
+    coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types: [MultiPolygonZ]
     bounds:
       west: 5.0
@@ -816,53 +737,20 @@ sources:
         let error = SourceCatalog::from_yaml_str(&no_z).expect_err("2D surface should fail");
         assert!(error.to_string().contains("PolygonZ and MultiPolygonZ"));
 
-        let local_vertical = valid.replace(
-            "vertical_reference:\n      crs: EPSG:7415\n      target: EPSG:4979",
-            "vertical_reference: local_ground_meters",
-        );
-        let error = SourceCatalog::from_yaml_str(&local_vertical)
-            .expect_err("surface without CRS contract should fail");
+        let no_operation =
+            valid.replace("    coordinate_operation: rdnaptrans2018_epsg_1149\n", "");
+        let error = SourceCatalog::from_yaml_str(&no_operation)
+            .expect_err("non-4979 surface without an operation should fail");
         assert!(
             error
                 .to_string()
-                .contains("requires a vertical_reference mapping")
+                .contains("needs an explicit supported coordinate_operation")
         );
 
-        let wrong_target = valid.replace("target: EPSG:4979", "target: EPSG:4978");
-        let error = SourceCatalog::from_yaml_str(&wrong_target)
-            .expect_err("surface target must be geographic 3D WGS84");
-        assert!(
-            error
-                .to_string()
-                .contains("requires vertical_reference.target: EPSG:4979")
-        );
-
-        let ballpark = valid.replace(
-            "target: EPSG:4979",
-            "target: EPSG:4979\n      operation: identity",
-        );
-        let error = SourceCatalog::from_yaml_str(&ballpark)
-            .expect_err("EPSG:7415 ballpark transform should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("requires rdnaptrans2018_epsg_1149")
-        );
-
-        let unsupported_postgis = valid
-            .replace("srid: 7415", "srid: 28992")
-            .replace("crs: EPSG:7415", "crs: EPSG:28992")
-            .replace(
-                "target: EPSG:4979",
-                "target: EPSG:4979\n      operation: identity",
-            );
+        let unsupported_postgis = valid.replace("srid: 7415", "srid: 28992");
         let error = SourceCatalog::from_yaml_str(&unsupported_postgis)
-            .expect_err("an implicit 3D transform from a projected CRS should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("identity surface transformation requires already-ellipsoidal EPSG:4979")
-        );
+            .expect_err("an unsupported explicit 3D operation should fail");
+        assert!(error.to_string().contains("only valid for EPSG:7415"));
 
         let subdivided = valid.replace("max_level: 0", "max_level: 1");
         let error = SourceCatalog::from_yaml_str(&subdivided)

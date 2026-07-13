@@ -1,6 +1,8 @@
 use std::fmt;
 
+const WKB_LINE_STRING: u32 = 2;
 const WKB_POLYGON: u32 = 3;
+const WKB_MULTI_LINE_STRING: u32 = 5;
 const WKB_MULTIPOLYGON: u32 = 6;
 const EWKB_Z_FLAG: u32 = 0x8000_0000;
 const EWKB_M_FLAG: u32 = 0x4000_0000;
@@ -40,6 +42,16 @@ pub struct Ring2D {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LineString2D {
+    pub points: Vec<Point2D>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiLineString2D {
+    pub lines: Vec<LineString2D>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ring3D {
     /// WKB rings retain their closing coordinate. Mesh validation removes it
     /// only after confirming that the ring is closed.
@@ -73,10 +85,31 @@ impl FootprintGeometry {
     }
 }
 
+/// One tile-contained footprint area together with the portions of the
+/// original feature boundary that survive inside that tile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FootprintFragment {
+    pub geometry: FootprintGeometry,
+    pub source_boundary: MultiLineString2D,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceGeometryZ {
     Polygon(Polygon3D),
     MultiPolygon(Vec<Polygon3D>),
+}
+
+/// Geometry after a source adapter has validated and normalized its coordinate
+/// reference system. Downstream Lucy code can rely on each variant's coordinate
+/// semantics without carrying an SRID or performing another CRS conversion.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NormalizedGeometry {
+    /// Tile-clipped EPSG:4326 longitude/latitude in degrees plus the surviving
+    /// original feature boundary. Elevation is supplied by the extrusion model
+    /// as local metres above the source region's base height.
+    GeographicFootprint(FootprintFragment),
+    /// EPSG:4979 longitude/latitude in degrees plus ellipsoidal height metres.
+    GeodeticSurface(SurfaceGeometryZ),
 }
 
 impl SurfaceGeometryZ {
@@ -160,6 +193,17 @@ pub fn decode_surface_geometry_z_wkb(wkb: &[u8]) -> Result<SurfaceGeometryZ, Wkb
     }
 }
 
+/// Decode an OGC/ISO WKB or PostGIS EWKB MultiLineString.
+///
+/// Exactly XY is required for both the outer geometry and every LineString
+/// member. Empty MultiLineStrings and empty LineString members are preserved.
+pub fn decode_multi_line_string_wkb(wkb: &[u8]) -> Result<MultiLineString2D, WkbError> {
+    let mut reader = WkbReader::new(wkb);
+    let geometry = reader.read_multi_line_string(CoordinateDimension::Xy)?;
+    reader.expect_finished()?;
+    Ok(geometry)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WkbError {
     UnexpectedEof {
@@ -184,6 +228,19 @@ pub enum WkbError {
         member_index: usize,
     },
     MultiPolygonMemberIsNotPolygon {
+        member_index: usize,
+        base_type: u32,
+    },
+    GeometryIsNotMultiLineString {
+        type_code: u32,
+        base_type: u32,
+    },
+    MixedMultiLineStringDimension {
+        expected: CoordinateDimension,
+        actual: CoordinateDimension,
+        member_index: usize,
+    },
+    MultiLineStringMemberIsNotLineString {
         member_index: usize,
         base_type: u32,
     },
@@ -241,6 +298,28 @@ impl fmt::Display for WkbError {
             } => write!(
                 f,
                 "MultiPolygon member {member_index} has geometry type {base_type}; expected Polygon"
+            ),
+            Self::GeometryIsNotMultiLineString {
+                type_code,
+                base_type,
+            } => write!(
+                f,
+                "WKB geometry type {base_type} (encoded type {type_code}) is not a MultiLineString"
+            ),
+            Self::MixedMultiLineStringDimension {
+                expected,
+                actual,
+                member_index,
+            } => write!(
+                f,
+                "MultiLineString member {member_index} has {actual} coordinates; outer geometry uses {expected}"
+            ),
+            Self::MultiLineStringMemberIsNotLineString {
+                member_index,
+                base_type,
+            } => write!(
+                f,
+                "MultiLineString member {member_index} has geometry type {base_type}; expected LineString"
             ),
             Self::PolygonHasNoRings => write!(f, "Polygon must contain at least one ring"),
             Self::MultiPolygonHasNoPolygons => {
@@ -424,6 +503,49 @@ impl<'a> WkbReader<'a> {
         }
     }
 
+    fn read_multi_line_string(
+        &mut self,
+        expected_dimension: CoordinateDimension,
+    ) -> Result<MultiLineString2D, WkbError> {
+        let header = self.read_header()?;
+        if header.dimension != expected_dimension {
+            return Err(WkbError::CoordinateDimensionMismatch {
+                expected: expected_dimension,
+                actual: header.dimension,
+                type_code: header.type_code,
+            });
+        }
+        if header.base_type != WKB_MULTI_LINE_STRING {
+            return Err(WkbError::GeometryIsNotMultiLineString {
+                type_code: header.type_code,
+                base_type: header.base_type,
+            });
+        }
+
+        let line_count = self.read_count(header.byte_order, "line string count")?;
+        self.ensure_minimum_items(line_count, 5, "line string count")?;
+        let mut lines = Vec::with_capacity(line_count);
+        for member_index in 0..line_count {
+            let member = self.read_header()?;
+            if member.base_type != WKB_LINE_STRING {
+                return Err(WkbError::MultiLineStringMemberIsNotLineString {
+                    member_index,
+                    base_type: member.base_type,
+                });
+            }
+            if member.dimension != header.dimension {
+                return Err(WkbError::MixedMultiLineStringDimension {
+                    expected: header.dimension,
+                    actual: member.dimension,
+                    member_index,
+                });
+            }
+            lines.push(self.read_line_string_body(member)?);
+        }
+
+        Ok(MultiLineString2D { lines })
+    }
+
     fn read_header(&mut self) -> Result<WkbHeader, WkbError> {
         let byte_order = self.read_byte_order()?;
         let type_code = self.read_u32(byte_order)?;
@@ -493,6 +615,26 @@ impl<'a> WkbReader<'a> {
             rings.push(ring);
         }
         Ok(RawPolygon { rings })
+    }
+
+    fn read_line_string_body(&mut self, header: WkbHeader) -> Result<LineString2D, WkbError> {
+        let point_count = self.read_count(header.byte_order, "line string point count")?;
+        let coordinate_bytes = header
+            .dimension
+            .ordinate_count()
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or(WkbError::CountOverflow("coordinate width"))?;
+        self.ensure_minimum_items(point_count, coordinate_bytes, "line string point count")?;
+
+        let mut points = Vec::with_capacity(point_count);
+        for _ in 0..point_count {
+            let point = self.read_point(header)?;
+            points.push(Point2D {
+                x: point.x,
+                y: point.y,
+            });
+        }
+        Ok(LineString2D { points })
     }
 
     fn read_point(&mut self, header: WkbHeader) -> Result<RawPoint, WkbError> {
@@ -608,6 +750,83 @@ impl<'a> WkbReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32, little_endian: bool) {
+        if little_endian {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    fn push_f64(bytes: &mut Vec<u8>, value: f64, little_endian: bool) {
+        if little_endian {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    fn write_header(
+        bytes: &mut Vec<u8>,
+        type_code: u32,
+        little_endian: bool,
+        embedded_srid: Option<u32>,
+    ) {
+        bytes.push(u8::from(little_endian));
+        push_u32(bytes, type_code, little_endian);
+        if type_code & EWKB_SRID_FLAG != 0 {
+            push_u32(
+                bytes,
+                embedded_srid.expect("EWKB SRID flag requires a test SRID"),
+                little_endian,
+            );
+        }
+    }
+
+    fn write_line_string(
+        type_code: u32,
+        points: &[[f64; 4]],
+        little_endian: bool,
+        embedded_srid: Option<u32>,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_header(&mut bytes, type_code, little_endian, embedded_srid);
+        push_u32(&mut bytes, points.len() as u32, little_endian);
+
+        let ordinate_count = if type_code & EWKB_FLAG_MASK != 0 {
+            2 + usize::from(type_code & EWKB_Z_FLAG != 0)
+                + usize::from(type_code & EWKB_M_FLAG != 0)
+        } else {
+            match type_code / 1_000 {
+                0 => 2,
+                1 | 2 => 3,
+                3 => 4,
+                _ => panic!("unsupported test WKB type code {type_code}"),
+            }
+        };
+        for point in points {
+            for value in &point[..ordinate_count] {
+                push_f64(&mut bytes, *value, little_endian);
+            }
+        }
+        bytes
+    }
+
+    fn write_multi_line_string(
+        type_code: u32,
+        lines: &[Vec<u8>],
+        little_endian: bool,
+        embedded_srid: Option<u32>,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_header(&mut bytes, type_code, little_endian, embedded_srid);
+        push_u32(&mut bytes, lines.len() as u32, little_endian);
+        for line in lines {
+            bytes.extend_from_slice(line);
+        }
+        bytes
+    }
 
     fn write_polygon(type_code: u32, rings: &[Vec<[f64; 3]>], little_endian: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -731,5 +950,145 @@ mod tests {
                 member_index: 0
             }
         ));
+    }
+
+    #[test]
+    fn decodes_ogc_multi_line_string_with_member_byte_orders() {
+        let first = write_line_string(
+            WKB_LINE_STRING,
+            &[[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 0.0, 0.0]],
+            true,
+            None,
+        );
+        let second = write_line_string(
+            WKB_LINE_STRING,
+            &[[5.0, 6.0, 0.0, 0.0], [7.0, 8.0, 0.0, 0.0]],
+            false,
+            None,
+        );
+        let wkb = write_multi_line_string(WKB_MULTI_LINE_STRING, &[first, second], false, None);
+
+        let geometry = decode_multi_line_string_wkb(&wkb).expect("MultiLineString should decode");
+
+        assert_eq!(geometry.lines.len(), 2);
+        assert_eq!(geometry.lines[0].points[1], Point2D { x: 3.0, y: 4.0 });
+        assert_eq!(geometry.lines[1].points[0], Point2D { x: 5.0, y: 6.0 });
+    }
+
+    #[test]
+    fn decodes_ewkb_multi_line_string_with_embedded_srids() {
+        let line = write_line_string(
+            EWKB_SRID_FLAG | WKB_LINE_STRING,
+            &[[5.85, 50.84, 0.0, 0.0], [5.86, 50.85, 0.0, 0.0]],
+            true,
+            Some(4326),
+        );
+        let wkb = write_multi_line_string(
+            EWKB_SRID_FLAG | WKB_MULTI_LINE_STRING,
+            &[line],
+            true,
+            Some(4326),
+        );
+
+        let geometry = decode_multi_line_string_wkb(&wkb).expect("EWKB should decode");
+
+        assert_eq!(geometry.lines.len(), 1);
+        assert_eq!(geometry.lines[0].points.len(), 2);
+        assert_eq!(geometry.lines[0].points[0].x, 5.85);
+    }
+
+    #[test]
+    fn decodes_empty_multi_line_string_and_empty_member() {
+        let empty = write_multi_line_string(WKB_MULTI_LINE_STRING, &[], true, None);
+        assert_eq!(
+            decode_multi_line_string_wkb(&empty).expect("empty collection should decode"),
+            MultiLineString2D { lines: Vec::new() }
+        );
+
+        let empty_line = write_line_string(WKB_LINE_STRING, &[], false, None);
+        let with_empty_member =
+            write_multi_line_string(WKB_MULTI_LINE_STRING, &[empty_line], true, None);
+        assert!(
+            decode_multi_line_string_wkb(&with_empty_member)
+                .expect("empty member should decode")
+                .lines[0]
+                .points
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_non_line_string_multi_line_string_member() {
+        let polygon = write_polygon(WKB_POLYGON, &[square(0.0)], true);
+        let wkb = write_multi_line_string(WKB_MULTI_LINE_STRING, &[polygon], true, None);
+
+        let error = decode_multi_line_string_wkb(&wkb).expect_err("Polygon member must fail");
+
+        assert!(matches!(
+            error,
+            WkbError::MultiLineStringMemberIsNotLineString {
+                member_index: 0,
+                base_type: WKB_POLYGON
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_multi_line_string_dimension_mismatches() {
+        let xyz_collection = write_multi_line_string(1_005, &[], true, None);
+        let outer_error = decode_multi_line_string_wkb(&xyz_collection)
+            .expect_err("XYZ collection must not be flattened");
+        assert!(matches!(
+            outer_error,
+            WkbError::CoordinateDimensionMismatch {
+                expected: CoordinateDimension::Xy,
+                actual: CoordinateDimension::Xyz,
+                type_code: 1_005
+            }
+        ));
+
+        let xyz_member = write_line_string(
+            EWKB_Z_FLAG | WKB_LINE_STRING,
+            &[[1.0, 2.0, 3.0, 0.0], [4.0, 5.0, 6.0, 0.0]],
+            true,
+            None,
+        );
+        let mixed = write_multi_line_string(WKB_MULTI_LINE_STRING, &[xyz_member], true, None);
+        let member_error =
+            decode_multi_line_string_wkb(&mixed).expect_err("mixed member dimension must fail");
+        assert!(matches!(
+            member_error,
+            WkbError::MixedMultiLineStringDimension {
+                expected: CoordinateDimension::Xy,
+                actual: CoordinateDimension::Xyz,
+                member_index: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_multi_line_string_and_trailing_bytes() {
+        let line = write_line_string(
+            WKB_LINE_STRING,
+            &[[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 0.0, 0.0]],
+            true,
+            None,
+        );
+        let wrong_type =
+            decode_multi_line_string_wkb(&line).expect_err("top-level LineString must fail");
+        assert!(matches!(
+            wrong_type,
+            WkbError::GeometryIsNotMultiLineString {
+                type_code: WKB_LINE_STRING,
+                base_type: WKB_LINE_STRING
+            }
+        ));
+
+        let mut with_trailing = write_multi_line_string(WKB_MULTI_LINE_STRING, &[], true, None);
+        with_trailing.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(
+            decode_multi_line_string_wkb(&with_trailing).expect_err("trailing bytes must fail"),
+            WkbError::TrailingBytes(2)
+        );
     }
 }

@@ -4,14 +4,19 @@ use std::time::Instant;
 
 use tokio_postgres::{GenericClient, Row};
 
+use lucy_core::geometry::{
+    FootprintFragment, NormalizedGeometry, decode_footprint_wkb, decode_multi_line_string_wkb,
+    decode_surface_geometry_z_wkb,
+};
 use lucy_core::source::{
-    ConfigError, GeometryType, SourceBounds, SourceConfig, SourceModel, VerticalReference,
-    VerticalTransform,
+    ConfigError, CoordinateOperation, GeometryType, SourceBounds, SourceConfig, SourceModel,
 };
 use lucy_core::subtree::{SubtreeAvailabilityBits, subtree_layout};
 use lucy_core::tile::{GeographicRegionDegrees, TileCoord};
 
+const TARGET_GEOGRAPHIC_2D_SRID: i32 = 4326;
 const TARGET_GEODETIC_3D_SRID: i32 = 4979;
+const POSTGIS_AUTOMATIC_TRANSFORM_OPERATION: &str = "postgis_st_transform";
 const RDNAPTRANS2018_EPSG_1149_OPERATION: &str = "rdnaptrans2018_epsg_1149";
 const RDNAPTRANS2018_EPSG_1149_PIPELINE: &str = "+proj=pipeline \
   +step +inv +proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 \
@@ -25,24 +30,28 @@ const RDNAPTRANS2018_EPSG_1149_PIPELINE: &str = "+proj=pipeline \
 
 /// One PostGIS feature selected for a requested tile bbox.
 ///
-/// Extruded footprints contain the clipped fragment. Native surface features
-/// contain the whole source geometry, normalized to Lucy's explicit EPSG:4979
-/// target contract. Validated native-surface sources are root-owned
-/// (`max_level = 0`), because PostGIS XY overlay would collapse vertical
-/// PolygonZ faces and whole-feature child duplication would violate tile bounds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TileFeatureWkb {
+/// Extruded footprints contain an EPSG:4326 clipped fragment plus the portions
+/// of the original feature boundary that remain inside the tile. The boundary
+/// mask prevents clip edges from becoming artificial extrusion walls. Native
+/// surface features contain the whole source geometry normalized to Lucy's
+/// explicit EPSG:4979 target contract. Validated native-surface sources are
+/// root-owned (`max_level = 0`), because PostGIS XY overlay would collapse
+/// vertical PolygonZ faces and whole-feature child duplication would violate
+/// tile bounds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedFeature {
     pub id: String,
-    pub geometry_wkb: Vec<u8>,
+    pub geometry: NormalizedGeometry,
+    pub encoded_size_bytes: usize,
     pub attributes: BTreeMap<String, Option<String>>,
 }
 
 /// Query a tile bbox from PostGIS using the configured geometry strategy.
-pub async fn query_tile_geometry_wkb(
+pub async fn query_normalized_features(
     client: &impl GenericClient,
     source: &SourceConfig,
     tile: TileCoord,
-) -> Result<Vec<TileFeatureWkb>, TileQueryError> {
+) -> Result<Vec<NormalizedFeature>, TileQueryError> {
     if tile.level < source.min_level || tile.level > source.max_level {
         return Err(ConfigError::Validation(format!(
             "tile level={} is outside configured levels {}..={}",
@@ -51,10 +60,11 @@ pub async fn query_tile_geometry_wkb(
         .into());
     }
     let bbox = tile.geographic_region_degrees(&source.bounds)?;
-    query_tile_geometry_wkb_for_bbox(client, source, bbox).await
+    query_normalized_features_for_bbox(client, source, bbox).await
 }
 
-/// Query an explicit target-geodetic bbox and return strategy-normalized WKB.
+/// Query an explicit target-geodetic bbox and return decoded, normalized
+/// geometry. WKB and source-CRS details do not cross this adapter boundary.
 #[tracing::instrument(
     name = "postgis.tile_geometry",
     skip(client, source, bbox),
@@ -70,14 +80,14 @@ pub async fn query_tile_geometry_wkb(
         query_limit = source.max_features_per_tile + 1,
     )
 )]
-async fn query_tile_geometry_wkb_for_bbox(
+async fn query_normalized_features_for_bbox(
     client: &impl GenericClient,
     source: &SourceConfig,
     bbox: GeographicRegionDegrees,
-) -> Result<Vec<TileFeatureWkb>, TileQueryError> {
+) -> Result<Vec<NormalizedFeature>, TileQueryError> {
     validate_query_bbox(bbox)?;
 
-    let plan = build_tile_wkb_query(source)?;
+    let plan = build_normalized_geometry_query(source)?;
     let query_limit = i64::from(source.max_features_per_tile) + 1;
     let started = Instant::now();
     let rows = match plan.bindings {
@@ -125,23 +135,67 @@ async fn query_tile_geometry_wkb_for_bbox(
     for row in rows {
         let id = row.try_get::<_, String>(0)?;
         let geometry_wkb = row.try_get::<_, Vec<u8>>(1)?;
+        let source_boundary_wkb = row.try_get::<_, Option<Vec<u8>>>(2)?;
+        let geometry = decode_normalized_geometry(
+            source.source_model,
+            &geometry_wkb,
+            source_boundary_wkb.as_deref(),
+        )
+        .map_err(|error| {
+            TileQueryError::SourceContract(format!(
+                "feature {id} did not match the adapter's normalized geometry contract: {error}"
+            ))
+        })?;
         let mut attributes = BTreeMap::new();
 
         for (index, attribute) in plan.attributes.iter().enumerate() {
             attributes.insert(
                 attribute.clone(),
-                row.try_get::<_, Option<String>>(index + 2)?,
+                row.try_get::<_, Option<String>>(index + 3)?,
             );
         }
 
-        features.push(TileFeatureWkb {
+        features.push(NormalizedFeature {
             id,
-            geometry_wkb,
+            geometry,
+            encoded_size_bytes: geometry_wkb.len()
+                + source_boundary_wkb.as_ref().map_or(0, Vec::len),
             attributes,
         });
     }
 
     Ok(features)
+}
+
+fn decode_normalized_geometry(
+    source_model: SourceModel,
+    geometry_wkb: &[u8],
+    source_boundary_wkb: Option<&[u8]>,
+) -> Result<NormalizedGeometry, String> {
+    match source_model {
+        SourceModel::ExtrudedFootprint => {
+            let source_boundary_wkb = source_boundary_wkb.ok_or_else(|| {
+                "extruded footprint is missing its original-boundary mask".to_string()
+            })?;
+            let geometry = decode_footprint_wkb(geometry_wkb).map_err(|error| error.to_string())?;
+            let source_boundary = decode_multi_line_string_wkb(source_boundary_wkb)
+                .map_err(|error| format!("source boundary: {error}"))?;
+            Ok(NormalizedGeometry::GeographicFootprint(FootprintFragment {
+                geometry,
+                source_boundary,
+            }))
+        }
+        SourceModel::SurfaceGeometryZ => {
+            if source_boundary_wkb.is_some() {
+                return Err(
+                    "native surface unexpectedly included a footprint boundary mask".to_string(),
+                );
+            }
+            decode_surface_geometry_z_wkb(geometry_wkb)
+                .map(NormalizedGeometry::GeodeticSurface)
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 /// Derive all tile, content, and child-subtree availability for one subtree
@@ -536,13 +590,80 @@ pub async fn validate_source(
     let profile = query_source_geometry_profile(client, source_id, source).await?;
     validate_source_geometry_profile(source_id, source, &profile)?;
     validate_finite_coordinates(client, source_id, source).await?;
-    if source.source_model == SourceModel::SurfaceGeometryZ {
-        validate_surface_transform(client, source_id, source).await?;
-        if profile.row_count > 0 {
-            validate_surface_extent(client, source_id, source).await?;
+    match source.source_model {
+        SourceModel::ExtrudedFootprint => {
+            validate_footprint_transform(client, source_id, source).await?;
+        }
+        SourceModel::SurfaceGeometryZ => {
+            validate_surface_transform(client, source_id, source).await?;
+            if profile.row_count > 0 {
+                validate_surface_extent(client, source_id, source).await?;
+            }
         }
     }
     Ok(profile)
+}
+
+async fn validate_footprint_transform(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let longitude = (source.bounds.west + source.bounds.east) / 2.0;
+    let latitude = (source.bounds.south + source.bounds.north) / 2.0;
+    let row = client
+        .query_one(
+            &format!(
+                "WITH target_point AS ( \
+                   SELECT ST_SetSRID(ST_MakePoint($1, $2), {TARGET_GEOGRAPHIC_2D_SRID}) AS geom \
+                 ), source_point AS ( \
+                   SELECT ST_Transform(geom, $3::integer) AS geom FROM target_point \
+                 ), roundtrip AS ( \
+                   SELECT ST_Transform(geom, {TARGET_GEOGRAPHIC_2D_SRID}) AS geom FROM source_point \
+                 ) \
+                 SELECT ST_X(geom), ST_Y(geom), ST_SRID(geom) FROM roundtrip"
+            ),
+            &[&longitude, &latitude, &source.srid],
+        )
+        .await
+        .map_err(|source_error| {
+            let is_transform_failure = source_error.as_db_error().is_some_and(|database_error| {
+                is_coordinate_transform_failure(
+                    database_error.code().code(),
+                    database_error.message(),
+                )
+            });
+            if is_transform_failure {
+                SourceValidationError::TransformUnavailable {
+                    source_id: source_id.to_string(),
+                    source_srid: source.srid,
+                    target_srid: TARGET_GEOGRAPHIC_2D_SRID,
+                    operation: POSTGIS_AUTOMATIC_TRANSFORM_OPERATION,
+                    source: source_error,
+                }
+            } else {
+                SourceValidationError::database(source_id, "transform probe", source_error)
+            }
+        })?;
+
+    let transformed_longitude = row.get::<_, f64>(0);
+    let transformed_latitude = row.get::<_, f64>(1);
+    let transformed_srid = row.get::<_, i32>(2);
+    const ROUNDTRIP_TOLERANCE_DEG: f64 = 1.0e-7;
+    if !transformed_longitude.is_finite()
+        || !transformed_latitude.is_finite()
+        || transformed_srid != TARGET_GEOGRAPHIC_2D_SRID
+        || (transformed_longitude - longitude).abs() > ROUNDTRIP_TOLERANCE_DEG
+        || (transformed_latitude - latitude).abs() > ROUNDTRIP_TOLERANCE_DEG
+    {
+        return Err(SourceValidationError::TransformContract {
+            source_id: source_id.to_string(),
+            message: format!(
+                "footprint transform probe returned ({transformed_longitude}, {transformed_latitude}) EPSG:{transformed_srid}; expected ({longitude}, {latitude}) EPSG:{TARGET_GEOGRAPHIC_2D_SRID}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn validate_source_columns(
@@ -1140,7 +1261,7 @@ impl SurfaceTransform {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct TileWkbQueryPlan {
+struct NormalizedGeometryQueryPlan {
     sql: String,
     attributes: Vec<String>,
     bindings: QueryBindings,
@@ -1154,7 +1275,7 @@ struct SubtreeOccupancyQueryPlan {
     source_model: SourceModel,
 }
 
-impl TileWkbQueryPlan {
+impl NormalizedGeometryQueryPlan {
     fn map_query_error(
         &self,
         source: &SourceConfig,
@@ -1183,14 +1304,22 @@ fn map_plan_query_error(
     let is_transform_failure = source_error.as_db_error().is_some_and(|database_error| {
         is_coordinate_transform_failure(database_error.code().code(), database_error.message())
     });
-    if source_model == SourceModel::SurfaceGeometryZ && is_transform_failure {
-        let operation = match bindings {
-            QueryBindings::Standard => "identity",
-            QueryBindings::Rdnaptrans2018Epsg1149 => RDNAPTRANS2018_EPSG_1149_OPERATION,
+    if is_transform_failure {
+        let (target_srid, operation) = match (source_model, bindings) {
+            (SourceModel::ExtrudedFootprint, _) => (
+                TARGET_GEOGRAPHIC_2D_SRID,
+                POSTGIS_AUTOMATIC_TRANSFORM_OPERATION,
+            ),
+            (SourceModel::SurfaceGeometryZ, QueryBindings::Standard) => {
+                (TARGET_GEODETIC_3D_SRID, "identity")
+            }
+            (SourceModel::SurfaceGeometryZ, QueryBindings::Rdnaptrans2018Epsg1149) => {
+                (TARGET_GEODETIC_3D_SRID, RDNAPTRANS2018_EPSG_1149_OPERATION)
+            }
         };
         TileQueryError::CoordinateTransform {
             source_srid: source.srid,
-            target_srid: TARGET_GEODETIC_3D_SRID,
+            target_srid,
             operation,
             source: source_error,
         }
@@ -1210,7 +1339,9 @@ fn is_coordinate_transform_failure(sqlstate: &str, message: &str) -> bool {
         || message.starts_with("could not form projection")
 }
 
-fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, ConfigError> {
+fn build_normalized_geometry_query(
+    source: &SourceConfig,
+) -> Result<NormalizedGeometryQueryPlan, ConfigError> {
     if source.max_features_per_tile == 0 {
         return Err(ConfigError::Validation(
             "max_features_per_tile must be greater than zero".to_string(),
@@ -1222,19 +1353,31 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
     let id_column = quote_identifier(&source.id_column, "id_column")?;
     let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
 
-    let (geometry_select, tile_bbox, joins, predicate, limit_parameter, bindings) = match source
-        .source_model
-    {
+    let (
+        geometry_select,
+        source_boundary_select,
+        tile_bbox,
+        joins,
+        predicate,
+        limit_parameter,
+        bindings,
+    ) = match source.source_model {
         SourceModel::ExtrudedFootprint => {
             let table_geometry = format!("t.{geometry_column}");
             let clipped_geometry = clipped_geometry_expression(&table_geometry, "b.geom");
+            let source_boundary = source_boundary_expression(&table_geometry, "b.geom");
             let predicate =
                 positive_area_intersection_predicate(&table_geometry, "b.geom", "clipped.geom");
             (
-                "ST_AsBinary(clipped.geom, 'NDR') AS geometry_wkb".to_string(),
+                "ST_AsBinary(ST_Transform(clipped.geom, 4326), 'NDR') AS geometry_wkb".to_string(),
+                "ST_AsBinary(ST_Transform(source_boundary.geom, 4326), 'NDR') AS source_boundary_wkb"
+                    .to_string(),
                 "ST_Transform(ST_MakeEnvelope($1, $2, $3, $4, 4326), $5::integer) AS geom"
                     .to_string(),
-                format!("CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped"),
+                format!(
+                    "CROSS JOIN LATERAL (SELECT {clipped_geometry} AS geom) AS clipped \
+                     CROSS JOIN LATERAL (SELECT {source_boundary} AS geom) AS source_boundary"
+                ),
                 predicate,
                 "$6",
                 QueryBindings::Standard,
@@ -1243,6 +1386,7 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         SourceModel::SurfaceGeometryZ => match surface_transform(source)? {
             SurfaceTransform::Identity => (
                 format!("ST_AsBinary(t.{geometry_column}, 'NDR') AS geometry_wkb"),
+                "NULL::bytea AS source_boundary_wkb".to_string(),
                 "ST_MakeEnvelope($1, $2, $3, $4, $5::integer) AS geom".to_string(),
                 String::new(),
                 format!("t.{geometry_column} && b.geom"),
@@ -1253,6 +1397,7 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
                 format!(
                     "ST_AsBinary(ST_TransformPipeline(t.{geometry_column}, $6, {TARGET_GEODETIC_3D_SRID}), 'NDR') AS geometry_wkb"
                 ),
+                "NULL::bytea AS source_boundary_wkb".to_string(),
                 format!(
                     "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
                          ST_Force3D(ST_MakeEnvelope($1, $2, $3, $4, {TARGET_GEODETIC_3D_SRID}), 0.0), \
@@ -1266,7 +1411,11 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         },
     };
 
-    let mut select_columns = vec![format!("t.{id_column}::text AS id"), geometry_select];
+    let mut select_columns = vec![
+        format!("t.{id_column}::text AS id"),
+        geometry_select,
+        source_boundary_select,
+    ];
 
     let query_attributes = source.content_query_attributes();
     let mut attributes = Vec::with_capacity(query_attributes.len());
@@ -1288,7 +1437,7 @@ fn build_tile_wkb_query(source: &SourceConfig) -> Result<TileWkbQueryPlan, Confi
         select_columns.join(", ")
     );
 
-    Ok(TileWkbQueryPlan {
+    Ok(NormalizedGeometryQueryPlan {
         sql,
         attributes,
         bindings,
@@ -1366,19 +1515,22 @@ fn build_subtree_occupancy_query(
 }
 
 fn surface_transform(source: &SourceConfig) -> Result<SurfaceTransform, ConfigError> {
-    let VerticalReference::Crs(reference) = &source.vertical_reference else {
-        return Err(ConfigError::Validation(
-            "surface_geometry_z requires a CRS vertical_reference".to_string(),
-        ));
-    };
-    Ok(match reference.effective_operation(source.srid) {
-        VerticalTransform::Identity => SurfaceTransform::Identity,
-        VerticalTransform::Rdnaptrans2018Epsg1149 => SurfaceTransform::Rdnaptrans2018Epsg1149,
+    Ok(match source.coordinate_operation {
+        None => SurfaceTransform::Identity,
+        Some(CoordinateOperation::Rdnaptrans2018Epsg1149) => {
+            SurfaceTransform::Rdnaptrans2018Epsg1149
+        }
     })
 }
 
 fn clipped_geometry_expression(table_geometry: &str, bbox_geometry: &str) -> String {
     format!("ST_Multi(ST_CollectionExtract(ST_Intersection({table_geometry}, {bbox_geometry}), 3))")
+}
+
+fn source_boundary_expression(table_geometry: &str, bbox_geometry: &str) -> String {
+    format!(
+        "ST_Multi(ST_CollectionExtract(ST_Intersection(ST_Boundary({table_geometry}), {bbox_geometry}), 2))"
+    )
 }
 
 fn positive_area_intersection_predicate(
@@ -1470,8 +1622,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use lucy_core::geometry::decode_surface_geometry_z_wkb;
-    use lucy_core::source::{SourceCatalog, VerticalCrsReference};
+    use lucy_core::geometry::NormalizedGeometry;
+    use lucy_core::mesh::{MeshFrame, TriangleMesh, footprint_fragment_to_extruded_mesh};
+    use lucy_core::source::SourceCatalog;
     use lucy_core::subtree::{
         generate_subtree_bytes_with_availability, pack_availability_bits, subtree_layout,
     };
@@ -1496,11 +1649,7 @@ mod tests {
         source.table = "surface_buildings_7415".to_string();
         source.srid = 7415;
         source.source_model = SourceModel::SurfaceGeometryZ;
-        source.vertical_reference = VerticalReference::Crs(VerticalCrsReference {
-            crs: "EPSG:7415".to_string(),
-            target: "EPSG:4979".to_string(),
-            operation: Some(VerticalTransform::Rdnaptrans2018Epsg1149),
-        });
+        source.coordinate_operation = Some(CoordinateOperation::Rdnaptrans2018Epsg1149);
         source.base_height_column = None;
         source.height_column = None;
         source.geometry_types = vec![GeometryType::PolygonZ, GeometryType::MultiPolygonZ];
@@ -1515,10 +1664,18 @@ mod tests {
         source
     }
 
+    fn footprint_feature_mesh(feature: &NormalizedFeature, frame: MeshFrame) -> TriangleMesh {
+        let NormalizedGeometry::GeographicFootprint(fragment) = &feature.geometry else {
+            panic!("expected normalized footprint feature")
+        };
+        footprint_fragment_to_extruded_mesh(fragment, frame, 0.0, 10.0)
+            .expect("normalized footprint fragment should mesh")
+    }
+
     #[test]
-    fn tile_wkb_query_uses_bound_bbox_values_clipping_and_limit() {
+    fn normalized_geometry_query_returns_clipped_caps_and_original_boundary_mask() {
         let source = fixture_source();
-        let plan = build_tile_wkb_query(&source).expect("query should build");
+        let plan = build_normalized_geometry_query(&source).expect("query should build");
 
         assert!(
             plan.sql
@@ -1529,7 +1686,20 @@ mod tests {
         assert!(plan.sql.contains("ST_Intersection(t.\"geom\", b.geom)"));
         assert!(plan.sql.contains("ST_CollectionExtract"));
         assert!(plan.sql.contains("ST_Area(clipped.geom) > 0"));
-        assert!(plan.sql.contains("ST_AsBinary(clipped.geom, 'NDR')"));
+        assert!(
+            plan.sql
+                .contains("ST_AsBinary(ST_Transform(clipped.geom, 4326), 'NDR')")
+        );
+        assert!(
+            plan.sql
+                .contains("ST_Intersection(ST_Boundary(t.\"geom\"), b.geom)")
+        );
+        assert!(plan.sql.contains("ST_CollectionExtract("));
+        assert!(plan.sql.contains(", 2)) AS geom) AS source_boundary"));
+        assert!(plan.sql.contains(
+            "ST_AsBinary(ST_Transform(source_boundary.geom, 4326), 'NDR') AS source_boundary_wkb"
+        ));
+        assert!(!plan.sql.contains("ST_Boundary(clipped.geom)"));
         assert!(plan.sql.contains("LIMIT $6"));
         assert!(!plan.sql.contains("-122.40130"));
         assert!(!plan.sql.contains("37.79245"));
@@ -1542,6 +1712,31 @@ mod tests {
                 "height_m",
                 "color"
             ]
+        );
+    }
+
+    #[test]
+    fn projected_footprint_query_normalizes_adapter_output_to_epsg_4326() {
+        let mut source = fixture_source();
+        source.srid = 28992;
+
+        let plan = build_normalized_geometry_query(&source).expect("query should build");
+
+        assert!(
+            plan.sql
+                .contains("ST_Transform(ST_MakeEnvelope($1, $2, $3, $4, 4326), $5::integer)")
+        );
+        assert!(
+            plan.sql
+                .contains("ST_AsBinary(ST_Transform(clipped.geom, 4326), 'NDR')")
+        );
+        assert!(
+            plan.sql
+                .contains("ST_AsBinary(ST_Transform(source_boundary.geom, 4326), 'NDR')")
+        );
+        assert!(
+            plan.sql
+                .contains("ST_Intersection(ST_Boundary(t.\"geom\"), b.geom)")
         );
     }
 
@@ -1565,7 +1760,7 @@ mod tests {
     #[test]
     fn surface_root_query_preserves_whole_features_and_uses_explicit_3d_transform() {
         let source = surface_source();
-        let plan = build_tile_wkb_query(&source).expect("surface query should build");
+        let plan = build_normalized_geometry_query(&source).expect("surface query should build");
 
         assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
         assert!(RDNAPTRANS2018_EPSG_1149_PIPELINE.contains("+proj=cart +ellps=GRS80"));
@@ -1582,23 +1777,22 @@ mod tests {
         assert!(!plan.sql.contains("ST_Intersects"));
         assert!(!plan.sql.contains("ST_Area"));
         assert!(!plan.sql.contains("ST_IsValid"));
+        assert!(plan.sql.contains("NULL::bytea AS source_boundary_wkb"));
+        assert!(!plan.sql.contains("ST_Boundary"));
         assert_eq!(plan.attributes, vec!["name", "color"]);
     }
 
     #[test]
-    fn already_normalized_surface_query_uses_explicit_identity_operation() {
+    fn already_normalized_surface_query_omits_database_transform() {
         let mut source = surface_source();
         source.srid = 4979;
-        source.vertical_reference = VerticalReference::Crs(VerticalCrsReference {
-            crs: "EPSG:4979".to_string(),
-            target: "EPSG:4979".to_string(),
-            operation: Some(VerticalTransform::Identity),
-        });
+        source.coordinate_operation = None;
 
-        let plan = build_tile_wkb_query(&source).expect("identity query should build");
+        let plan = build_normalized_geometry_query(&source).expect("identity query should build");
 
         assert_eq!(plan.bindings, QueryBindings::Standard);
         assert!(plan.sql.contains("ST_AsBinary(t.\"geom\", 'NDR')"));
+        assert!(plan.sql.contains("NULL::bytea AS source_boundary_wkb"));
         assert!(
             plan.sql
                 .contains("ST_MakeEnvelope($1, $2, $3, $4, $5::integer)")
@@ -1688,11 +1882,12 @@ mod tests {
     }
 
     #[test]
-    fn tile_wkb_query_rejects_unsafe_attribute_identifiers() {
+    fn normalized_geometry_query_rejects_unsafe_attribute_identifiers() {
         let mut source = fixture_source();
         source.attributes.push("name; DROP TABLE x".to_string());
 
-        let error = build_tile_wkb_query(&source).expect_err("unsafe attribute should fail");
+        let error =
+            build_normalized_geometry_query(&source).expect_err("unsafe attribute should fail");
         assert!(
             error.to_string().contains("attribute"),
             "unexpected error: {error}"
@@ -1700,13 +1895,13 @@ mod tests {
     }
 
     #[test]
-    fn tile_wkb_query_includes_configured_height_columns() {
+    fn normalized_geometry_query_includes_configured_height_columns() {
         let mut source = fixture_source();
         source.attributes = vec!["name".to_string()];
         source.base_height_column = Some("custom_base_m".to_string());
         source.height_column = Some("custom_height_m".to_string());
 
-        let plan = build_tile_wkb_query(&source).expect("query should build");
+        let plan = build_normalized_geometry_query(&source).expect("query should build");
 
         assert_eq!(
             plan.attributes,
@@ -1732,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and the PostGIS fixtures"]
-    async fn fixture_tile_query_clips_cross_boundary_features_and_rejects_overflow() {
+    async fn fixture_tile_query_omits_clip_walls_and_rejects_overflow() {
         let database_url = env::var("DATABASE_URL")
             .expect("DATABASE_URL is required for the ignored PostGIS integration test");
 
@@ -1758,15 +1953,18 @@ mod tests {
         assert_eq!(profile.srids, vec![4326]);
         assert_eq!(profile.geometry_types, vec!["MULTIPOLYGON"]);
         assert_eq!(profile.zm_flags, vec![0]);
-        let root_features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
+        let root_features = query_normalized_features(&client, &source, TileCoord::root())
             .await
             .expect("root tile should query");
         assert_eq!(root_features.len(), 6);
-        assert!(
-            root_features
-                .iter()
-                .all(|feature| !feature.geometry_wkb.is_empty())
-        );
+        assert!(root_features.iter().all(|feature| {
+            feature.encoded_size_bytes > 0
+                && matches!(
+                    &feature.geometry,
+                    NormalizedGeometry::GeographicFootprint(fragment)
+                        if !fragment.source_boundary.lines.is_empty()
+                )
+        }));
         assert_eq!(
             root_features[0]
                 .attributes
@@ -1987,6 +2185,7 @@ mod tests {
             empty_child.level, empty_child.x, empty_child.y
         );
         let empty = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(&empty_path)
@@ -1998,25 +2197,19 @@ mod tests {
         assert_eq!(empty.status(), StatusCode::NOT_FOUND);
 
         let empty_tile = TileCoord::new(2, 0, 3).expect("valid empty fixture tile");
-        let empty_features = query_tile_geometry_wkb(&client, &source, empty_tile)
+        let empty_features = query_normalized_features(&client, &source, empty_tile)
             .await
             .expect("empty tile should query");
         assert!(empty_features.is_empty());
 
-        let southwest = query_tile_geometry_wkb(
-            &client,
-            &source,
-            TileCoord::new(1, 0, 0).expect("southwest tile"),
-        )
-        .await
-        .expect("southwest tile should query");
-        let southeast = query_tile_geometry_wkb(
-            &client,
-            &source,
-            TileCoord::new(1, 1, 0).expect("southeast tile"),
-        )
-        .await
-        .expect("southeast tile should query");
+        let southwest_tile = TileCoord::new(1, 0, 0).expect("southwest tile");
+        let southeast_tile = TileCoord::new(1, 1, 0).expect("southeast tile");
+        let southwest = query_normalized_features(&client, &source, southwest_tile)
+            .await
+            .expect("southwest tile should query");
+        let southeast = query_normalized_features(&client, &source, southeast_tile)
+            .await
+            .expect("southeast tile should query");
         let west_fragment = southwest
             .iter()
             .find(|feature| feature.id == "2")
@@ -2025,7 +2218,138 @@ mod tests {
             .iter()
             .find(|feature| feature.id == "2")
             .expect("cross-boundary feature should have an east fragment");
-        assert_ne!(west_fragment.geometry_wkb, east_fragment.geometry_wkb);
+        assert_ne!(west_fragment.geometry, east_fragment.geometry);
+
+        let root_feature = root_features
+            .iter()
+            .find(|feature| feature.id == "2")
+            .expect("cross-boundary feature should exist in the root tile");
+        let root_frame = MeshFrame::from_tile_region(
+            TileCoord::root()
+                .geographic_region_degrees(&source.bounds)
+                .expect("root region"),
+        );
+        let root_mesh = footprint_feature_mesh(root_feature, root_frame);
+        assert_eq!(root_mesh.vertices.len(), 24);
+        assert_eq!(root_mesh.indices.len(), 36);
+
+        for (fragment, tile) in [
+            (west_fragment, southwest_tile),
+            (east_fragment, southeast_tile),
+        ] {
+            let frame = MeshFrame::from_tile_region(
+                tile.geographic_region_degrees(&source.bounds)
+                    .expect("level-one tile region"),
+            );
+            let mesh = footprint_feature_mesh(fragment, frame);
+            assert_eq!(mesh.vertices.len(), 20);
+            assert_eq!(mesh.indices.len(), 30);
+        }
+
+        let interior_tile = TileCoord::new(4, 7, 2).expect("feature-interior tile");
+        let interior_features = query_normalized_features(&client, &source, interior_tile)
+            .await
+            .expect("feature-interior tile should query");
+        assert_eq!(interior_features.len(), 1);
+        assert_eq!(interior_features[0].id, "2");
+        assert!(
+            matches!(
+                &interior_features[0].geometry,
+                NormalizedGeometry::GeographicFootprint(fragment)
+                    if fragment.source_boundary.lines.is_empty()
+            ),
+            "a tile wholly inside the feature must not gain clip-edge walls"
+        );
+        let interior_frame = MeshFrame::from_tile_region(
+            interior_tile
+                .geographic_region_degrees(&source.bounds)
+                .expect("feature-interior tile region"),
+        );
+        let interior_mesh = footprint_feature_mesh(&interior_features[0], interior_frame);
+        assert_eq!(interior_mesh.vertices.len(), 8);
+        assert_eq!(interior_mesh.indices.len(), 12);
+
+        let interior_content = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sources/poc_buildings/content/4/7/2.glb")
+                    .body(Body::empty())
+                    .expect("interior content request should build"),
+            )
+            .await
+            .expect("interior content request should route");
+        assert_eq!(interior_content.status(), StatusCode::OK);
+        let interior_body = to_bytes(interior_content.into_body(), usize::MAX)
+            .await
+            .expect("interior content body should read");
+        let interior_json_length =
+            u32::from_le_bytes(interior_body[12..16].try_into().expect("JSON length")) as usize;
+        let interior_document: serde_json::Value =
+            serde_json::from_slice(&interior_body[20..20 + interior_json_length])
+                .expect("interior content glTF JSON should parse");
+        let primitive = &interior_document["meshes"][0]["primitives"][0];
+        let position_accessor_index = primitive["attributes"]["POSITION"]
+            .as_u64()
+            .expect("position accessor") as usize;
+        let index_accessor_index = primitive["indices"].as_u64().expect("index accessor") as usize;
+        assert_eq!(
+            interior_document["accessors"][position_accessor_index]["count"],
+            8
+        );
+        assert_eq!(
+            interior_document["accessors"][index_accessor_index]["count"],
+            12
+        );
+        assert_eq!(
+            interior_document["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"],
+            1
+        );
+
+        client
+            .batch_execute(
+                "BEGIN; \
+                 CREATE TABLE public.poc_buildings_projected_adapter_test AS \
+                 SELECT id, name, building_type, base_height_m, height_m, color, \
+                        ST_Transform(geom, 3857) AS geom \
+                 FROM public.poc_buildings",
+            )
+            .await
+            .expect("create transaction-local projected fixture");
+        let mut projected_source = source.clone();
+        projected_source.table = "poc_buildings_projected_adapter_test".to_string();
+        projected_source.srid = 3857;
+        validate_source(&client, "projected_footprints", &projected_source)
+            .await
+            .expect("projected footprint source and transform should validate");
+        let projected_features =
+            query_normalized_features(&client, &projected_source, TileCoord::root())
+                .await
+                .expect("projected footprints should normalize to EPSG:4326");
+        assert_eq!(projected_features.len(), root_features.len());
+        assert!(projected_features.iter().all(|feature| {
+            const TOLERANCE_DEG: f64 = 1.0e-8;
+            let NormalizedGeometry::GeographicFootprint(fragment) = &feature.geometry else {
+                return false;
+            };
+            fragment.geometry.polygons().iter().all(|polygon| {
+                polygon.exterior.points.iter().all(|point| {
+                    source.bounds.west - TOLERANCE_DEG <= point.x
+                        && point.x <= source.bounds.east + TOLERANCE_DEG
+                        && source.bounds.south - TOLERANCE_DEG <= point.y
+                        && point.y <= source.bounds.north + TOLERANCE_DEG
+                })
+            })
+        }));
+        for feature in &projected_features {
+            let mesh = footprint_feature_mesh(feature, root_frame);
+            assert_eq!(mesh.vertices.len(), 24);
+            assert_eq!(mesh.indices.len(), 36);
+        }
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("drop transaction-local projected fixture");
 
         source.max_features_per_tile = 2;
         let limited_availability = query_subtree_availability(&client, &source, TileCoord::root())
@@ -2055,7 +2379,7 @@ mod tests {
             ]
         );
 
-        let error = query_tile_geometry_wkb(&client, &source, TileCoord::root())
+        let error = query_normalized_features(&client, &source, TileCoord::root())
             .await
             .expect_err("overflow must not return a truncated tile");
         assert!(matches!(
@@ -2119,13 +2443,14 @@ mod tests {
             .await
             .expect("server startup should fail-fast validate configured surface sources");
 
-        let features = query_tile_geometry_wkb(&client, &source, TileCoord::root())
+        let features = query_normalized_features(&client, &source, TileCoord::root())
             .await
             .expect("surface root tile should query");
         assert_eq!(features.len(), 2);
         for feature in &features {
-            let geometry = decode_surface_geometry_z_wkb(&feature.geometry_wkb)
-                .expect("query WKB should remain XYZ");
+            let NormalizedGeometry::GeodeticSurface(geometry) = &feature.geometry else {
+                panic!("surface adapter output should be normalized EPSG:4979 XYZ");
+            };
             assert!(geometry.polygons().iter().all(|polygon| {
                 polygon
                     .exterior
@@ -2137,7 +2462,7 @@ mod tests {
             assert!(!feature.attributes.contains_key("height_m"));
         }
 
-        let child_error = query_tile_geometry_wkb(
+        let child_error = query_normalized_features(
             &client,
             &source,
             TileCoord::new(1, 0, 0).expect("valid quadtree coordinate"),

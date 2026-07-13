@@ -107,10 +107,12 @@ maximum z: 100 m
 ## WKB-to-Mesh Assumptions
 
 Footprint mesh conversion accepts OGC/ISO WKB and PostGIS EWKB `Polygon` and
-`MultiPolygon` values from `ST_AsBinary`. It requires exactly XY coordinates;
-XYZ is rejected instead of silently losing Z. Polygon interior rings are
-triangulated and extruded. Points, lines, geometry collections, curves,
-measured coordinates, and solids remain unsupported.
+`MultiPolygon` values from `ST_AsBinary`. A second, adapter-internal XY
+`MultiLineString` carries the portions of the original feature boundary that
+remain inside the tile. Both decoders require exactly XY coordinates; XYZ is
+rejected instead of silently losing Z. Polygon interior rings are triangulated
+and extruded. General point, line, geometry-collection, curve, measured, and
+solid source models remain unsupported.
 
 The WKB coordinates are interpreted as EPSG:4326 `[longitude, latitude]`
 decimal degrees. For each content request, the mesh converts WGS 84 geodetic
@@ -131,13 +133,23 @@ then computes `ST_Intersection` with the tile envelope, extracts polygonal
 components, and discards empty or zero-area results. The resulting WKB is
 therefore contained by the tile's horizontal bounds.
 
+The adapter also intersects `ST_Boundary` of the original source feature with
+the tile envelope and returns the extracted linear components as an XY
+`MultiLineString`. Mesh generation uses the clipped polygon for the top and
+bottom caps, but creates side walls only where a clipped ring overlaps this
+original-boundary mask. Edges introduced solely by the tile envelope are not
+sealed. This is essential for translucent extrusions: refinement reconstructs
+one continuous outer shell instead of revealing an artificial wall at every
+quadtree cut.
+
 A building crossing a tile boundary produces one clipped fragment in each
 intersected tile. Every fragment retains the source feature id and attributes,
 and stable id ordering makes repeated requests deterministic. At a given level,
 the union of the fragments equals the source footprint within the configured
-bounds, so clipping creates neither visual gaps nor uncontrolled whole-feature
-duplication. Content availability uses this same positive-area intersection
-rule.
+bounds. Their caps meet at tile edges and their retained source-boundary walls
+form the same outer shell as the uncut feature, without uncontrolled
+whole-feature duplication. Content availability uses the same positive-area
+intersection rule and does not need to compute boundary masks.
 
 `max_features_per_tile` is an overflow threshold, not a truncation setting.
 Lucy asks PostGIS for at most one row beyond the threshold. If that extra row
@@ -255,7 +267,6 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:
@@ -300,9 +311,9 @@ unless explicitly listed as a retained Phase 0 constraint.
 | `schema`, `table` | Quoted after identifier validation and used to build the PostGIS tile query target. |
 | `geometry_column` | Quoted after identifier validation and used for bbox filtering, intersection tests, and `ST_AsBinary(..., 'NDR')`. |
 | `id_column` | Quoted after identifier validation, selected as the feature id, and used for stable ordering. |
-| `srid` | Bound into `ST_MakeEnvelope($1, $2, $3, $4, $5)`; Phase 0 validation still restricts this to `4326`. |
-| `source_model` | Validated as `extruded_footprint`; selects the footprint extrusion path. |
-| `vertical_reference` | Parsed and retained as source metadata; no alternate vertical reference behavior exists yet. |
+| `srid` | Declares and validates the PostGIS source geometry SRID. Tile envelopes are transformed into it; normalized footprint output is transformed back to EPSG:4326. |
+| `source_model` | Selects the adapter normalization and mesh strategy. `extruded_footprint` produces standard EPSG:4326 XY; `surface_geometry_z` produces standard EPSG:4979 XYZ. |
+| `coordinate_operation` | Optional only for native 3D surfaces. It selects an explicit supported source-to-EPSG:4979 pipeline; it is omitted for already-normalized EPSG:4979 and for footprints. |
 | `base_height_column` | If present, automatically selected by the PostGIS tile query and used as the extrusion base. Missing or NULL values default to `0.0`. |
 | `height_column` | Automatically selected by the PostGIS tile query and required as positive extrusion height input. |
 | `geometry_types` | Parsed and validated by config deserialization; runtime geometry compatibility is currently enforced by the WKB parser and P1.3 startup introspection. |
@@ -322,22 +333,24 @@ unless explicitly listed as a retained Phase 0 constraint.
 
 The following assumptions remain deliberate constraints:
 
-1. `extruded_footprint` accepts only SRID `4326`; other horizontal CRSs require
-   a future explicit transform contract.
+1. `extruded_footprint` accepts any positive SRID registered in the deployed
+   PostGIS `spatial_ref_sys` table and supported by PROJ. Query and clipping
+   stay in the source CRS; the adapter always returns EPSG:4326 XY.
 2. `min_level` must be `0`; generalizing the implicit root to a nonzero level is
    deferred. Populated non-root subtree roots are served at configured subtree
    boundaries.
 3. Geometry types are checked by source introspection and again by the WKB
    decoder; the footprint SQL still relies on configured table contents rather
    than adding a redundant type predicate to every tile request.
-4. `vertical_reference` has one effective behavior:
-   `local_ground_meters`.
+4. Extrusion columns are interpreted as local metres above the configured
+   region base. This is part of the footprint model and no longer repeated as
+   a separate `vertical_reference` setting.
 5. GLB output includes flat normals, material color, picking IDs, and STRING
    structural metadata. Textures and native numeric metadata column types
    remain deferred.
-6. Native-surface sources are eagerly introspected at startup because their CRS
-   grid contract must fail fast. The legacy footprint path retains request-time
-   database validation for compatibility with externally managed sources.
+6. Every source is introspected at startup. Footprint sources probe the
+   PostGIS source-SRID/4326 transform; native surfaces additionally validate
+   their explicit 3D grid contract and transformed extent.
 
 The reusable source introspector checks:
 

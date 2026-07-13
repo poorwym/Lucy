@@ -9,9 +9,12 @@ contracts are intentionally different.
 ### `extruded_footprint`
 
 `extruded_footprint` accepts two-dimensional `Polygon` and `MultiPolygon`
-footprints. Lucy clips the footprint to a requested tile in PostGIS and builds
-a volume from `base_height_column` plus the required `height_column`. Existing
-configuration remains compatible.
+footprints in any positive SRID registered in the deployed PostGIS
+`spatial_ref_sys` table and supported by PROJ. The adapter queries and clips in
+the source SRID, preserves the part of the original feature boundary inside
+each tile, transforms both results to EPSG:4326, and builds a volume from
+`base_height_column` plus the required `height_column`. Tile-cut edges divide
+the caps but do not become artificial extrusion walls.
 
 ### `surface_geometry_z`
 
@@ -31,10 +34,7 @@ surface_buildings_7415:
   id_column: id
   srid: 7415
   source_model: surface_geometry_z
-  vertical_reference:
-    crs: EPSG:7415
-    target: EPSG:4979
-    operation: rdnaptrans2018_epsg_1149
+  coordinate_operation: rdnaptrans2018_epsg_1149
   geometry_types:
     - PolygonZ
     - MultiPolygonZ
@@ -47,15 +47,47 @@ horizontal `PolygonZ` roof with an interior ring and one closed
 `MultiPolygonZ` shell containing a roof, floor, and four vertical faces. It is
 synthetic and deliberately small; no 3DBAG source geometry is copied into it.
 
+## Configuration Migration
+
+The adapter owns its standard target CRSs, so they are no longer repeated in
+source configuration. For footprints, remove
+`vertical_reference: local_ground_meters`; local extrusion metres are inherent
+in the model. For native EPSG:7415 surfaces, replace:
+
+```yaml
+vertical_reference:
+  crs: EPSG:7415
+  target: EPSG:4979
+  operation: rdnaptrans2018_epsg_1149
+```
+
+with:
+
+```yaml
+coordinate_operation: rdnaptrans2018_epsg_1149
+```
+
+The single `srid` field remains the declared database geometry SRID. Unknown
+legacy fields are rejected during configuration loading instead of being
+silently ignored.
+
 ## Coordinate and Bounds Contract
 
 EPSG:7415 combines Amersfoort / RD New horizontal coordinates with NAP height.
 NAP is a physical vertical datum and is not the ellipsoidal height expected by
 the WGS 84 three-dimensional target CRS.
 
-For `surface_geometry_z`, the PostGIS adapter returns
-`[longitude_degrees, latitude_degrees, ellipsoidal_height_m]` and tags it as
-EPSG:4979 before WKB reaches the core geometry layer. A missing vertical grid
+The PostGIS adapter is Lucy's coordinate-system boundary. It validates the
+declared source SRID, executes all database-side spatial work, decodes the
+returned WKB, and exposes one of two typed standard geometries:
+
+| Source model | Adapter output |
+| --- | --- |
+| `extruded_footprint` | EPSG:4326 clipped polygon XY plus original-boundary `MultiLineString` XY |
+| `surface_geometry_z` | EPSG:4979 longitude/latitude/ellipsoidal-height XYZ |
+
+Neither WKB nor source SRID crosses into content generation. `lucy-core` can
+therefore construct meshes without branching on a CRS. A missing vertical grid
 is an error; Lucy never passes an unchanged NAP value through as if it were
 ellipsoidal.
 
@@ -71,12 +103,13 @@ dynamic conversion would require a named WGS 84 realization and coordinate
 epoch as described by [PROJ's time-dependent transformation
 model](https://proj.org/en/stable/operations/time_dependent_transformations.html);
 neither can be inferred from XYZ WKB, so Lucy does not expose such a mode.
-Sources already stored as EPSG:4979 use `operation: identity` (or omit the
-operation, which defaults to identity for that source CRS). Other CRS/operation
-combinations are rejected instead of delegating an ambiguous 3D transform to
-`ST_Transform`.
+Sources already stored as EPSG:4979 omit `coordinate_operation`; identity is
+implicit only for that source SRID. Other 3D CRS/operation combinations are
+rejected instead of delegating an ambiguous vertical transform to
+`ST_Transform`. The target SRID is intentionally not configurable, so config
+cannot disagree with the geometry semantics expected by the core.
 
-`bounds` is always expressed in the target EPSG:4979 domain:
+`bounds` is always expressed in Lucy's standard geographic output domain:
 
 - `west` / `east`: longitude in degrees;
 - `south` / `north`: latitude in degrees;
@@ -129,7 +162,9 @@ contract, not an optional accuracy improvement.
 Startup validation checks the relation and required columns, non-null,
 non-empty, unique feature IDs, non-null/non-empty geometry, configured SRID,
 the actual geometry type profile, Z dimension, finite XYZ values, and
-transformation availability. For non-empty native-surface sources it also
+transformation availability. Footprints use a source-SRID/4326 round-trip
+probe; surfaces use their configured 3D operation. For non-empty
+native-surface sources validation also
 computes the transformed vertex extent and rejects configurations whose
 content would fall outside the advertised root EPSG:4979 region or height
 interval.
@@ -153,8 +188,12 @@ interior rings.
 
 ## Tile Ownership and Query Semantics
 
-Footprints retain the existing positive-area clipping semantics. Native
-surfaces do not.
+Footprints retain positive-area tile clipping. Their top and bottom caps use
+the clipped polygon, while side walls use only the intersection of the
+original feature boundary and the tile. A deep tile wholly inside a large
+feature therefore has caps but no side walls; neighboring fragments together
+reconstruct the feature without visible internal partitions. Native surfaces
+do not use two-dimensional clipping.
 
 Native surfaces currently use one explicit ownership rule: every complete
 feature belongs to the root tile, and a `surface_geometry_z` source must set

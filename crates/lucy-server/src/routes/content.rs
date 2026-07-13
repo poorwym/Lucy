@@ -7,13 +7,14 @@ use axum::response::Response;
 use tokio_postgres::NoTls;
 use tracing::{debug, error};
 
+use lucy_core::geometry::NormalizedGeometry;
 use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
-use lucy_core::mesh::{MeshFrame, wkb_footprint_to_extruded_mesh, wkb_surface_geometry_z_to_mesh};
-use lucy_core::source::{ConfigError, DEFAULT_BASE_HEIGHT_M, SourceConfig, SourceModel};
+use lucy_core::mesh::{MeshFrame, footprint_fragment_to_extruded_mesh, surface_geometry_z_to_mesh};
+use lucy_core::source::{ConfigError, DEFAULT_BASE_HEIGHT_M, SourceConfig};
 use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
-use crate::postgis::{TileFeatureWkb, TileQueryError, query_tile_geometry_wkb};
+use crate::postgis::{NormalizedFeature, TileQueryError, query_normalized_features};
 use crate::response::bytes_response;
 use crate::state::AppState;
 
@@ -76,10 +77,10 @@ async fn content_tile_response(
     });
 
     let started = Instant::now();
-    let features = query_tile_geometry_wkb(&client, source, tile).await?;
+    let features = query_normalized_features(&client, source, tile).await?;
     let wkb_bytes = features
         .iter()
-        .map(|feature| feature.geometry_wkb.len())
+        .map(|feature| feature.encoded_size_bytes)
         .sum::<usize>();
     debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
@@ -98,18 +99,19 @@ async fn content_tile_response(
     let mut content_features = Vec::with_capacity(features.len());
     let started = Instant::now();
     for feature in features {
-        let mesh = match source.source_model {
-            SourceModel::ExtrudedFootprint => {
+        let double_sided = matches!(&feature.geometry, NormalizedGeometry::GeodeticSurface(_));
+        let mesh = match &feature.geometry {
+            NormalizedGeometry::GeographicFootprint(fragment) => {
                 let (base_height_m, height_m) = feature_heights(source, &feature)?;
-                wkb_footprint_to_extruded_mesh(
-                    &feature.geometry_wkb,
+                footprint_fragment_to_extruded_mesh(
+                    fragment,
                     frame,
-                    base_height_m,
-                    height_m,
+                    f64::from(base_height_m),
+                    f64::from(height_m),
                 )
             }
-            SourceModel::SurfaceGeometryZ => {
-                wkb_surface_geometry_z_to_mesh(&feature.geometry_wkb, frame)
+            NormalizedGeometry::GeodeticSurface(geometry) => {
+                surface_geometry_z_to_mesh(geometry, frame)
             }
         }
         .map_err(|error| {
@@ -133,7 +135,7 @@ async fn content_tile_response(
             id: feature.id,
             mesh,
             base_color,
-            double_sided: source.source_model == SourceModel::SurfaceGeometryZ,
+            double_sided,
             properties,
         });
     }
@@ -176,7 +178,7 @@ fn content_mesh_placement(
 
 fn feature_base_color(
     source: &SourceConfig,
-    feature: &TileFeatureWkb,
+    feature: &NormalizedFeature,
 ) -> Result<[f32; 4], RouteError> {
     let Some(color_column) = source.material.color_column.as_deref() else {
         return Ok(source.material.default_base_color);
@@ -226,7 +228,7 @@ fn parse_hex_color(value: &str) -> Result<[f32; 4], &'static str> {
 
 fn feature_heights(
     source: &SourceConfig,
-    feature: &TileFeatureWkb,
+    feature: &NormalizedFeature,
 ) -> Result<(f32, f32), RouteError> {
     let base_height_m = match source.base_height_column_or_default() {
         Some(attribute) => {
@@ -242,7 +244,7 @@ fn feature_heights(
 }
 
 fn parse_required_feature_f32(
-    feature: &TileFeatureWkb,
+    feature: &NormalizedFeature,
     attribute: &str,
 ) -> Result<f32, RouteError> {
     parse_optional_feature_f32(feature, attribute)?.ok_or_else(|| {
@@ -254,7 +256,7 @@ fn parse_required_feature_f32(
 }
 
 fn parse_optional_feature_f32(
-    feature: &TileFeatureWkb,
+    feature: &NormalizedFeature,
     attribute: &str,
 ) -> Result<Option<f32>, RouteError> {
     let Some(value) = feature
@@ -277,7 +279,9 @@ fn parse_optional_feature_f32(
 mod tests {
     use std::collections::BTreeMap;
 
-    use lucy_core::geometry::{FootprintGeometry, Point2D, Polygon2D, Ring2D};
+    use lucy_core::geometry::{
+        FootprintFragment, FootprintGeometry, MultiLineString2D, Point2D, Polygon2D, Ring2D,
+    };
     use lucy_core::mesh::footprint_to_extruded_mesh;
     use lucy_core::source::SourceCatalog;
 
@@ -293,15 +297,23 @@ mod tests {
             .expect("poc source should exist")
     }
 
+    fn empty_footprint_geometry() -> NormalizedGeometry {
+        NormalizedGeometry::GeographicFootprint(FootprintFragment {
+            geometry: FootprintGeometry::MultiPolygon(Vec::new()),
+            source_boundary: MultiLineString2D { lines: Vec::new() },
+        })
+    }
+
     #[test]
     fn feature_heights_use_configured_column_names() {
         let mut source = fixture_source();
         source.base_height_column = Some("bottom_m".to_string());
         source.height_column = Some("height_delta_m".to_string());
 
-        let feature = TileFeatureWkb {
+        let feature = NormalizedFeature {
             id: "42".to_string(),
-            geometry_wkb: Vec::new(),
+            geometry: empty_footprint_geometry(),
+            encoded_size_bytes: 0,
             attributes: BTreeMap::from([
                 ("bottom_m".to_string(), Some("7.5".to_string())),
                 ("height_delta_m".to_string(), Some("12.25".to_string())),
@@ -320,9 +332,10 @@ mod tests {
         source.base_height_column = None;
         source.height_column = Some("height_delta_m".to_string());
 
-        let feature = TileFeatureWkb {
+        let feature = NormalizedFeature {
             id: "42".to_string(),
-            geometry_wkb: Vec::new(),
+            geometry: empty_footprint_geometry(),
+            encoded_size_bytes: 0,
             attributes: BTreeMap::from([("height_delta_m".to_string(), Some("12.25".to_string()))]),
         };
 
@@ -335,9 +348,10 @@ mod tests {
     #[test]
     fn feature_color_uses_configured_hex_and_optional_alpha() {
         let source = fixture_source();
-        let feature = TileFeatureWkb {
+        let feature = NormalizedFeature {
             id: "42".to_string(),
-            geometry_wkb: Vec::new(),
+            geometry: empty_footprint_geometry(),
+            encoded_size_bytes: 0,
             attributes: BTreeMap::from([("color".to_string(), Some("#80402080".to_string()))]),
         };
 
@@ -351,9 +365,10 @@ mod tests {
     #[test]
     fn feature_color_falls_back_to_configured_default() {
         let source = fixture_source();
-        let feature = TileFeatureWkb {
+        let feature = NormalizedFeature {
             id: "42".to_string(),
-            geometry_wkb: Vec::new(),
+            geometry: empty_footprint_geometry(),
+            encoded_size_bytes: 0,
             attributes: BTreeMap::from([("color".to_string(), None)]),
         };
 
@@ -366,9 +381,10 @@ mod tests {
     #[test]
     fn feature_color_rejects_malformed_source_values() {
         let source = fixture_source();
-        let feature = TileFeatureWkb {
+        let feature = NormalizedFeature {
             id: "42".to_string(),
-            geometry_wkb: Vec::new(),
+            geometry: empty_footprint_geometry(),
+            encoded_size_bytes: 0,
             attributes: BTreeMap::from([("color".to_string(), Some("orange".to_string()))]),
         };
 

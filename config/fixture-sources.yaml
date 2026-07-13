@@ -10,7 +10,6 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:
@@ -47,10 +46,7 @@ sources:
     id_column: id
     srid: 7415
     source_model: surface_geometry_z
-    vertical_reference:
-      crs: EPSG:7415
-      target: EPSG:4979
-      operation: rdnaptrans2018_epsg_1149
+    coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types:
       - PolygonZ
       - MultiPolygonZ

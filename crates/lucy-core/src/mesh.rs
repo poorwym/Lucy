@@ -1,8 +1,9 @@
 use std::fmt;
 
 use crate::geometry::{
-    FootprintGeometry, Point2D, Point3D, Polygon2D, Polygon3D, Ring2D, Ring3D, SurfaceGeometryZ,
-    WkbError, decode_footprint_wkb, decode_surface_geometry_z_wkb,
+    FootprintFragment, FootprintGeometry, MultiLineString2D, Point2D, Point3D, Polygon2D,
+    Polygon3D, Ring2D, Ring3D, SurfaceGeometryZ, WkbError, decode_footprint_wkb,
+    decode_surface_geometry_z_wkb,
 };
 use crate::source::SourceBounds;
 use crate::tile::GeographicRegionDegrees;
@@ -11,6 +12,7 @@ const WGS84_A: f64 = 6_378_137.0;
 const WGS84_F: f64 = 1.0 / 298.257_223_563;
 const MIN_CLOSED_RING_POINTS: usize = 4;
 const COORDINATE_EPSILON: f64 = 1.0e-12;
+const BOUNDARY_MATCH_EPSILON_DEG: f64 = 1.0e-9;
 const PROJECTED_EPSILON: f64 = 1.0e-9;
 const NORMAL_EPSILON: f64 = 1.0e-12;
 const MAX_TRIANGULATION_DEVIATION: f64 = 1.0e-8;
@@ -288,7 +290,7 @@ pub fn footprint_to_mesh(
     geometry: &FootprintGeometry,
     frame: MeshFrame,
 ) -> Result<TriangleMesh, MeshError> {
-    build_footprint_mesh(geometry, frame, None)
+    build_footprint_mesh(geometry, frame, None, None)
 }
 
 #[tracing::instrument(
@@ -322,6 +324,31 @@ pub fn footprint_to_extruded_mesh(
         geometry,
         frame,
         Some((base_height_m, base_height_m + extrusion_height_m)),
+        None,
+    )
+}
+
+/// Extrude a tile-clipped footprint without sealing the edges introduced by
+/// the tile clip itself.
+///
+/// The fragment's boundary mask contains only the portions of the original
+/// feature rings that survive inside the requested tile. Top and bottom caps
+/// are built from the clipped polygon, while side walls are emitted only where
+/// a clipped ring overlaps this boundary. Adjacent tile fragments therefore
+/// reconstruct one continuous feature surface instead of adding visible
+/// interior walls.
+pub fn footprint_fragment_to_extruded_mesh(
+    fragment: &FootprintFragment,
+    frame: MeshFrame,
+    base_height_m: f64,
+    extrusion_height_m: f64,
+) -> Result<TriangleMesh, MeshError> {
+    validate_extrusion_heights(base_height_m, extrusion_height_m)?;
+    build_footprint_mesh(
+        &fragment.geometry,
+        frame,
+        Some((base_height_m, base_height_m + extrusion_height_m)),
+        Some(&fragment.source_boundary),
     )
 }
 
@@ -374,6 +401,7 @@ fn build_footprint_mesh(
     geometry: &FootprintGeometry,
     frame: MeshFrame,
     extrusion: Option<(f64, f64)>,
+    source_boundary: Option<&MultiLineString2D>,
 ) -> Result<TriangleMesh, MeshError> {
     if geometry.polygons().is_empty() {
         return Err(MeshError::EmptyGeometry);
@@ -389,6 +417,7 @@ fn build_footprint_mesh(
                 base_height_m,
                 top_height_m,
                 polygon_index,
+                source_boundary,
             )?,
             None => append_footprint_cap(&mut mesh, polygon, frame, 0.0, polygon_index)?,
         }
@@ -425,6 +454,7 @@ fn append_extruded_polygon(
     base_height_m: f64,
     top_height_m: f64,
     polygon_index: usize,
+    source_boundary: Option<&MultiLineString2D>,
 ) -> Result<(), MeshError> {
     let prepared = prepare_footprint_polygon(polygon, frame, polygon_index)?;
     let triangles = triangulate_rings(&prepared.projected_rings, polygon_index)?;
@@ -441,33 +471,135 @@ fn append_extruded_polygon(
         polygon_index,
     )?;
 
-    let mut flattened_offset = 0;
     for (ring_index, ring) in prepared.source_rings.iter().enumerate() {
         for edge_start in 0..ring.len() {
             let edge_end = (edge_start + 1) % ring.len();
-            let bottom_start = bottom_positions[flattened_offset + edge_start];
-            let bottom_end = bottom_positions[flattened_offset + edge_end];
-            let top_end = top_positions[flattened_offset + edge_end];
-            let top_start = top_positions[flattened_offset + edge_start];
-            let normal = normalize3(cross3(
-                sub3(bottom_end, bottom_start),
-                sub3(top_start, bottom_start),
-            ))
-            .ok_or(MeshError::DegenerateEdge {
-                polygon_index,
-                ring_index,
-                edge_index: edge_start,
-            })?;
-            append_quad(
-                mesh,
-                [bottom_start, bottom_end, top_end, top_start],
-                normal,
-                polygon_index,
-            )?;
+            let source_start = ring[edge_start];
+            let source_end = ring[edge_end];
+            let intervals = match source_boundary {
+                Some(boundary) => source_boundary_overlap(source_start, source_end, boundary),
+                None => vec![(0.0, 1.0)],
+            };
+
+            for (start_t, end_t) in intervals {
+                let segment_start = interpolate_point2(source_start, source_end, start_t);
+                let segment_end = interpolate_point2(source_start, source_end, end_t);
+                append_extruded_sidewall(
+                    mesh,
+                    segment_start,
+                    segment_end,
+                    frame,
+                    base_height_m,
+                    top_height_m,
+                    polygon_index,
+                    ring_index,
+                    edge_start,
+                )?;
+            }
         }
-        flattened_offset += ring.len();
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_extruded_sidewall(
+    mesh: &mut TriangleMesh,
+    source_start: Point2D,
+    source_end: Point2D,
+    frame: MeshFrame,
+    base_height_m: f64,
+    top_height_m: f64,
+    polygon_index: usize,
+    ring_index: usize,
+    edge_index: usize,
+) -> Result<(), MeshError> {
+    let bottom_start = frame.project_local_height(source_start.x, source_start.y, base_height_m)?;
+    let bottom_end = frame.project_local_height(source_end.x, source_end.y, base_height_m)?;
+    let top_end = frame.project_local_height(source_end.x, source_end.y, top_height_m)?;
+    let top_start = frame.project_local_height(source_start.x, source_start.y, top_height_m)?;
+    let normal = normalize3(cross3(
+        sub3(bottom_end, bottom_start),
+        sub3(top_start, bottom_start),
+    ))
+    .ok_or(MeshError::DegenerateEdge {
+        polygon_index,
+        ring_index,
+        edge_index,
+    })?;
+    append_quad(
+        mesh,
+        [bottom_start, bottom_end, top_end, top_start],
+        normal,
+        polygon_index,
+    )
+}
+
+fn source_boundary_overlap(
+    edge_start: Point2D,
+    edge_end: Point2D,
+    source_boundary: &MultiLineString2D,
+) -> Vec<(f64, f64)> {
+    let edge = [edge_end.x - edge_start.x, edge_end.y - edge_start.y];
+    let edge_length_squared = dot2(edge, edge);
+    if edge_length_squared <= COORDINATE_EPSILON * COORDINATE_EPSILON {
+        return Vec::new();
+    }
+    let edge_length = edge_length_squared.sqrt();
+    let parameter_epsilon = (BOUNDARY_MATCH_EPSILON_DEG / edge_length).min(0.25);
+    let mut intervals = Vec::new();
+
+    for line in &source_boundary.lines {
+        for segment in line.points.windows(2) {
+            let boundary_start = segment[0];
+            let boundary_end = segment[1];
+            let start_delta = [
+                boundary_start.x - edge_start.x,
+                boundary_start.y - edge_start.y,
+            ];
+            let end_delta = [boundary_end.x - edge_start.x, boundary_end.y - edge_start.y];
+            if cross2_vectors(edge, start_delta).abs() / edge_length > BOUNDARY_MATCH_EPSILON_DEG
+                || cross2_vectors(edge, end_delta).abs() / edge_length > BOUNDARY_MATCH_EPSILON_DEG
+            {
+                continue;
+            }
+
+            let start_t = dot2(start_delta, edge) / edge_length_squared;
+            let end_t = dot2(end_delta, edge) / edge_length_squared;
+            let overlap_start = start_t.min(end_t).max(0.0);
+            let overlap_end = start_t.max(end_t).min(1.0);
+            if overlap_end - overlap_start > parameter_epsilon {
+                intervals.push((overlap_start, overlap_end));
+            }
+        }
+    }
+
+    intervals.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end + parameter_epsilon
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn interpolate_point2(start: Point2D, end: Point2D, parameter: f64) -> Point2D {
+    Point2D {
+        x: start.x + (end.x - start.x) * parameter,
+        y: start.y + (end.y - start.y) * parameter,
+    }
+}
+
+fn dot2(left: [f64; 2], right: [f64; 2]) -> f64 {
+    left[0] * right[0] + left[1] * right[1]
+}
+
+fn cross2_vectors(left: [f64; 2], right: [f64; 2]) -> f64 {
+    left[0] * right[1] - left[1] * right[0]
 }
 
 fn append_surface_polygon(
@@ -1353,7 +1485,7 @@ impl From<WkbError> for MeshError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{Polygon3D, Ring3D};
+    use crate::geometry::{LineString2D, Polygon3D, Ring3D};
     use crate::tile::TileCoord;
 
     fn fixture_bounds() -> SourceBounds {
@@ -1570,6 +1702,166 @@ mod tests {
             mesh.vertices[16..]
                 .iter()
                 .all(|vertex| vertex.normal[2].abs() < 0.01)
+        );
+    }
+
+    #[test]
+    fn footprint_fragment_boundary_mask_preserves_hole_walls() {
+        let exterior = square2(5.001, 50.001, 0.006);
+        let interior = square2(5.003, 50.003, 0.002);
+        let fragment = FootprintFragment {
+            geometry: FootprintGeometry::Polygon(Polygon2D {
+                exterior: exterior.clone(),
+                interiors: vec![interior.clone()],
+            }),
+            source_boundary: MultiLineString2D {
+                lines: vec![
+                    LineString2D {
+                        points: exterior.points,
+                    },
+                    LineString2D {
+                        points: interior.points,
+                    },
+                ],
+            },
+        };
+
+        let mesh = footprint_fragment_to_extruded_mesh(&fragment, fixture_frame(), 2.0, 8.0)
+            .expect("boundary-aware extrusion should retain exterior and hole walls");
+
+        assert_eq!(mesh.vertices.len(), 48);
+        assert_eq!(mesh.indices.len(), 96);
+        assert_unit_normals(&mesh);
+    }
+
+    #[test]
+    fn clipped_footprint_does_not_seal_artificial_tile_edges() {
+        let west = 5.001;
+        let south = 50.001;
+        let east_clip = 5.004;
+        let north = 50.006;
+        let geometry = FootprintGeometry::Polygon(Polygon2D {
+            exterior: ring2(&[
+                (west, south),
+                (east_clip, south),
+                (east_clip, north),
+                (west, north),
+                (west, south),
+            ]),
+            interiors: Vec::new(),
+        });
+        let source_boundary = MultiLineString2D {
+            lines: vec![
+                LineString2D {
+                    points: vec![
+                        Point2D { x: west, y: south },
+                        Point2D {
+                            x: east_clip,
+                            y: south,
+                        },
+                    ],
+                },
+                LineString2D {
+                    points: vec![Point2D { x: west, y: north }, Point2D { x: west, y: south }],
+                },
+                LineString2D {
+                    points: vec![
+                        Point2D {
+                            x: east_clip,
+                            y: north,
+                        },
+                        Point2D { x: west, y: north },
+                    ],
+                },
+            ],
+        };
+        let fragment = FootprintFragment {
+            geometry,
+            source_boundary,
+        };
+
+        let mesh = footprint_fragment_to_extruded_mesh(&fragment, fixture_frame(), 2.0, 8.0)
+            .expect("clipped footprint should extrude only its source boundary");
+
+        // Two four-vertex caps plus three four-vertex walls. A fourth wall on
+        // the east clip edge would reproduce the visible subdivision bug.
+        assert_eq!(mesh.vertices.len(), 20);
+        assert_eq!(mesh.indices.len(), 30);
+        assert_unit_normals(&mesh);
+        assert!(
+            mesh.vertices[8..]
+                .iter()
+                .all(|vertex| vertex.normal[0] < 0.99),
+            "the artificial east-facing tile wall must not be emitted"
+        );
+    }
+
+    #[test]
+    fn interior_clipped_fragment_emits_caps_without_sidewalls() {
+        let geometry = FootprintGeometry::Polygon(Polygon2D {
+            exterior: square2(5.001, 50.001, 0.003),
+            interiors: Vec::new(),
+        });
+        let source_boundary = MultiLineString2D { lines: Vec::new() };
+        let fragment = FootprintFragment {
+            geometry,
+            source_boundary,
+        };
+
+        let mesh = footprint_fragment_to_extruded_mesh(&fragment, fixture_frame(), 2.0, 8.0)
+            .expect("an interior fragment should keep its top and bottom caps");
+
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len(), 12);
+        assert_unit_normals(&mesh);
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| vertex.normal[2].abs() > 0.99)
+        );
+    }
+
+    #[test]
+    fn unclipped_fragment_keeps_the_complete_extrusion_shell() {
+        let west = 5.001;
+        let south = 50.001;
+        let east = 5.004;
+        let north = 50.004;
+        let closed_ring = vec![
+            Point2D { x: west, y: south },
+            Point2D { x: east, y: south },
+            Point2D { x: east, y: north },
+            Point2D { x: west, y: north },
+            Point2D { x: west, y: south },
+        ];
+        let geometry = FootprintGeometry::Polygon(Polygon2D {
+            exterior: Ring2D {
+                points: closed_ring.clone(),
+            },
+            interiors: Vec::new(),
+        });
+        let source_boundary = MultiLineString2D {
+            lines: vec![LineString2D {
+                points: closed_ring,
+            }],
+        };
+        let fragment = FootprintFragment {
+            geometry,
+            source_boundary,
+        };
+
+        let mesh = footprint_fragment_to_extruded_mesh(&fragment, fixture_frame(), 2.0, 8.0)
+            .expect("an unclipped fragment should retain every source wall");
+
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(mesh.indices.len(), 36);
+        assert_unit_normals(&mesh);
+        assert_eq!(
+            mesh.vertices
+                .iter()
+                .filter(|vertex| vertex.normal[2].abs() < 0.01)
+                .count(),
+            16
         );
     }
 

@@ -8,7 +8,6 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: base_height_m # Zero if this field is not present in the source table
     height_column: height_m
     geometry_types:
@@ -45,7 +44,6 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
-    vertical_reference: local_ground_meters
     base_height_column: base_height_m # Zero if this field is not present in the source table
     height_column: height_m
     geometry_types:

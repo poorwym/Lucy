@@ -8,7 +8,9 @@ const searchParams = new URLSearchParams(window.location.search);
 const TILESET_URL =
   searchParams.get("tileset") ??
   import.meta.env.VITE_TILESET_URL ??
-  "/sources/surface_buildings_7415/tileset.json";
+  // "/tileset.json";
+  // "/sources/surface_buildings_7415/tileset.json";
+  "/sources/controlled_airspace/tileset.json";
 
 // const numberParam = (name: string, fallback: number) => {
 //   const raw = searchParams.get(name);
@@ -65,30 +67,8 @@ function App() {
         }
 
         viewer.scene.primitives.add(tileset);
-        //
-        // # Target EPSG:4979 region and ellipsoidal heights. The explicit operation
-        // # includes the EPSG:1149 ETRS89-to-WGS84 zero-translation approximation.
-        // bounds:
-        //   west: 5.84970
-        //   south: 50.83985
-        //   east: 5.85071
-        //   north: 50.84021
-        //   min_height_m: 170.0
-        //   max_height_m: 201.0
 
-        viewer.camera.flyTo({
-          destination: Cesium.Rectangle.fromDegrees(
-            5.8497,
-            50.83985,
-            5.85071,
-            50.84021,
-          ),
-          orientation: {
-            heading: 0,
-            pitch: Cesium.Math.toRadians(-60),
-            roll: 0,
-          },
-        });
+        viewer.flyTo(tileset);
 
         // tileset.debugShowBoundingVolume = true;
         // tileset.style = new Cesium.Cesium3DTileStyle({
