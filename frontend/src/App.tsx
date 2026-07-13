@@ -10,7 +10,8 @@ const TILESET_URL =
   import.meta.env.VITE_TILESET_URL ??
   // "/tileset.json";
   // "/sources/surface_buildings_7415/tileset.json";
-  "/sources/controlled_airspace/tileset.json";
+  // "/sources/controlled_airspace/tileset.json";
+  "/sources/nl_lod12_3d/tileset.json";
 
 // const numberParam = (name: string, fallback: number) => {
 //   const raw = searchParams.get(name);

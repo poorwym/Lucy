@@ -2,11 +2,13 @@ use std::env;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use lucy_core::source::{DEFAULT_CONFIG_PATH, SourceModel};
+use lucy_core::source::{DEFAULT_CONFIG_PATH, SourceModel, StartupValidation};
 use lucy_core::subtree::{generate_root_subtree_bytes, generate_root_subtree_json};
 use lucy_core::tile::TileCoord;
 use lucy_core::tileset::{TilesetOptions, generate_tileset_json};
-use lucy_server::{DEFAULT_ADDR, load_source_catalog, run_server};
+use lucy_server::{
+    DEFAULT_ADDR, load_source_catalog, run_server, validate_catalog_sources_with_mode,
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -33,6 +35,48 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 error!(error = %error, "server stopped with an error");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if first_arg.as_deref() == Some("validate") {
+        let config_path = args
+            .next()
+            .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+        let source_id = args.next();
+        if let Some(unexpected) = args.next() {
+            error!(argument = %unexpected, "unexpected validate argument");
+            return ExitCode::FAILURE;
+        }
+        let catalog = match load_source_catalog(&config_path) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                error!(error = %error, config_path, "failed to load source catalog");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match validate_catalog_sources_with_mode(
+            &catalog,
+            StartupValidation::Full,
+            source_id.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                println!(
+                    "Fully validated {} source(s) from {}",
+                    if source_id.is_some() {
+                        1
+                    } else {
+                        catalog.sources.len()
+                    },
+                    config_path
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(error = %error, config_path, ?source_id, "source validation failed");
                 ExitCode::FAILURE
             }
         };

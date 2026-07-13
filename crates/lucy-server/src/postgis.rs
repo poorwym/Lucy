@@ -333,17 +333,7 @@ pub async fn query_subtree_availability(
     subtree_root: TileCoord,
 ) -> Result<SubtreeAvailabilityBits, TileQueryError> {
     let layout = subtree_layout(source, subtree_root)?;
-    let mut slots = Vec::new();
-    for (index, tile) in layout.local_tiles.iter().copied().enumerate() {
-        if let Some(tile) = tile {
-            slots.push(SubtreeQuerySlot::Tile { index, tile });
-        }
-    }
-    for (index, tile) in layout.child_roots.iter().copied().enumerate() {
-        if let Some(tile) = tile {
-            slots.push(SubtreeQuerySlot::ChildSubtree { index, tile });
-        }
-    }
+    let slots = subtree_query_slots(source, &layout);
 
     let mut west = Vec::with_capacity(slots.len());
     let mut south = Vec::with_capacity(slots.len());
@@ -373,7 +363,14 @@ pub async fn query_subtree_availability(
     }
 
     let plan = build_subtree_occupancy_query(source)?;
-    let query_limit = i64::from(source.max_features_per_tile) + 1;
+    let query_limit = slots
+        .iter()
+        .map(|slot| subtree_slot_feature_count_target(source, *slot))
+        .max()
+        .and_then(|target| i64::try_from(target).ok())
+        .ok_or_else(|| {
+            ConfigError::Validation("subtree query must contain at least one slot".to_string())
+        })?;
     let started = Instant::now();
     let rows = match plan.bindings {
         QueryBindings::Standard => {
@@ -434,6 +431,23 @@ pub async fn query_subtree_availability(
     }
 
     availability_from_feature_counts(source, subtree_root, &layout, &slots, &feature_counts)
+}
+
+fn subtree_query_slots(source: &SourceConfig, layout: &SubtreeLayout) -> Vec<SubtreeQuerySlot> {
+    let mut slots = Vec::new();
+    for (index, tile) in layout.local_tiles.iter().copied().enumerate() {
+        if let Some(tile) = tile
+            && tile.level >= source.tileset.content_start_level
+        {
+            slots.push(SubtreeQuerySlot::Tile { index, tile });
+        }
+    }
+    for (index, tile) in layout.child_roots.iter().copied().enumerate() {
+        if let Some(tile) = tile {
+            slots.push(SubtreeQuerySlot::ChildSubtree { index, tile });
+        }
+    }
+    slots
 }
 
 fn availability_from_feature_counts(
@@ -542,92 +556,335 @@ async fn query_surface_subtree_availability(
     east: &[f64],
     north: &[f64],
 ) -> Result<SubtreeAvailabilityBits, TileQueryError> {
-    let plan = build_surface_subtree_candidates_query(source)?;
+    let feature_count_targets = slots
+        .iter()
+        .map(|slot| subtree_slot_feature_count_target(source, *slot))
+        .collect::<Vec<_>>();
+    let mut feature_counts = vec![0_u64; slots.len()];
+
+    let boolean_slots = feature_count_targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &target)| (target == 1).then_some(index))
+        .collect::<Vec<_>>();
+    let counted_slots = feature_count_targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &target)| (target > 1).then_some(index))
+        .collect::<Vec<_>>();
+
+    populate_surface_subtree_slot_counts(
+        client,
+        source,
+        slots,
+        west,
+        south,
+        east,
+        north,
+        &feature_count_targets,
+        &boolean_slots,
+        1,
+        &mut feature_counts,
+    )
+    .await?;
+    let exact_counted_slots = populate_surface_subtree_contained_counts(
+        client,
+        source,
+        west,
+        south,
+        east,
+        north,
+        &counted_slots,
+        &mut feature_counts,
+    )
+    .await?;
+    populate_surface_subtree_slot_counts(
+        client,
+        source,
+        slots,
+        west,
+        south,
+        east,
+        north,
+        &feature_count_targets,
+        &exact_counted_slots,
+        128,
+        &mut feature_counts,
+    )
+    .await?;
+
+    availability_from_feature_counts(source, subtree_root, layout, slots, &feature_counts)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn populate_surface_subtree_contained_counts(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    west: &[f64],
+    south: &[f64],
+    east: &[f64],
+    north: &[f64],
+    slot_indices: &[usize],
+    feature_counts: &mut [u64],
+) -> Result<Vec<usize>, TileQueryError> {
+    if slot_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plan = build_surface_subtree_count_query(source)?;
+    let batch_west = slot_indices
+        .iter()
+        .map(|&slot_index| west[slot_index])
+        .collect::<Vec<_>>();
+    let batch_south = slot_indices
+        .iter()
+        .map(|&slot_index| south[slot_index])
+        .collect::<Vec<_>>();
+    let batch_east = slot_indices
+        .iter()
+        .map(|&slot_index| east[slot_index])
+        .collect::<Vec<_>>();
+    let batch_north = slot_indices
+        .iter()
+        .map(|&slot_index| north[slot_index])
+        .collect::<Vec<_>>();
+    let query_limit = i64::from(source.max_features_per_tile) + 1;
     let started = Instant::now();
     let rows = match plan.bindings {
         QueryBindings::Standard => {
-            let params: [&(dyn ToSql + Sync); 5] = [&west, &south, &east, &north, &source.srid];
-            client.query_raw(&plan.sql, params).await
+            client
+                .query(
+                    &plan.sql,
+                    &[
+                        &batch_west,
+                        &batch_south,
+                        &batch_east,
+                        &batch_north,
+                        &source.srid,
+                        &query_limit,
+                    ],
+                )
+                .await
         }
         QueryBindings::Rdnaptrans2018Epsg1149 => {
-            let params: [&(dyn ToSql + Sync); 6] = [
-                &west,
-                &south,
-                &east,
-                &north,
-                &source.srid,
-                &RDNAPTRANS2018_EPSG_1149_PIPELINE,
-            ];
-            client.query_raw(&plan.sql, params).await
+            client
+                .query(
+                    &plan.sql,
+                    &[
+                        &batch_west,
+                        &batch_south,
+                        &batch_east,
+                        &batch_north,
+                        &source.srid,
+                        &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+                        &query_limit,
+                    ],
+                )
+                .await
         }
     }
     .map_err(|source_error| plan.map_query_error(source, source_error))?;
-    tokio::pin!(rows);
 
-    let source_frame = MeshFrame::from_source_bounds(&source.bounds);
-    let capped_count = u64::from(source.max_features_per_tile) + 1;
-    let mut feature_counts = vec![0_u64; slots.len()];
-    let mut candidate_feature_count = 0_usize;
-    while let Some(row) = rows
-        .try_next()
-        .await
-        .map_err(|error| plan.map_query_error(source, error))?
-    {
-        candidate_feature_count += 1;
-        let feature_id = row.try_get::<_, String>(0)?;
-        let geometry_wkb = row.try_get::<_, Vec<u8>>(1)?;
-        let matched_slots = row.try_get::<_, Vec<i64>>(2)?;
-        let geometry = decode_surface_geometry_z_wkb(&geometry_wkb).map_err(|error| {
-            TileQueryError::SourceContract(format!(
-                "feature {feature_id} did not match the adapter's normalized geometry contract: {error}"
+    if rows.len() != slot_indices.len() {
+        return Err(ConfigError::Validation(format!(
+            "PostGIS returned {} native-surface count rows for {} slots",
+            rows.len(),
+            slot_indices.len()
+        ))
+        .into());
+    }
+    let mut exact_counted_slots = Vec::new();
+    for row in rows {
+        let batch_slot_index = usize::try_from(row.try_get::<_, i64>(0)?).map_err(|_| {
+            ConfigError::Validation(
+                "PostGIS returned a negative native-surface count slot".to_string(),
+            )
+        })?;
+        let original_slot_index = *slot_indices.get(batch_slot_index).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "PostGIS returned out-of-range native-surface count slot {batch_slot_index}"
             ))
         })?;
-        let prepared = prepare_surface_geometry_z(&geometry, source_frame).map_err(|error| {
-            TileQueryError::SourceContract(format!(
-                "feature {feature_id} could not be prepared for subtree availability: {error}"
-            ))
+        let contained_count = u64::try_from(row.try_get::<_, i64>(1)?).map_err(|_| {
+            ConfigError::Validation(
+                "PostGIS returned a negative native-surface feature count".to_string(),
+            )
         })?;
-
-        for raw_slot_index in matched_slots {
-            let slot_index = usize::try_from(raw_slot_index).map_err(|_| {
-                ConfigError::Validation(
-                    "PostGIS returned a negative native-surface subtree slot".to_string(),
-                )
-            })?;
-            let slot = slots.get(slot_index).ok_or_else(|| {
-                ConfigError::Validation(format!(
-                    "PostGIS returned out-of-range native-surface subtree slot {slot_index}"
-                ))
-            })?;
-            if feature_counts[slot_index] >= capped_count {
-                continue;
-            }
-
-            let clip = surface_tile_clip(source, slot.tile())?;
-            let has_fragment = prepared.has_tile_content(clip).map_err(|error| {
-                TileQueryError::SourceContract(format!(
-                    "feature {feature_id} could not be clipped for subtree availability: {error}"
-                ))
-            })?;
-            if has_fragment {
-                feature_counts[slot_index] += 1;
-            }
+        if contained_count > u64::from(source.max_features_per_tile) {
+            feature_counts[original_slot_index] = contained_count;
+        } else {
+            feature_counts[original_slot_index] = 0;
+            exact_counted_slots.push(original_slot_index);
         }
     }
     tracing::debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        query_slot_count = slots.len(),
-        candidate_feature_count,
-        "PostGIS native-surface subtree candidates streamed"
+        query_slot_count = slot_indices.len(),
+        exact_fallback_slot_count = exact_counted_slots.len(),
+        "PostGIS native-surface subtree contained-feature lower bounds counted"
     );
+    Ok(exact_counted_slots)
+}
 
-    availability_from_feature_counts(source, subtree_root, layout, slots, &feature_counts)
+#[allow(clippy::too_many_arguments)]
+async fn populate_surface_subtree_slot_counts(
+    client: &impl GenericClient,
+    source: &SourceConfig,
+    slots: &[SubtreeQuerySlot],
+    west: &[f64],
+    south: &[f64],
+    east: &[f64],
+    north: &[f64],
+    feature_count_targets: &[u64],
+    slot_indices: &[usize],
+    candidate_batch_size: usize,
+    feature_counts: &mut [u64],
+) -> Result<(), TileQueryError> {
+    if slot_indices.is_empty() {
+        return Ok(());
+    }
+    let plan = build_surface_subtree_boolean_candidates_query(source)?;
+    let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+    let mut unresolved_slots = slot_indices.to_vec();
+    let mut candidate_offset = 0_i64;
+    let candidate_limit = i64::try_from(candidate_batch_size).expect("batch size fits i64");
+    let mut candidate_feature_count = 0_usize;
+    let mut query_batch_count = 0_usize;
+    let started = Instant::now();
+
+    while !unresolved_slots.is_empty() {
+        let batch_west = unresolved_slots
+            .iter()
+            .map(|&slot_index| west[slot_index])
+            .collect::<Vec<_>>();
+        let batch_south = unresolved_slots
+            .iter()
+            .map(|&slot_index| south[slot_index])
+            .collect::<Vec<_>>();
+        let batch_east = unresolved_slots
+            .iter()
+            .map(|&slot_index| east[slot_index])
+            .collect::<Vec<_>>();
+        let batch_north = unresolved_slots
+            .iter()
+            .map(|&slot_index| north[slot_index])
+            .collect::<Vec<_>>();
+        let rows = match plan.bindings {
+            QueryBindings::Standard => {
+                client
+                    .query(
+                        &plan.sql,
+                        &[
+                            &batch_west,
+                            &batch_south,
+                            &batch_east,
+                            &batch_north,
+                            &source.srid,
+                            &candidate_limit,
+                            &candidate_offset,
+                        ],
+                    )
+                    .await
+            }
+            QueryBindings::Rdnaptrans2018Epsg1149 => {
+                client
+                    .query(
+                        &plan.sql,
+                        &[
+                            &batch_west,
+                            &batch_south,
+                            &batch_east,
+                            &batch_north,
+                            &source.srid,
+                            &RDNAPTRANS2018_EPSG_1149_PIPELINE,
+                            &candidate_limit,
+                            &candidate_offset,
+                        ],
+                    )
+                    .await
+            }
+        }
+        .map_err(|source_error| plan.map_query_error(source, source_error))?;
+        query_batch_count += 1;
+
+        let mut returned_counts = vec![0_usize; unresolved_slots.len()];
+        for row in rows {
+            candidate_feature_count += 1;
+            let batch_slot_index = usize::try_from(row.try_get::<_, i64>(0)?).map_err(|_| {
+                ConfigError::Validation(
+                    "PostGIS returned a negative boolean subtree slot".to_string(),
+                )
+            })?;
+            let original_slot_index = *unresolved_slots.get(batch_slot_index).ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "PostGIS returned out-of-range boolean subtree slot {batch_slot_index}"
+                ))
+            })?;
+            returned_counts[batch_slot_index] += 1;
+            if feature_counts[original_slot_index] >= feature_count_targets[original_slot_index] {
+                continue;
+            }
+
+            let feature_id = row.try_get::<_, String>(1)?;
+            let geometry_wkb = row.try_get::<_, Vec<u8>>(2)?;
+            let geometry = decode_surface_geometry_z_wkb(&geometry_wkb).map_err(|error| {
+                TileQueryError::SourceContract(format!(
+                    "feature {feature_id} did not match the adapter's normalized geometry contract: {error}"
+                ))
+            })?;
+            let prepared = prepare_surface_geometry_z(&geometry, source_frame).map_err(|error| {
+                TileQueryError::SourceContract(format!(
+                    "feature {feature_id} could not be prepared for subtree availability: {error}"
+                ))
+            })?;
+            let clip = surface_tile_clip(source, slots[original_slot_index].tile())?;
+            if prepared.has_tile_content(clip).map_err(|error| {
+                TileQueryError::SourceContract(format!(
+                    "feature {feature_id} could not be clipped for subtree availability: {error}"
+                ))
+            })? {
+                feature_counts[original_slot_index] += 1;
+            }
+        }
+
+        unresolved_slots = unresolved_slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(batch_slot_index, original_slot_index)| {
+                (feature_counts[original_slot_index] < feature_count_targets[original_slot_index]
+                    && returned_counts[batch_slot_index] == candidate_batch_size)
+                    .then_some(original_slot_index)
+            })
+            .collect();
+        candidate_offset = candidate_offset
+            .checked_add(candidate_limit)
+            .ok_or_else(|| ConfigError::Validation("candidate offset overflowed".to_string()))?;
+    }
+
+    tracing::debug!(
+        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        query_slot_count = slots.len(),
+        requested_slot_count = slot_indices.len(),
+        candidate_batch_size,
+        query_batch_count,
+        candidate_feature_count,
+        "PostGIS native-surface paged subtree candidates queried"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
 enum SubtreeQuerySlot {
     Tile { index: usize, tile: TileCoord },
     ChildSubtree { index: usize, tile: TileCoord },
+}
+
+fn subtree_slot_feature_count_target(source: &SourceConfig, slot: SubtreeQuerySlot) -> u64 {
+    match slot {
+        SubtreeQuerySlot::Tile { tile, .. } if tile.level >= source.tileset.content_start_level => {
+            u64::from(source.max_features_per_tile) + 1
+        }
+        SubtreeQuerySlot::Tile { .. } | SubtreeQuerySlot::ChildSubtree { .. } => 1,
+    }
 }
 
 impl SubtreeQuerySlot {
@@ -665,6 +922,16 @@ pub struct SourceGeometryProfile {
     pub zm_flags: Vec<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMetadataProfile {
+    pub declared_geometry_type: Option<String>,
+    pub declared_srid: Option<i32>,
+    pub declared_dimensions: Option<i32>,
+    pub id_not_null: bool,
+    pub geometry_not_null: bool,
+    pub id_unique: bool,
+}
+
 #[derive(Debug)]
 pub enum SourceValidationError {
     ConnectionConfig {
@@ -689,6 +956,10 @@ pub enum SourceValidationError {
         source_id: String,
         column: String,
         actual_type: String,
+    },
+    DeclaredGeometryContract {
+        source_id: String,
+        message: String,
     },
     NullFeatureId {
         source_id: String,
@@ -798,6 +1069,10 @@ impl fmt::Display for SourceValidationError {
                 f,
                 "source {source_id} geometry column {column} has type {actual_type}, expected PostGIS geometry"
             ),
+            Self::DeclaredGeometryContract { source_id, message } => write!(
+                f,
+                "source {source_id} declared geometry contract does not match its configuration: {message}"
+            ),
             Self::NullFeatureId { source_id, count } => write!(
                 f,
                 "source {source_id} contains {count} row(s) with a NULL feature id"
@@ -880,6 +1155,29 @@ impl fmt::Display for SourceValidationError {
 }
 
 impl std::error::Error for SourceValidationError {}
+
+/// Validate source metadata and transformation capabilities without scanning
+/// source rows. Generic geometry typmods and absent database constraints are
+/// reported in the returned profile as unknown rather than inferred from data.
+pub async fn validate_source_metadata(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<SourceMetadataProfile, SourceValidationError> {
+    validate_source_columns(client, source_id, source).await?;
+    validate_source_select_permissions(client, source_id, source).await?;
+    let profile = query_source_metadata_profile(client, source_id, source).await?;
+    validate_declared_geometry_contract(source_id, source, &profile)?;
+    match source.source_model {
+        SourceModel::ExtrudedFootprint => {
+            validate_footprint_transform(client, source_id, source).await?;
+        }
+        SourceModel::SurfaceGeometryZ => {
+            validate_surface_transform(client, source_id, source).await?;
+        }
+    }
+    Ok(profile)
+}
 
 /// Validate the configured relation and its strategy-specific geometry contract.
 ///
@@ -1030,6 +1328,172 @@ async fn validate_source_columns(
         });
     }
     Ok(())
+}
+
+async fn validate_source_select_permissions(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<(), SourceValidationError> {
+    let schema = quote_identifier(&source.schema, "schema").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let table = quote_identifier(&source.table, "table").map_err(|source| {
+        SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        }
+    })?;
+    let mut columns = vec![source.id_column.as_str(), source.geometry_column.as_str()];
+    let attributes = source.content_query_attributes();
+    columns.extend(attributes.iter().map(String::as_str));
+    let columns = columns
+        .into_iter()
+        .map(|column| quote_identifier(column, "source column"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| SourceValidationError::Config {
+            source_id: source_id.to_string(),
+            source,
+        })?
+        .join(", ");
+    client
+        .query(
+            &format!("SELECT {columns} FROM {schema}.{table} LIMIT 0"),
+            &[],
+        )
+        .await
+        .map_err(|error| {
+            SourceValidationError::database(source_id, "select permission probe", error)
+        })?;
+    Ok(())
+}
+
+async fn query_source_metadata_profile(
+    client: &impl GenericClient,
+    source_id: &str,
+    source: &SourceConfig,
+) -> Result<SourceMetadataProfile, SourceValidationError> {
+    let row = client
+        .query_one(
+            "SELECT postgis_typmod_type(geometry_attribute.atttypmod), \
+                    postgis_typmod_srid(geometry_attribute.atttypmod), \
+                    postgis_typmod_dims(geometry_attribute.atttypmod), \
+                    id_attribute.attnotnull, geometry_attribute.attnotnull, \
+                    EXISTS ( \
+                      SELECT 1 FROM pg_catalog.pg_index AS index \
+                      WHERE index.indrelid = relation.oid \
+                        AND index.indisunique AND index.indisvalid \
+                        AND index.indpred IS NULL AND index.indexprs IS NULL \
+                        AND index.indnkeyatts = 1 \
+                        AND index.indkey[0] = id_attribute.attnum \
+                    ) \
+             FROM pg_catalog.pg_class AS relation \
+             JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+             JOIN pg_catalog.pg_attribute AS geometry_attribute \
+               ON geometry_attribute.attrelid = relation.oid AND geometry_attribute.attname = $3 \
+             JOIN pg_catalog.pg_attribute AS id_attribute \
+               ON id_attribute.attrelid = relation.oid AND id_attribute.attname = $4 \
+             WHERE namespace.nspname = $1 AND relation.relname = $2",
+            &[
+                &source.schema,
+                &source.table,
+                &source.geometry_column,
+                &source.id_column,
+            ],
+        )
+        .await
+        .map_err(|error| SourceValidationError::database(source_id, "metadata profile", error))?;
+
+    let typmod_type = row.get::<_, String>(0);
+    let typmod_srid = row.get::<_, i32>(1);
+    let typmod_dimensions = row.get::<_, Option<i32>>(2);
+    Ok(SourceMetadataProfile {
+        declared_geometry_type: (typmod_type != "Geometry").then_some(typmod_type),
+        declared_srid: (typmod_srid > 0).then_some(typmod_srid),
+        declared_dimensions: typmod_dimensions,
+        id_not_null: row.get(3),
+        geometry_not_null: row.get(4),
+        id_unique: row.get(5),
+    })
+}
+
+fn validate_declared_geometry_contract(
+    source_id: &str,
+    source: &SourceConfig,
+    profile: &SourceMetadataProfile,
+) -> Result<(), SourceValidationError> {
+    if let Some(declared_type) = &profile.declared_geometry_type {
+        if declared_type.starts_with("Geometry") {
+            let expected_generic_type = match source.source_model {
+                SourceModel::ExtrudedFootprint => "Geometry",
+                SourceModel::SurfaceGeometryZ => "GeometryZ",
+            };
+            if declared_type != expected_generic_type {
+                return Err(SourceValidationError::DeclaredGeometryContract {
+                    source_id: source_id.to_string(),
+                    message: format!(
+                        "column typmod is {declared_type}, expected {expected_generic_type}"
+                    ),
+                });
+            }
+        } else {
+            let allowed = source
+                .geometry_types
+                .iter()
+                .copied()
+                .map(postgis_typmod_geometry_type)
+                .collect::<Vec<_>>();
+            if !allowed
+                .iter()
+                .any(|allowed_type| allowed_type.eq_ignore_ascii_case(declared_type))
+            {
+                return Err(SourceValidationError::DeclaredGeometryContract {
+                    source_id: source_id.to_string(),
+                    message: format!(
+                        "column typmod is {declared_type}, expected one of {allowed:?}"
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(declared_srid) = profile.declared_srid
+        && declared_srid != source.srid
+    {
+        return Err(SourceValidationError::DeclaredGeometryContract {
+            source_id: source_id.to_string(),
+            message: format!(
+                "column typmod uses EPSG:{declared_srid}, expected EPSG:{}",
+                source.srid
+            ),
+        });
+    }
+    let expected_dimensions = match source.source_model {
+        SourceModel::ExtrudedFootprint => 2,
+        SourceModel::SurfaceGeometryZ => 3,
+    };
+    if let Some(declared_dimensions) = profile.declared_dimensions
+        && declared_dimensions != expected_dimensions
+    {
+        return Err(SourceValidationError::DeclaredGeometryContract {
+            source_id: source_id.to_string(),
+            message: format!(
+                "column typmod has {declared_dimensions} dimensions, expected {expected_dimensions}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn postgis_typmod_geometry_type(geometry_type: GeometryType) -> &'static str {
+    match geometry_type {
+        GeometryType::Polygon => "Polygon",
+        GeometryType::MultiPolygon => "MultiPolygon",
+        GeometryType::PolygonZ => "PolygonZ",
+        GeometryType::MultiPolygonZ => "MultiPolygonZ",
+    }
 }
 
 async fn query_source_geometry_profile(
@@ -1818,7 +2282,65 @@ fn build_subtree_occupancy_query(
     })
 }
 
-fn build_surface_subtree_candidates_query(
+fn build_surface_subtree_count_query(
+    source: &SourceConfig,
+) -> Result<SurfaceSubtreeCandidatesQueryPlan, ConfigError> {
+    if source.source_model != SourceModel::SurfaceGeometryZ {
+        return Err(ConfigError::Validation(
+            "surface subtree counts require source_model = surface_geometry_z".to_string(),
+        ));
+    }
+    let schema = quote_identifier(&source.schema, "schema")?;
+    let table = quote_identifier(&source.table, "table")?;
+    let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
+    let (bbox_expression, limit_parameter, bindings) = match surface_transform(source)? {
+        SurfaceTransform::Identity => (
+            "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
+            "$6",
+            QueryBindings::Standard,
+        ),
+        SurfaceTransform::Rdnaptrans2018Epsg1149 => (
+            format!(
+                "ST_Force2D(ST_InverseTransformPipeline(\
+                 ST_Force3D(ST_Segmentize(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.001), 0.0), \
+                 $6, $5::integer))"
+            ),
+            "$7",
+            QueryBindings::Rdnaptrans2018Epsg1149,
+        ),
+    };
+    let sql = format!(
+        "WITH source_tiles AS ( \
+           SELECT (u.ordinality - 1)::bigint AS slot, \
+                  {bbox_expression} AS geom \
+           FROM unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[]) \
+                WITH ORDINALITY AS u(west, south, east, north, ordinality) \
+         ), requested_tiles AS ( \
+           SELECT slot, \
+                  ST_Expand(\
+                    ST_PointOnSurface(geom), \
+                    ST_Distance(ST_PointOnSurface(geom), ST_Boundary(geom)) / sqrt(2.0)\
+                  ) AS geom \
+           FROM source_tiles \
+         ) \
+         SELECT q.slot, counted.feature_count \
+         FROM requested_tiles AS q \
+         CROSS JOIN LATERAL ( \
+           SELECT count(*)::bigint AS feature_count \
+           FROM ( \
+             SELECT 1 \
+             FROM {schema}.{table} AS t \
+             WHERE t.{geometry_column} && q.geom \
+               AND t.{geometry_column} @ q.geom \
+             LIMIT {limit_parameter} \
+           ) AS matching_features \
+         ) AS counted \
+         ORDER BY q.slot"
+    );
+    Ok(SurfaceSubtreeCandidatesQueryPlan { sql, bindings })
+}
+
+fn build_surface_subtree_boolean_candidates_query(
     source: &SourceConfig,
 ) -> Result<SurfaceSubtreeCandidatesQueryPlan, ConfigError> {
     if source.source_model != SourceModel::SurfaceGeometryZ {
@@ -1830,47 +2352,46 @@ fn build_surface_subtree_candidates_query(
     let table = quote_identifier(&source.table, "table")?;
     let id_column = quote_identifier(&source.id_column, "id_column")?;
     let geometry_column = quote_identifier(&source.geometry_column, "geometry_column")?;
-    let (bbox_expression, geometry_wkb, bindings) = match surface_transform(source)? {
-        SurfaceTransform::Identity => (
-            "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
-            "ST_AsBinary(c.source_geom, 'NDR')".to_string(),
-            QueryBindings::Standard,
-        ),
-        SurfaceTransform::Rdnaptrans2018Epsg1149 => (
-            format!(
-                "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
-                 ST_Force3D(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.0), \
-                 $6, $5::integer)))"
+    let (bbox_expression, geometry_wkb, limit_parameter, offset_parameter, bindings) =
+        match surface_transform(source)? {
+            SurfaceTransform::Identity => (
+                "ST_MakeEnvelope(u.west, u.south, u.east, u.north, $5::integer)".to_string(),
+                "ST_AsBinary(candidate.source_geom, 'NDR')".to_string(),
+                "$6",
+                "$7",
+                QueryBindings::Standard,
             ),
-            format!(
-                "ST_AsBinary(ST_TransformPipeline(c.source_geom, $6, {TARGET_GEODETIC_3D_SRID}), 'NDR')"
+            SurfaceTransform::Rdnaptrans2018Epsg1149 => (
+                format!(
+                    "ST_Envelope(ST_Force2D(ST_InverseTransformPipeline(\
+                     ST_Force3D(ST_MakeEnvelope(u.west, u.south, u.east, u.north, {TARGET_GEODETIC_3D_SRID}), 0.0), \
+                     $6, $5::integer)))"
+                ),
+                format!(
+                    "ST_AsBinary(ST_TransformPipeline(candidate.source_geom, $6, {TARGET_GEODETIC_3D_SRID}), 'NDR')"
+                ),
+                "$7",
+                "$8",
+                QueryBindings::Rdnaptrans2018Epsg1149,
             ),
-            QueryBindings::Rdnaptrans2018Epsg1149,
-        ),
-    };
+        };
     let sql = format!(
         "WITH requested_tiles AS ( \
            SELECT (u.ordinality - 1)::bigint AS slot, \
                   {bbox_expression} AS geom \
            FROM unnest($1::float8[], $2::float8[], $3::float8[], $4::float8[]) \
                 WITH ORDINALITY AS u(west, south, east, north, ordinality) \
-         ), requested_extent AS ( \
-           SELECT ST_SetSRID(ST_Extent(geom)::geometry, $5::integer) AS geom \
-           FROM requested_tiles \
-         ), candidate_features AS ( \
+         ) \
+         SELECT q.slot, candidate.id, {geometry_wkb} AS geometry_wkb \
+         FROM requested_tiles AS q \
+         CROSS JOIN LATERAL ( \
            SELECT t.{id_column}::text AS id, t.{geometry_column} AS source_geom \
            FROM {schema}.{table} AS t \
-           CROSS JOIN requested_extent AS e \
-           WHERE t.{geometry_column} && e.geom \
-         ) \
-         SELECT c.id, {geometry_wkb} AS geometry_wkb, matched.slots \
-         FROM candidate_features AS c \
-         CROSS JOIN LATERAL ( \
-           SELECT array_agg(q.slot) AS slots \
-           FROM requested_tiles AS q \
-           WHERE c.source_geom && q.geom \
-         ) AS matched \
-         WHERE matched.slots IS NOT NULL"
+           WHERE t.{geometry_column} && q.geom \
+           ORDER BY t.{id_column} \
+           LIMIT {limit_parameter} OFFSET {offset_parameter} \
+         ) AS candidate \
+         ORDER BY q.slot, candidate.id"
     );
     Ok(SurfaceSubtreeCandidatesQueryPlan { sql, bindings })
 }
@@ -2119,6 +2640,54 @@ mod tests {
     }
 
     #[test]
+    fn subtree_query_omits_ancestor_only_slots_and_uses_boolean_child_targets() {
+        let mut source = surface_source();
+        source.max_level = 7;
+        source.subtree_levels = 4;
+        source.tileset.content_start_level = 6;
+        source.max_features_per_tile = 1_000;
+
+        let root = TileCoord::root();
+        let layout = subtree_layout(&source, root).expect("root subtree layout");
+        let slots = subtree_query_slots(&source, &layout);
+        assert_eq!(slots.len(), 256);
+        assert!(slots.iter().all(|slot| matches!(
+            slot,
+            SubtreeQuerySlot::ChildSubtree { tile, .. } if tile.level == 4
+        )));
+        assert!(
+            slots
+                .iter()
+                .all(|slot| subtree_slot_feature_count_target(&source, *slot) == 1)
+        );
+
+        let availability =
+            availability_from_feature_counts(&source, root, &layout, &slots, &vec![1; slots.len()])
+                .expect("occupied child roots should close over local ancestors");
+        assert!(availability.tile.iter().all(|available| *available));
+        assert!(availability.content.iter().all(|available| !*available));
+        assert!(
+            availability
+                .child_subtree
+                .iter()
+                .all(|available| *available)
+        );
+
+        let level_four = TileCoord::new(4, 0, 0).expect("level-four subtree root");
+        let layout = subtree_layout(&source, level_four).expect("final subtree layout");
+        let slots = subtree_query_slots(&source, &layout);
+        assert_eq!(slots.len(), 80);
+        assert!(slots.iter().all(|slot| matches!(
+            slot,
+            SubtreeQuerySlot::Tile { tile, .. } if tile.level >= 6
+        )));
+        assert!(slots.iter().all(|slot| {
+            subtree_slot_feature_count_target(&source, *slot)
+                == u64::from(source.max_features_per_tile) + 1
+        }));
+    }
+
+    #[test]
     fn surface_query_preserves_whole_candidates_and_uses_explicit_3d_transform() {
         let source = surface_source();
         let plan = build_normalized_geometry_query(&source).expect("surface query should build");
@@ -2184,6 +2753,60 @@ mod tests {
     }
 
     #[test]
+    fn metadata_contract_accepts_specific_and_generic_surface_typmods() {
+        let source = surface_source();
+        for declared_geometry_type in [Some("MultiPolygonZ"), Some("GeometryZ"), None] {
+            let profile = SourceMetadataProfile {
+                declared_geometry_type: declared_geometry_type.map(str::to_string),
+                declared_srid: Some(7415),
+                declared_dimensions: Some(3),
+                id_not_null: true,
+                geometry_not_null: false,
+                id_unique: true,
+            };
+
+            validate_declared_geometry_contract("surface", &source, &profile)
+                .expect("compatible metadata should satisfy the declared contract");
+        }
+    }
+
+    #[test]
+    fn metadata_contract_rejects_declared_srid_type_and_dimension_mismatches() {
+        let source = surface_source();
+        for profile in [
+            SourceMetadataProfile {
+                declared_geometry_type: Some("PointZ".to_string()),
+                declared_srid: Some(7415),
+                declared_dimensions: Some(3),
+                id_not_null: true,
+                geometry_not_null: true,
+                id_unique: true,
+            },
+            SourceMetadataProfile {
+                declared_geometry_type: Some("MultiPolygonZ".to_string()),
+                declared_srid: Some(4979),
+                declared_dimensions: Some(3),
+                id_not_null: true,
+                geometry_not_null: true,
+                id_unique: true,
+            },
+            SourceMetadataProfile {
+                declared_geometry_type: Some("MultiPolygonZ".to_string()),
+                declared_srid: Some(7415),
+                declared_dimensions: Some(2),
+                id_not_null: true,
+                geometry_not_null: true,
+                id_unique: true,
+            },
+        ] {
+            assert!(matches!(
+                validate_declared_geometry_contract("surface", &source, &profile),
+                Err(SourceValidationError::DeclaredGeometryContract { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn bbox_only_subtree_query_rejects_native_surfaces() {
         let source = surface_source();
         let error = build_subtree_occupancy_query(&source)
@@ -2192,25 +2815,41 @@ mod tests {
     }
 
     #[test]
-    fn surface_subtree_candidates_transform_each_feature_for_exact_core_clipping() {
+    fn surface_subtree_counts_use_indexed_containment_lower_bounds_without_geometry_output() {
         let source = surface_source();
-        let plan = build_surface_subtree_candidates_query(&source)
-            .expect("surface candidate query should build");
+        let plan =
+            build_surface_subtree_count_query(&source).expect("surface count query should build");
 
         assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
-        assert!(plan.sql.contains("requested_extent AS"));
-        assert!(plan.sql.contains("ST_Extent(geom)"));
-        assert!(plan.sql.contains("t.\"geom\" && e.geom"));
-        assert!(plan.sql.contains("array_agg(q.slot)"));
-        assert!(!plan.sql.contains("MATERIALIZED"));
-        assert!(!plan.sql.contains("ORDER BY"));
+        assert!(plan.sql.contains("t.\"geom\" && q.geom"));
+        assert!(plan.sql.contains("ST_PointOnSurface"));
+        assert!(plan.sql.contains("ST_Distance"));
+        assert!(plan.sql.contains("sqrt(2.0)"));
+        assert!(plan.sql.contains("t.\"geom\" @ q.geom"));
+        assert!(plan.sql.contains("ST_Segmentize"));
+        assert!(plan.sql.contains("LIMIT $7"));
+        assert!(plan.sql.contains("count(*)::bigint"));
+        assert!(!plan.sql.contains("ST_AsBinary"));
+        assert!(!plan.sql.contains("ST_Relate"));
+        assert!(!plan.sql.contains("ST_TransformPipeline(t.\"geom\""));
+    }
+
+    #[test]
+    fn boolean_surface_subtree_candidates_page_through_each_indexed_slot() {
+        let source = surface_source();
+        let plan = build_surface_subtree_boolean_candidates_query(&source)
+            .expect("boolean surface candidate query should build");
+
+        assert_eq!(plan.bindings, QueryBindings::Rdnaptrans2018Epsg1149);
+        assert!(plan.sql.contains("t.\"geom\" && q.geom"));
+        assert!(plan.sql.contains("ORDER BY t.\"id\""));
+        assert!(plan.sql.contains("LIMIT $7 OFFSET $8"));
         assert!(
             plan.sql
-                .contains("ST_TransformPipeline(c.source_geom, $6, 4979)")
+                .contains("ST_TransformPipeline(candidate.source_geom, $6, 4979)")
         );
-        assert!(!plan.sql.contains("ST_Intersection"));
-        assert!(!plan.sql.contains("ST_Area"));
-        assert!(!plan.sql.contains("LIMIT"));
+        assert!(!plan.sql.contains("requested_extent"));
+        assert!(!plan.sql.contains("array_agg"));
     }
 
     #[test]
@@ -2905,6 +3544,22 @@ mod tests {
             .await
             .expect("surface subtree availability should use exact core clipping");
         let layout = subtree_layout(&source, TileCoord::root()).expect("surface subtree layout");
+
+        let mut delayed_content_source = source.clone();
+        delayed_content_source.subtree_levels = 1;
+        delayed_content_source.tileset.content_start_level = 2;
+        let delayed_availability =
+            query_subtree_availability(&client, &delayed_content_source, TileCoord::root())
+                .await
+                .expect("delayed surface content should use paged boolean child availability");
+        assert!(delayed_availability.tile[0]);
+        assert!(!delayed_availability.content[0]);
+        assert!(
+            delayed_availability
+                .child_subtree
+                .iter()
+                .any(|available| *available)
+        );
 
         let app = crate::server::build_app(catalog).expect("surface fixture app should build");
         let mut occupied_children = 0;

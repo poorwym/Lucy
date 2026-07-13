@@ -12,7 +12,10 @@ pub mod settings;
 pub mod state;
 
 pub use error::{RouteError, ServerError};
-pub use server::{DEFAULT_ADDR, build_app, build_app_with_settings, run_server};
+pub use server::{
+    DEFAULT_ADDR, build_app, build_app_with_settings, run_server,
+    validate_catalog_sources_with_mode,
+};
 pub use settings::ServerSettings;
 pub use state::AppState;
 

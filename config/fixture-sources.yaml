@@ -1,6 +1,9 @@
-# Self-contained catalog for the deterministic SQL fixtures loaded by
-# `just load-fixtures`. Tests should prefer source-scoped URLs.
+# Catalog for the deterministic SQL fixtures loaded by `just load-fixtures`
+# plus the locally imported 3DBAG benchmark source. Tests should prefer
+# source-scoped URLs.
 default_source: poc_buildings
+validation:
+  startup: metadata
 sources:
   poc_buildings:
     connection: ${DATABASE_URL}
@@ -74,4 +77,37 @@ sources:
       - surface_kind
     material:
       color_column: color
+      default_base_color: [0.72, 0.70, 0.65, 1.0]
+  nl_lod12_3d:
+    connection: ${DATABASE_URL}
+    schema: public
+    # The 99 source features previously rejected by Lucy's surface contract
+    # were repaired in place; backup and audit tables remain in PostGIS.
+    table: nl_lod12_3d
+    geometry_column: geom
+    id_column: fid
+    srid: 7415
+    source_model: surface_geometry_z
+    coordinate_operation: rdnaptrans2018_epsg_1149
+    geometry_types:
+      - MultiPolygonZ
+    bounds:
+      west: 4.6050787
+      south: 52.1887155
+      east: 5.1391789
+      north: 52.5113376
+      min_height_m: 31.47
+      max_height_m: 218.75
+    min_level: 0
+    max_level: 7
+    subtree_levels: 2
+    max_features_per_tile: 1000
+    tileset:
+      content_start_level: 3
+      root_geometric_error_m: 2000.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
+    attributes:
+      - identificatie
+    material:
       default_base_color: [0.72, 0.70, 0.65, 1.0]

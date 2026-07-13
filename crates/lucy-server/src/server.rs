@@ -12,12 +12,12 @@ use tokio_postgres::NoTls;
 use tower::ServiceBuilder;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Level, Span, error, info};
+use tracing::{Level, Span, error, info, warn};
 
-use lucy_core::source::{SourceCatalog, SourceModel};
+use lucy_core::source::{ConfigError, SourceCatalog, StartupValidation};
 
 use crate::error::ServerError;
-use crate::postgis::{SourceValidationError, validate_source};
+use crate::postgis::{SourceValidationError, validate_source, validate_source_metadata};
 use crate::routes;
 use crate::settings::ServerSettings;
 use crate::state::AppState;
@@ -133,13 +133,32 @@ pub async fn run_server(
 }
 
 pub async fn validate_catalog_sources(catalog: &SourceCatalog) -> Result<(), ServerError> {
+    validate_catalog_sources_with_mode(catalog, catalog.validation.startup, None).await
+}
+
+pub async fn validate_catalog_sources_with_mode(
+    catalog: &SourceCatalog,
+    mode: StartupValidation,
+    source_filter: Option<&str>,
+) -> Result<(), ServerError> {
+    if let Some(source_id) = source_filter
+        && !catalog.sources.contains_key(source_id)
+    {
+        return Err(ConfigError::Validation(format!(
+            "validation source {source_id:?} is not present in sources"
+        ))
+        .into());
+    }
+    if mode == StartupValidation::None {
+        info!(?source_filter, "PostGIS source validation disabled");
+        return Ok(());
+    }
+
     for (source_id, source) in &catalog.sources {
-        // Preserve the existing extrusion startup contract. Native surface
-        // sources need eager validation because their vertical transform and
-        // grid dependencies must never fall back or fail mid-request.
-        if source.source_model != SourceModel::SurfaceGeometryZ {
+        if source_filter.is_some_and(|filter| filter != source_id) {
             continue;
         }
+        let started = std::time::Instant::now();
         let connection_string = resolve_startup_connection(source_id, &source.connection)?;
         let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
             .await
@@ -159,15 +178,56 @@ pub async fn validate_catalog_sources(catalog: &SourceCatalog) -> Result<(), Ser
             }
         });
 
-        let profile = validate_source(&client, source_id, source).await?;
-        info!(
-            source_id,
-            row_count = profile.row_count,
-            srids = ?profile.srids,
-            geometry_types = ?profile.geometry_types,
-            zm_flags = ?profile.zm_flags,
-            "PostGIS source geometry contract validated"
-        );
+        match mode {
+            StartupValidation::Metadata => {
+                let profile = validate_source_metadata(&client, source_id, source).await?;
+                info!(
+                    source_id,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    declared_geometry_type = ?profile.declared_geometry_type,
+                    declared_srid = ?profile.declared_srid,
+                    declared_dimensions = ?profile.declared_dimensions,
+                    id_not_null = profile.id_not_null,
+                    geometry_not_null = profile.geometry_not_null,
+                    id_unique = profile.id_unique,
+                    "PostGIS source metadata and transform contract validated"
+                );
+                if !profile.id_not_null || !profile.id_unique || !profile.geometry_not_null {
+                    warn!(
+                        source_id,
+                        id_not_null = profile.id_not_null,
+                        geometry_not_null = profile.geometry_not_null,
+                        id_unique = profile.id_unique,
+                        "source constraints do not prove the complete row-level contract; use full validation for a data scan"
+                    );
+                }
+                if profile
+                    .declared_geometry_type
+                    .as_deref()
+                    .is_none_or(|geometry_type| geometry_type.starts_with("Geometry"))
+                    || profile.declared_srid.is_none()
+                    || profile.declared_dimensions.is_none()
+                {
+                    warn!(
+                        source_id,
+                        "generic geometry typmod does not prove the configured geometry contract; request-time validation remains active"
+                    );
+                }
+            }
+            StartupValidation::Full => {
+                let profile = validate_source(&client, source_id, source).await?;
+                info!(
+                    source_id,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    row_count = profile.row_count,
+                    srids = ?profile.srids,
+                    geometry_types = ?profile.geometry_types,
+                    zm_flags = ?profile.zm_flags,
+                    "PostGIS source geometry contract fully validated"
+                );
+            }
+            StartupValidation::None => unreachable!("none mode returns before connecting"),
+        }
     }
     Ok(())
 }
@@ -202,9 +262,9 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    use lucy_core::source::SourceCatalog;
+    use lucy_core::source::{SourceCatalog, StartupValidation};
 
-    use super::build_app;
+    use super::{build_app, validate_catalog_sources_with_mode};
 
     #[tokio::test]
     async fn assigns_and_propagates_request_id() {
@@ -228,5 +288,32 @@ mod tests {
             .get("x-request-id")
             .expect("response should contain a request id");
         assert!(!request_id.as_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn none_validation_mode_does_not_connect_to_sources() {
+        let catalog =
+            SourceCatalog::from_yaml_str(include_str!("../../../config/poc-sources.yaml"))
+                .expect("fixture config should load");
+
+        validate_catalog_sources_with_mode(&catalog, StartupValidation::None, None)
+            .await
+            .expect("none mode should only validate parsed configuration");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_an_unknown_source_filter_before_connecting() {
+        let catalog =
+            SourceCatalog::from_yaml_str(include_str!("../../../config/poc-sources.yaml"))
+                .expect("fixture config should load");
+        let error = validate_catalog_sources_with_mode(
+            &catalog,
+            StartupValidation::Metadata,
+            Some("missing"),
+        )
+        .await
+        .expect_err("unknown source filter should fail");
+
+        assert!(error.to_string().contains("missing"));
     }
 }

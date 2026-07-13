@@ -18,6 +18,8 @@ pub const MAX_SUBTREE_LEVELS: u8 = 8;
 pub struct SourceCatalog {
     #[serde(default)]
     pub default_source: Option<String>,
+    #[serde(default)]
+    pub validation: ValidationConfig,
     pub sources: BTreeMap<String, SourceConfig>,
 }
 
@@ -58,6 +60,22 @@ impl SourceCatalog {
             .as_deref()
             .or_else(|| self.sources.keys().next().map(String::as_str))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationConfig {
+    #[serde(default)]
+    pub startup: StartupValidation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupValidation {
+    #[default]
+    Metadata,
+    Full,
+    None,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -563,6 +581,12 @@ mod tests {
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column.as_deref(), Some("height_m"));
+        assert_eq!(
+            catalog.validation,
+            ValidationConfig {
+                startup: StartupValidation::Metadata,
+            }
+        );
         assert_eq!(source.tileset.root_geometric_error_m, 512.0);
         assert_eq!(
             source.tileset.content_uri_template,
@@ -572,6 +596,47 @@ mod tests {
             source.tileset.subtree_uri_template,
             DEFAULT_SUBTREE_URI_TEMPLATE
         );
+    }
+
+    #[test]
+    fn parses_catalog_startup_validation_modes() {
+        for (configured, expected) in [
+            ("metadata", StartupValidation::Metadata),
+            ("full", StartupValidation::Full),
+            ("none", StartupValidation::None),
+        ] {
+            let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+                "validation:\n  startup: metadata\n",
+                &format!("validation:\n  startup: {configured}\n"),
+                1,
+            );
+            let catalog = SourceCatalog::from_yaml_str(&raw)
+                .expect("configured startup validation mode should load");
+            assert_eq!(catalog.validation.startup, expected);
+        }
+    }
+
+    #[test]
+    fn defaults_startup_validation_to_metadata() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("validation:\n  startup: metadata\n", "");
+        let catalog = SourceCatalog::from_yaml_str(&raw)
+            .expect("catalog without validation configuration should load");
+
+        assert_eq!(catalog.validation.startup, StartupValidation::Metadata);
+    }
+
+    #[test]
+    fn rejects_unknown_validation_configuration() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "validation:\n  startup: metadata\n",
+            "validation:\n  cache: true\n",
+            1,
+        );
+        let error = SourceCatalog::from_yaml_str(&raw)
+            .expect_err("unsupported validation settings should be rejected");
+
+        assert!(error.to_string().contains("cache"));
     }
 
     #[test]
@@ -832,7 +897,7 @@ sources:
     #[test]
     fn rejects_content_start_level_above_source_max_level() {
         let raw = include_str!("../../../config/poc-sources.yaml")
-            .replace("content_start_level: 12", "content_start_level: 17");
+            .replace("content_start_level: 6", "content_start_level: 8");
         let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
 
         assert!(

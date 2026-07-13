@@ -184,15 +184,18 @@ an overflow at the deepest level requires changing the data or configuration.
 ## Sparse Subtree Availability
 
 For footprints, subtree availability is derived from the same positive-area
-clipping predicate as content. For native surfaces, PostGIS returns each
-whole-feature candidate once together with the bbox-matched slot indices;
-Lucy then applies the same source-frame triangulation and triangle clip used by
-content before counting a slot. This prevents holes, disjoint MultiPolygons,
-and half-open split-plane ownership from advertising empty content. Lucy sends
-the bounding boxes for every valid local tile and child subtree root to
-PostGIS as arrays. With the default `subtree_levels: 4`, this covers 85 local
-tiles and 256 child roots in one database round trip instead of one query per
-tile.
+clipping predicate as content. Native-surface boolean slots use small paged
+GiST lookups and apply the same source-frame triangle clip used by content;
+bbox false positives therefore cannot advertise an empty branch.
+
+For a native-surface content slot, Lucy first tries to prove overflow with a
+conservative lower bound. It constructs an axis-aligned square fully inside
+the source-space tile polygon and counts only feature bboxes fully contained
+by that square, stopping at `max_features_per_tile + 1`. Reaching the limit is
+therefore sufficient to prove overflow without reading, transforming, or
+decoding the large geometries. If that lower bound does not reach the limit,
+Lucy falls back to paged whole-feature candidates and the exact core triangle
+clip, preserving sparse and boundary-slot correctness.
 
 An occupied tile is tile-available. It is content-available only when its count
 does not exceed `max_features_per_tile`; an overflowing non-leaf remains
@@ -204,6 +207,16 @@ resolved by subdivision. Child subtree bits are set only for occupied child
 roots at or below `max_level`. Branches with no occupied descendant remain
 zero, while the global implicit root tile remains available even for an empty
 source.
+
+Ancestor-only local slots below `tileset.content_start_level` are inferred by
+closing occupied descendants over their parent chain instead of querying them
+separately. For boolean native-surface occupancy, Lucy pages a small,
+ID-ordered GiST candidate batch per unresolved slot and performs the exact
+triangle clip in core. A slot stops querying after its first real fragment;
+bbox false positives advance only that slot to the next candidate.
+Content-bearing slots use the contained-bbox overflow proof above and count
+exact fragments through the configured threshold only when proof is
+inconclusive.
 
 Availability arrays always retain the fixed size required by the configured
 `subtree_levels`. Final partial subtrees clear bits beyond `max_level` rather
@@ -289,6 +302,8 @@ non-string metadata remain deferred.
 The POC source config is `config/poc-sources.yaml`:
 
 ```yaml
+validation:
+  startup: metadata
 sources:
   poc_buildings:
     connection: ${DATABASE_URL}
@@ -337,6 +352,7 @@ unless explicitly listed as a retained Phase 0 constraint.
 
 | Config field | Runtime usage |
 | --- | --- |
+| `validation.startup` | Selects bounded `metadata` startup probes (default), the existing `full` data scan, or `none`. The separate `validate` command always performs a full scan and does not mutate the source. |
 | Source id map key | Selected from the loaded `SourceCatalog`; source-scoped routes use `/sources/{source_id}/...`, and legacy routes use explicit `default_source` (falling back deterministically only when it is omitted). |
 | `connection` | Resolved by `lucy-server` content routes. Literal connection strings are used as-is; the POC `${DATABASE_URL}` placeholder is resolved from the process environment. |
 | `schema`, `table` | Quoted after identifier validation and used to build the PostGIS tile query target. |
@@ -379,11 +395,12 @@ The following assumptions remain deliberate constraints:
 5. GLB output includes flat normals, material color, picking IDs, and STRING
    structural metadata. Textures and native numeric metadata column types
    remain deferred.
-6. Every source is introspected at startup. Footprint sources probe the
-   PostGIS source-SRID/4326 transform; native surfaces additionally validate
-   their explicit 3D grid contract and transformed extent.
+6. Every source uses bounded metadata introspection by default. Footprint
+   sources probe the PostGIS source-SRID/4326 transform; native surfaces probe
+   their explicit 3D grid contract. Exact transformed extent checks require
+   `validation.startup: full` or the explicit `validate` command.
 
-The reusable source introspector checks:
+The reusable full source validator checks:
 
 1. The configured schema/table and required columns exist.
 2. `id_column` values are non-null, non-empty when rendered as text, and
