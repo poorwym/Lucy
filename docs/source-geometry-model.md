@@ -184,6 +184,17 @@ geometry decoding and mesh validation. Bounds remain an operator-provided
 source contract in metadata mode; exact extent verification belongs to full
 validation. Validation never modifies source relations.
 
+`surface_subtree_envelope_shortcut: true` is a separate, opt-in operator
+assertion for large, audited `surface_geometry_z` relations. It states that
+every non-empty row already satisfies Lucy's decode, topology, planarity, and
+triangulation contract, allowing subtree generation to treat a feature
+envelope wholly covered by a conservative inner tile as renderable content
+without reading that geometry again. Neither metadata nor full startup
+validation automatically certifies this stronger assertion. Re-audit the
+relation before keeping the shortcut enabled after inserts, updates, table
+replacement, or changes to Lucy's mesh contract. Content requests continue to
+decode and validate every geometry they actually render.
+
 The surface strategy does not use `ST_IsValid`. GEOS applies polygon validity
 rules in XY; a legitimate vertical wall has a line-shaped XY projection and is
 reported as invalid even though it is a valid three-dimensional face. Surface

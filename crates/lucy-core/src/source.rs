@@ -88,6 +88,12 @@ pub struct SourceConfig {
     pub id_column: String,
     pub srid: i32,
     pub source_model: SourceModel,
+    /// Allow subtree availability to treat a feature envelope wholly covered
+    /// by a tile's conservative inner polygon as proven renderable content.
+    /// Operators must only enable this after auditing every surface geometry
+    /// against Lucy's decode, topology, planarity, and triangulation contract.
+    #[serde(default)]
+    pub surface_subtree_envelope_shortcut: bool,
     /// Optional explicit operation used by the PostGIS adapter to normalize a
     /// 3D surface into Lucy's fixed EPSG:4979 geometry contract.
     #[serde(default)]
@@ -214,6 +220,11 @@ impl SourceConfig {
     fn validate_geometry_strategy(&self, source_id: &str) -> Result<(), ConfigError> {
         match self.source_model {
             SourceModel::ExtrudedFootprint => {
+                if self.surface_subtree_envelope_shortcut {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_subtree_envelope_shortcut is only valid for surface_geometry_z"
+                    )));
+                }
                 if self.coordinate_operation.is_some() {
                     return Err(ConfigError::Validation(format!(
                         "{source_id}: extruded_footprint does not accept coordinate_operation; the PostGIS adapter automatically normalizes horizontal coordinates to EPSG:4326"
@@ -579,6 +590,7 @@ mod tests {
         assert_eq!(source.table, "poc_buildings");
         assert_eq!(source.srid, 4326);
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
+        assert!(!source.surface_subtree_envelope_shortcut);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column.as_deref(), Some("height_m"));
         assert_eq!(
@@ -729,6 +741,7 @@ sources:
     id_column: identificatie
     srid: 7415
     source_model: surface_geometry_z
+    surface_subtree_envelope_shortcut: true
     coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types:
       - PolygonZ
@@ -753,12 +766,30 @@ sources:
         let source = &catalog.sources["sibbe_lod12"];
 
         assert_eq!(source.source_model, SourceModel::SurfaceGeometryZ);
+        assert!(source.surface_subtree_envelope_shortcut);
         assert_eq!(source.base_height_column, None);
         assert_eq!(source.height_column, None);
         assert_eq!(source.content_query_attributes(), vec!["status"]);
         assert_eq!(
             source.coordinate_operation,
             Some(CoordinateOperation::Rdnaptrans2018Epsg1149)
+        );
+    }
+
+    #[test]
+    fn rejects_surface_subtree_envelope_shortcut_for_footprints() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "    source_model: extruded_footprint\n",
+            "    source_model: extruded_footprint\n    surface_subtree_envelope_shortcut: true\n",
+            1,
+        );
+        let error = SourceCatalog::from_yaml_str(&raw)
+            .expect_err("surface-only shortcut should reject footprint sources");
+
+        assert!(
+            error
+                .to_string()
+                .contains("surface_subtree_envelope_shortcut is only valid")
         );
     }
 

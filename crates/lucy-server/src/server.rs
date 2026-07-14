@@ -66,11 +66,12 @@ pub fn build_app_with_settings(
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &Request| {
+                            let path = request.uri().path();
                             let route = request
                                 .extensions()
                                 .get::<MatchedPath>()
                                 .map(MatchedPath::as_str)
-                                .unwrap_or_else(|| request.uri().path());
+                                .unwrap_or(path);
                             let request_id = request
                                 .headers()
                                 .get("x-request-id")
@@ -82,6 +83,7 @@ pub fn build_app_with_settings(
                                 request_id,
                                 http.method = %request.method(),
                                 http.route = route,
+                                http.path = path,
                                 http.status_code = tracing::field::Empty,
                                 latency_ms = tracing::field::Empty,
                             )

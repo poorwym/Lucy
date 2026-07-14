@@ -88,6 +88,10 @@ sources:
     id_column: fid
     srid: 7415
     source_model: surface_geometry_z
+    # All rows were audited through Lucy's surface decode/mesh contract when
+    # the 99 rejected source features above were repaired. Re-audit before
+    # keeping this shortcut enabled after replacing or mutating source rows.
+    surface_subtree_envelope_shortcut: true
     coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types:
       - MultiPolygonZ

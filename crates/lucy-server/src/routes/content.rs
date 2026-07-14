@@ -4,8 +4,7 @@ use std::time::Instant;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use tokio_postgres::NoTls;
-use tracing::{debug, error};
+use tracing::debug;
 
 use lucy_core::geometry::NormalizedGeometry;
 use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
@@ -18,8 +17,8 @@ use lucy_core::tile::TileCoord;
 
 use crate::error::RouteError;
 use crate::postgis::{
-    NormalizedFeature, TileQueryError, for_each_normalized_surface_feature,
-    query_normalized_features, surface_tile_clip,
+    NormalizedFeature, TileQueryError, for_each_normalized_surface_feature_prepared,
+    normalized_surface_geometry_query_sql, query_normalized_features, surface_tile_clip,
 };
 use crate::response::bytes_response;
 use crate::state::AppState;
@@ -32,6 +31,7 @@ pub(crate) async fn source_content(
 ) -> Result<Response, RouteError> {
     let source = state.source(&source_id)?;
     content_tile_response(
+        &state,
         &source_id,
         &source,
         parse_tile_path(&level, &x, &y_file, ".glb")?,
@@ -45,6 +45,7 @@ pub(crate) async fn default_content(
 ) -> Result<Response, RouteError> {
     let source = state.default_source()?;
     content_tile_response(
+        &state,
         state.default_source_id(),
         &source,
         parse_tile_path(&level, &x, &y_file, ".glb")?,
@@ -54,10 +55,11 @@ pub(crate) async fn default_content(
 
 #[tracing::instrument(
     name = "content_tile",
-    skip(source),
+    skip(state, source),
     fields(tile.level = tile.level, tile.x = tile.x, tile.y = tile.y)
 )]
 async fn content_tile_response(
+    state: &AppState,
     source_id: &str,
     source: &SourceConfig,
     tile: TileCoord,
@@ -70,28 +72,20 @@ async fn content_tile_response(
         )));
     }
     let connection = resolve_connection_string(&source.connection)?;
-    let started = Instant::now();
-    let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
-    debug!(
-        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        "PostGIS connection established"
-    );
-    let connection_handle = tokio::spawn(async move {
-        if let Err(error) = connection_task.await {
-            error!(error = %error, "PostGIS connection task failed");
-        }
-    });
-
     let source_frame = MeshFrame::from_source_bounds(&source.bounds);
     let (frame, node_transform) = content_mesh_placement(source, tile)?;
     let surface_clip = surface_tile_clip(source, tile)?;
+    let mut client = state.postgres_client(source_id, &connection).await?;
     let started = Instant::now();
     let mut candidate_count = 0_usize;
     let mut wkb_bytes = 0_usize;
     let mut pending_features = Vec::new();
     match source.source_model {
         SourceModel::ExtrudedFootprint => {
-            let features = query_normalized_features(&client, source, tile).await?;
+            client.discard();
+            let features = query_normalized_features(client.client(), source, tile).await?;
+            client.reuse();
+            drop(client);
             candidate_count = features.len();
             wkb_bytes = features
                 .iter()
@@ -111,8 +105,15 @@ async fn content_tile_response(
             }
         }
         SourceModel::SurfaceGeometryZ => {
-            let stream_result =
-                for_each_normalized_surface_feature(&client, source, tile, |feature| {
+            let statement_sql = normalized_surface_geometry_query_sql(source)?;
+            let statement = client.prepare_cached(&statement_sql).await?;
+            client.discard();
+            let stream_result = for_each_normalized_surface_feature_prepared(
+                client.client(),
+                &statement,
+                source,
+                tile,
+                |feature| {
                     candidate_count += 1;
                     wkb_bytes += feature.encoded_size_bytes;
                     append_pending_content_feature(
@@ -124,15 +125,17 @@ async fn content_tile_response(
                         frame,
                         surface_clip,
                     )
-                })
-                .await;
+                },
+            )
+            .await;
             if let Err(error) = stream_result {
-                // This connection is request-scoped. Dropping its driver
-                // closes the socket so an overflow/source-contract early exit
-                // does not leave PostgreSQL draining the uncapped query.
-                connection_handle.abort();
+                // Do not reuse a socket that may still be draining the
+                // uncapped streaming query after an early exit.
+                client.discard();
                 return Err(error);
             }
+            client.reuse();
+            drop(client);
         }
     }
     debug!(

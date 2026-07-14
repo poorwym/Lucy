@@ -184,18 +184,24 @@ an overflow at the deepest level requires changing the data or configuration.
 ## Sparse Subtree Availability
 
 For footprints, subtree availability is derived from the same positive-area
-clipping predicate as content. Native-surface boolean slots use small paged
-GiST lookups and apply the same source-frame triangle clip used by content;
-bbox false positives therefore cannot advertise an empty branch.
+clipping predicate as content. By default, native-surface boolean slots use
+small paged GiST lookups and apply the same source-frame triangle clip used by
+content; bbox false positives therefore cannot advertise an empty branch.
+Sources with the audited `surface_subtree_envelope_shortcut` contract may
+instead use a feature envelope wholly covered by a conservative inner tile as
+an occupancy proof.
 
-For a native-surface content slot, Lucy first tries to prove overflow with a
-conservative lower bound. It constructs an axis-aligned square fully inside
-the source-space tile polygon and counts only feature bboxes fully contained
-by that square, stopping at `max_features_per_tile + 1`. Reaching the limit is
-therefore sufficient to prove overflow without reading, transforming, or
-decoding the large geometries. If that lower bound does not reach the limit,
-Lucy falls back to paged whole-feature candidates and the exact core triangle
-clip, preserving sparse and boundary-slot correctness.
+For a source with the audited envelope shortcut, Lucy slightly insets the
+densified source-space tile polygon and counts only feature envelopes fully
+covered by that inner polygon, stopping at `max_features_per_tile + 1`. The
+inset keeps features on transformed or half-open tile boundaries in the exact
+fallback. Reaching the limit proves overflow without reading the large
+geometries; a capped broad count below the limit proves that overflow is
+impossible, while a nonzero inner count proves occupancy. Only an
+inconclusive fringe needs exact clipping. An unaudited source uses its bbox
+query only to prove that a slot is empty; every nonempty candidate set,
+including contained candidates, retains request-time decode and mesh
+validation.
 
 An occupied tile is tile-available. It is content-available only when its count
 does not exceed `max_features_per_tile`; an overflowing non-leaf remains
@@ -210,13 +216,13 @@ source.
 
 Ancestor-only local slots below `tileset.content_start_level` are inferred by
 closing occupied descendants over their parent chain instead of querying them
-separately. For boolean native-surface occupancy, Lucy pages a small,
-ID-ordered GiST candidate batch per unresolved slot and performs the exact
-triangle clip in core. A slot stops querying after its first real fragment;
-bbox false positives advance only that slot to the next candidate.
-Content-bearing slots use the contained-bbox overflow proof above and count
-exact fragments through the configured threshold only when proof is
-inconclusive.
+separately. Exact native-surface fallback pages small, ID-ordered GiST batches
+per unresolved slot and performs the triangle clip in core; bbox false
+positives advance only that slot. With the audited envelope shortcut, boolean
+slots can stop at an inner-envelope proof and content-bearing slots can skip
+exact geometry when the broad upper bound and inner lower bound already settle
+availability. Only the remaining inconclusive fringe is transformed and
+exact-clipped through the configured threshold.
 
 Availability arrays always retain the fixed size required by the configured
 `subtree_levels`. Final partial subtrees clear bits beyond `max_level` rather
