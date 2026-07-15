@@ -58,6 +58,8 @@ http://127.0.0.1:8080/sources/surface_buildings_7415/tileset.json
 `config/fixture-sources.yaml` contains the two deterministic tables created by
 `just load-fixtures` plus the separately managed `nl_lod12_3d` benchmark;
 `poc_buildings` is explicitly its default source for legacy routes.
+The completed pg2b3dm/Lucy full-materialization comparison is documented in
+[`docs/benchmarks/yimo-127-sibbe.md`](docs/benchmarks/yimo-127-sibbe.md).
 The existing `just poc-server` command continues to use
 `config/poc-sources.yaml`, including the separately managed
 `controlled_airspace` source.
