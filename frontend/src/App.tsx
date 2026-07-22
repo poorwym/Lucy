@@ -12,6 +12,7 @@ const TILESET_URL =
   // "/sources/surface_buildings_7415/tileset.json";
   // "/sources/controlled_airspace/tileset.json";
   "/sources/nl_lod12_3d/tileset.json";
+// "/sources/helsinki_kalasatama_lod2/tileset.json";
 
 // const numberParam = (name: string, fallback: number) => {
 //   const raw = searchParams.get(name);

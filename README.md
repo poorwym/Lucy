@@ -43,11 +43,11 @@ DATABASE_URL=postgres://lucy:lucy@localhost:5432/lucy \
 The optional final argument selects one source; omitting it validates every
 configured source.
 
-`just up` builds a local PostGIS image containing the checksum-pinned
-RDNAPTRANS2018 horizontal and vertical grids required to convert EPSG:7415 NAP
-heights to ETRS89 ellipsoidal heights. Lucy then applies the explicit EPSG:1149
-ETRS89-to-WGS84 zero-translation approximation (1m accuracy contract) and tags
-the result as EPSG:4979. Runtime PROJ networking stays off.
+`just up` builds a local PostGIS image containing checksum-pinned
+RDNAPTRANS2018 and FIN2023N2000 grids. They support the Netherlands fixture and
+the separately downloaded Helsinki CityGML source without confusing NAP or
+N2000 gravity-related heights with EPSG:4979 ellipsoidal height. Runtime PROJ
+networking stays off.
 
 The configured native-surface sample is available at:
 
@@ -60,6 +60,9 @@ http://127.0.0.1:8080/sources/surface_buildings_7415/tileset.json
 `poc_buildings` is explicitly its default source for legacy routes.
 The completed pg2b3dm/Lucy full-materialization comparison is documented in
 [`docs/benchmarks/yimo-127-sibbe.md`](docs/benchmarks/yimo-127-sibbe.md).
+The independent Helsinki Kalasatama LoD2 dataset, its reproducible importer,
+3D coordinate conversion, and full-materialization results are documented in
+[`docs/datasets/helsinki-kalasatama.md`](docs/datasets/helsinki-kalasatama.md).
 The existing `just poc-server` command continues to use
 `config/poc-sources.yaml`, including the separately managed
 `controlled_airspace` source.

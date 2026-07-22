@@ -115,3 +115,44 @@ sources:
       - identificatie
     material:
       default_base_color: [0.72, 0.70, 0.65, 1.0]
+  helsinki_kalasatama_lod2:
+    connection: ${DATABASE_URL}
+    schema: public
+    table: helsinki_kalasatama_lod2
+    geometry_column: geom
+    id_column: gml_id
+    # Import normalizes ETRS-GK25 + N2000 height to WGS 84 longitude,
+    # latitude, and ellipsoidal height with the FIN2023N2000 geoid grid.
+    srid: 4979
+    source_model: surface_geometry_z
+    # The pinned import passed Lucy full validation and every available GLB was
+    # materialized, exercising decode, planarity, topology, triangulation, and
+    # clipping. Repeat both checks before keeping this after replacing the table.
+    surface_subtree_envelope_shortcut: true
+    geometry_types:
+      - MultiPolygonZ
+    bounds:
+      west: 24.9487997
+      south: 60.1648910
+      east: 25.0052481
+      north: 60.2045649
+      min_height_m: 5.51
+      max_height_m: 154.12
+    min_level: 0
+    max_level: 7
+    subtree_levels: 2
+    max_features_per_tile: 1000
+    tileset:
+      content_start_level: 3
+      root_geometric_error_m: 1000.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
+    attributes:
+      - measured_height_m
+      - roof_type
+      - creation_date
+      - source_polygon_count
+      - source_vertex_count
+      - polygon_count
+    material:
+      default_base_color: [0.76, 0.72, 0.65, 1.0]

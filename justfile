@@ -6,6 +6,9 @@ db_name := env("POSTGRES_DB", "lucy")
 database_url := env("DATABASE_URL", "postgres://lucy:lucy@localhost:5432/lucy")
 poc_addr := env("POC_ADDR", "127.0.0.1:8080")
 rdnap_pipeline := "+proj=pipeline +step +inv +proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel +step +proj=hgridshift +grids=nl_nsgi_rdtrans2018.tif +step +proj=vgridshift +grids=nl_nsgi_nlgeo2018.tif +multiplier=1 +step +proj=cart +ellps=GRS80 +step +proj=helmert +x=0 +y=0 +z=0 +step +inv +proj=cart +ellps=WGS84 +step +proj=unitconvert +xy_in=rad +xy_out=deg"
+fin2023_pipeline := "+proj=pipeline +step +inv +proj=tmerc +lat_0=0 +lon_0=25 +k=1 +x_0=25500000 +y_0=0 +ellps=GRS80 +step +proj=vgridshift +grids=fi_nls_fin2023n2000.tif +multiplier=1 +step +proj=cart +ellps=GRS80 +step +proj=helmert +x=0 +y=0 +z=0 +step +inv +proj=cart +ellps=WGS84 +step +proj=unitconvert +xy_in=rad +xy_out=deg"
+helsinki_citygml_url := "https://3d.hel.ninja/data/citygml/Helsinki3D_CityGML_Kalasatama_20190326.zip"
+helsinki_citygml_sha256 := "ef6a787068b82642e5a0be5e20268e137075bb41fdbf0ec88619ad79926e2299"
 
 default:
     just --list
@@ -49,9 +52,26 @@ load-surface-fixture:
 # Load every deterministic PostGIS fixture used by the workspace.
 load-fixtures: load-poc-fixture load-surface-fixture
 
+# Download the pinned 2019 Helsinki Kalasatama LoD2 CityGML archive (CC BY 4.0).
+download-helsinki-kalasatama output="/tmp/Helsinki3D_CityGML_Kalasatama_20190326.zip":
+    curl --fail --show-error --location --output '{{ output }}' '{{ helsinki_citygml_url }}'
+    echo "{{ helsinki_citygml_sha256 }}  {{ output }}" | shasum -a 256 --check
+
+# Import true LoD2 XYZ surfaces and atomically replace the normalized EPSG:4979 relation.
+load-helsinki-kalasatama archive="/tmp/Helsinki3D_CityGML_Kalasatama_20190326.zip": verify-fin2023n2000-grid
+    python3 scripts/importers/import_helsinki_citygml.py '{{ archive }}' --database-url '{{ database_url }}' --replace
+
 # Fail if the pinned grids or explicit RDNAPTRANS2018 + EPSG:1149 pipeline drift.
 verify-rdnap-grids:
     {{ compose }} exec -T postgres psql -U {{ db_user }} -d {{ db_name }} -Atc "WITH transformed AS (SELECT ST_TransformPipeline(ST_GeomFromEWKT('SRID=7415;POINT Z (121302 487371 2.68)'), '{{ rdnap_pipeline }}', 4979) AS geom) SELECT abs(ST_X(geom) - 4.892367035931109) < 0.0000001 AND abs(ST_Y(geom) - 52.37317920269912) < 0.0000001 AND abs(ST_Z(geom) - 45.66258579945144) < 0.05 FROM transformed" | grep -qx t
+
+# Fail if the FIN2023N2000 grid is missing or source GIS axis order drifts.
+verify-fin2023n2000-grid:
+    {{ compose }} exec -T postgres psql -U {{ db_user }} -d {{ db_name }} -Atc "WITH transformed AS (SELECT ST_TransformPipeline(ST_SetSRID(ST_MakePoint(25497750, 6676280, 2.68), 3879), '{{ fin2023_pipeline }}', 4979) AS geom) SELECT abs(ST_X(geom) - 24.95943315450587) < 0.0000001 AND abs(ST_Y(geom) - 60.19931510976058) < 0.0000001 AND abs(ST_Z(geom) - 20.27470033017963) < 0.03 FROM transformed" | grep -qx t
+
+# Verify the imported relation retains its complete non-degenerate LoD2 inventory.
+verify-helsinki-kalasatama:
+    {{ compose }} exec -T postgres psql -U {{ db_user }} -d {{ db_name }} -Atc "SELECT count(*), sum(source_polygon_count), sum(source_vertex_count), sum(polygon_count), GeometryType(geom), ST_NDims(geom), ST_SRID(geom) FROM public.helsinki_kalasatama_lod2 GROUP BY GeometryType(geom), ST_NDims(geom), ST_SRID(geom)" | grep -qx '2919|79810|454444|295576|MULTIPOLYGON|3|4979'
 
 # Verify the fixture retains both geometry types and its interior ring.
 verify-surface-fixture:
