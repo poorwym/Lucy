@@ -18,6 +18,8 @@ pub const MAX_SUBTREE_LEVELS: u8 = 8;
 pub struct SourceCatalog {
     #[serde(default)]
     pub default_source: Option<String>,
+    #[serde(default)]
+    pub validation: ValidationConfig,
     pub sources: BTreeMap<String, SourceConfig>,
 }
 
@@ -60,6 +62,22 @@ impl SourceCatalog {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationConfig {
+    #[serde(default)]
+    pub startup: StartupValidation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupValidation {
+    #[default]
+    Metadata,
+    Full,
+    None,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
@@ -70,6 +88,12 @@ pub struct SourceConfig {
     pub id_column: String,
     pub srid: i32,
     pub source_model: SourceModel,
+    /// Allow subtree availability to treat a feature envelope wholly covered
+    /// by a tile's conservative inner polygon as proven renderable content.
+    /// Operators must only enable this after auditing every surface geometry
+    /// against Lucy's decode, topology, planarity, and triangulation contract.
+    #[serde(default)]
+    pub surface_subtree_envelope_shortcut: bool,
     /// Optional explicit operation used by the PostGIS adapter to normalize a
     /// 3D surface into Lucy's fixed EPSG:4979 geometry contract.
     #[serde(default)]
@@ -196,6 +220,11 @@ impl SourceConfig {
     fn validate_geometry_strategy(&self, source_id: &str) -> Result<(), ConfigError> {
         match self.source_model {
             SourceModel::ExtrudedFootprint => {
+                if self.surface_subtree_envelope_shortcut {
+                    return Err(ConfigError::Validation(format!(
+                        "{source_id}: surface_subtree_envelope_shortcut is only valid for surface_geometry_z"
+                    )));
+                }
                 if self.coordinate_operation.is_some() {
                     return Err(ConfigError::Validation(format!(
                         "{source_id}: extruded_footprint does not accept coordinate_operation; the PostGIS adapter automatically normalizes horizontal coordinates to EPSG:4326"
@@ -561,8 +590,15 @@ mod tests {
         assert_eq!(source.table, "poc_buildings");
         assert_eq!(source.srid, 4326);
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
+        assert!(!source.surface_subtree_envelope_shortcut);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column.as_deref(), Some("height_m"));
+        assert_eq!(
+            catalog.validation,
+            ValidationConfig {
+                startup: StartupValidation::Metadata,
+            }
+        );
         assert_eq!(source.tileset.root_geometric_error_m, 512.0);
         assert_eq!(
             source.tileset.content_uri_template,
@@ -572,6 +608,47 @@ mod tests {
             source.tileset.subtree_uri_template,
             DEFAULT_SUBTREE_URI_TEMPLATE
         );
+    }
+
+    #[test]
+    fn parses_catalog_startup_validation_modes() {
+        for (configured, expected) in [
+            ("metadata", StartupValidation::Metadata),
+            ("full", StartupValidation::Full),
+            ("none", StartupValidation::None),
+        ] {
+            let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+                "validation:\n  startup: metadata\n",
+                &format!("validation:\n  startup: {configured}\n"),
+                1,
+            );
+            let catalog = SourceCatalog::from_yaml_str(&raw)
+                .expect("configured startup validation mode should load");
+            assert_eq!(catalog.validation.startup, expected);
+        }
+    }
+
+    #[test]
+    fn defaults_startup_validation_to_metadata() {
+        let raw = include_str!("../../../config/poc-sources.yaml")
+            .replace("validation:\n  startup: metadata\n", "");
+        let catalog = SourceCatalog::from_yaml_str(&raw)
+            .expect("catalog without validation configuration should load");
+
+        assert_eq!(catalog.validation.startup, StartupValidation::Metadata);
+    }
+
+    #[test]
+    fn rejects_unknown_validation_configuration() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "validation:\n  startup: metadata\n",
+            "validation:\n  cache: true\n",
+            1,
+        );
+        let error = SourceCatalog::from_yaml_str(&raw)
+            .expect_err("unsupported validation settings should be rejected");
+
+        assert!(error.to_string().contains("cache"));
     }
 
     #[test]
@@ -664,6 +741,7 @@ sources:
     id_column: identificatie
     srid: 7415
     source_model: surface_geometry_z
+    surface_subtree_envelope_shortcut: true
     coordinate_operation: rdnaptrans2018_epsg_1149
     geometry_types:
       - PolygonZ
@@ -688,12 +766,30 @@ sources:
         let source = &catalog.sources["sibbe_lod12"];
 
         assert_eq!(source.source_model, SourceModel::SurfaceGeometryZ);
+        assert!(source.surface_subtree_envelope_shortcut);
         assert_eq!(source.base_height_column, None);
         assert_eq!(source.height_column, None);
         assert_eq!(source.content_query_attributes(), vec!["status"]);
         assert_eq!(
             source.coordinate_operation,
             Some(CoordinateOperation::Rdnaptrans2018Epsg1149)
+        );
+    }
+
+    #[test]
+    fn rejects_surface_subtree_envelope_shortcut_for_footprints() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "    source_model: extruded_footprint\n",
+            "    source_model: extruded_footprint\n    surface_subtree_envelope_shortcut: true\n",
+            1,
+        );
+        let error = SourceCatalog::from_yaml_str(&raw)
+            .expect_err("surface-only shortcut should reject footprint sources");
+
+        assert!(
+            error
+                .to_string()
+                .contains("surface_subtree_envelope_shortcut is only valid")
         );
     }
 
@@ -832,7 +928,7 @@ sources:
     #[test]
     fn rejects_content_start_level_above_source_max_level() {
         let raw = include_str!("../../../config/poc-sources.yaml")
-            .replace("content_start_level: 12", "content_start_level: 17");
+            .replace("content_start_level: 6", "content_start_level: 8");
         let error = SourceCatalog::from_yaml_str(&raw).expect_err("config should be rejected");
 
         assert!(

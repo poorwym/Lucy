@@ -466,13 +466,13 @@ impl PreparedSurfaceGeometryZ {
     ) -> Result<Option<TriangleMesh>, MeshError> {
         validate_surface_tile_clip(clip)?;
         tile_frame.validate()?;
+        let frame_transform = LocalFrameTransform::between(self.source_frame, tile_frame);
         let mut mesh = TriangleMesh::new();
         for (polygon_index, polygon) in self.polygons.iter().enumerate() {
             append_clipped_surface_polygon(
                 &mut mesh,
                 polygon,
-                self.source_frame,
-                tile_frame,
+                &frame_transform,
                 clip,
                 polygon_index,
             )?;
@@ -901,16 +901,30 @@ fn append_prepared_surface_polygon(
 fn append_clipped_surface_polygon(
     mesh: &mut TriangleMesh,
     prepared: &PreparedSurfacePolygon,
-    source_frame: MeshFrame,
-    tile_frame: MeshFrame,
+    frame_transform: &LocalFrameTransform,
     clip: SurfaceTileClip,
     polygon_index: usize,
 ) -> Result<(), MeshError> {
-    let tile_face_normal = transform_local_vector_between_frames(
-        prepared.source_face_normal,
-        source_frame,
-        tile_frame,
-    );
+    let tile_face_normal = frame_transform.transform_vector(prepared.source_face_normal);
+
+    if surface_clip_polygon_is_contained(&prepared.vertices, clip) {
+        if !surface_clip_polygon_is_owned(&prepared.vertices, clip) {
+            return Ok(());
+        }
+
+        let positions = prepared
+            .vertices
+            .iter()
+            .map(|vertex| frame_transform.transform_position(vertex.source_position))
+            .collect::<Vec<_>>();
+        return append_indexed_face(
+            mesh,
+            &positions,
+            &prepared.triangles,
+            tile_face_normal,
+            polygon_index,
+        );
+    }
 
     for triangle in prepared.triangles.chunks_exact(3) {
         let clipped = clip_prepared_surface_triangle(prepared, triangle, clip, polygon_index)?;
@@ -919,17 +933,23 @@ fn append_clipped_surface_polygon(
         }
         let positions = clipped
             .iter()
-            .map(|vertex| {
-                transform_local_position_between_frames(
-                    vertex.source_position,
-                    source_frame,
-                    tile_frame,
-                )
-            })
+            .map(|vertex| frame_transform.transform_position(vertex.source_position))
             .collect::<Vec<_>>();
         append_clipped_convex_polygon(mesh, &positions, tile_face_normal, polygon_index)?;
     }
     Ok(())
+}
+
+fn surface_clip_polygon_is_contained(
+    vertices: &[SurfaceClipVertex],
+    clip: SurfaceTileClip,
+) -> bool {
+    vertices.iter().all(|vertex| {
+        vertex.geodetic.x >= clip.west_deg
+            && vertex.geodetic.x <= clip.east_deg
+            && vertex.geodetic.y >= clip.south_deg
+            && vertex.geodetic.y <= clip.north_deg
+    })
 }
 
 fn clip_prepared_surface_triangle(
@@ -1750,134 +1770,89 @@ fn interpolate3(start: [f64; 3], end: [f64; 3], parameter: f64) -> [f64; 3] {
     add3(start, scale3(sub3(end, start), parameter))
 }
 
-fn transform_local_position_between_frames(
-    position: [f64; 3],
-    source_frame: MeshFrame,
-    target_frame: MeshFrame,
-) -> [f64; 3] {
-    let source_transform = source_frame.enu_to_ecef_transform();
-    let ecef = add3(
-        source_frame.origin_ecef,
-        add3(
-            scale3(
-                [
-                    source_transform[0],
-                    source_transform[1],
-                    source_transform[2],
-                ],
-                position[0],
-            ),
-            add3(
-                scale3(
-                    [
-                        source_transform[4],
-                        source_transform[5],
-                        source_transform[6],
-                    ],
-                    position[1],
-                ),
-                scale3(
-                    [
-                        source_transform[8],
-                        source_transform[9],
-                        source_transform[10],
-                    ],
-                    position[2],
-                ),
-            ),
-        ),
-    );
-    let target_transform = target_frame.enu_to_ecef_transform();
-    let delta = sub3(ecef, target_frame.origin_ecef);
-    [
-        dot3(
-            [
-                target_transform[0],
-                target_transform[1],
-                target_transform[2],
-            ],
-            delta,
-        ),
-        dot3(
-            [
-                target_transform[4],
-                target_transform[5],
-                target_transform[6],
-            ],
-            delta,
-        ),
-        dot3(
-            [
-                target_transform[8],
-                target_transform[9],
-                target_transform[10],
-            ],
-            delta,
-        ),
-    ]
+#[derive(Debug, Clone, Copy)]
+struct LocalFrameTransform {
+    linear: [[f64; 3]; 3],
+    translation: [f64; 3],
 }
 
-fn transform_local_vector_between_frames(
-    vector: [f64; 3],
-    source_frame: MeshFrame,
-    target_frame: MeshFrame,
-) -> [f64; 3] {
-    let source_transform = source_frame.enu_to_ecef_transform();
-    let ecef = add3(
-        scale3(
+impl LocalFrameTransform {
+    fn between(source_frame: MeshFrame, target_frame: MeshFrame) -> Self {
+        let source_transform = source_frame.enu_to_ecef_transform();
+        let target_transform = target_frame.enu_to_ecef_transform();
+        let source_axes = [
             [
                 source_transform[0],
                 source_transform[1],
                 source_transform[2],
             ],
-            vector[0],
-        ),
-        add3(
-            scale3(
-                [
-                    source_transform[4],
-                    source_transform[5],
-                    source_transform[6],
-                ],
-                vector[1],
-            ),
-            scale3(
-                [
-                    source_transform[8],
-                    source_transform[9],
-                    source_transform[10],
-                ],
-                vector[2],
-            ),
-        ),
-    );
-    let target_transform = target_frame.enu_to_ecef_transform();
-    [
-        dot3(
+            [
+                source_transform[4],
+                source_transform[5],
+                source_transform[6],
+            ],
+            [
+                source_transform[8],
+                source_transform[9],
+                source_transform[10],
+            ],
+        ];
+        let target_axes = [
             [
                 target_transform[0],
                 target_transform[1],
                 target_transform[2],
             ],
-            ecef,
-        ),
-        dot3(
             [
                 target_transform[4],
                 target_transform[5],
                 target_transform[6],
             ],
-            ecef,
-        ),
-        dot3(
             [
                 target_transform[8],
                 target_transform[9],
                 target_transform[10],
             ],
-            ecef,
-        ),
-    ]
+        ];
+        let origin_delta = sub3(source_frame.origin_ecef, target_frame.origin_ecef);
+
+        Self {
+            linear: [
+                [
+                    dot3(target_axes[0], source_axes[0]),
+                    dot3(target_axes[0], source_axes[1]),
+                    dot3(target_axes[0], source_axes[2]),
+                ],
+                [
+                    dot3(target_axes[1], source_axes[0]),
+                    dot3(target_axes[1], source_axes[1]),
+                    dot3(target_axes[1], source_axes[2]),
+                ],
+                [
+                    dot3(target_axes[2], source_axes[0]),
+                    dot3(target_axes[2], source_axes[1]),
+                    dot3(target_axes[2], source_axes[2]),
+                ],
+            ],
+            translation: [
+                dot3(target_axes[0], origin_delta),
+                dot3(target_axes[1], origin_delta),
+                dot3(target_axes[2], origin_delta),
+            ],
+        }
+    }
+
+    fn transform_position(self, position: [f64; 3]) -> [f64; 3] {
+        add3(self.transform_vector(position), self.translation)
+    }
+
+    fn transform_vector(self, vector: [f64; 3]) -> [f64; 3] {
+        [
+            dot3(self.linear[0], vector),
+            dot3(self.linear[1], vector),
+            dot3(self.linear[2], vector),
+        ]
+    }
 }
 
 fn scale3(vector: [f64; 3], scale: f64) -> [f64; 3] {
@@ -2241,15 +2216,10 @@ mod tests {
         mesh_frame: MeshFrame,
         target_frame: MeshFrame,
     ) -> Vec<[f64; 3]> {
+        let frame_transform = LocalFrameTransform::between(mesh_frame, target_frame);
         mesh.vertices
             .iter()
-            .map(|vertex| {
-                transform_local_position_between_frames(
-                    vertex.position.map(f64::from),
-                    mesh_frame,
-                    target_frame,
-                )
-            })
+            .map(|vertex| frame_transform.transform_position(vertex.position.map(f64::from)))
             .collect()
     }
 
@@ -2275,6 +2245,55 @@ mod tests {
         }
     }
 
+    fn transform_local_via_ecef(
+        value: [f64; 3],
+        source_frame: MeshFrame,
+        target_frame: MeshFrame,
+        is_position: bool,
+    ) -> [f64; 3] {
+        let ecef = transform_vector(
+            source_frame.enu_to_ecef_transform(),
+            [
+                value[0],
+                value[1],
+                value[2],
+                if is_position { 1.0 } else { 0.0 },
+            ],
+        );
+        let target_transform = target_frame.enu_to_ecef_transform();
+        let target_input = if is_position {
+            sub3([ecef[0], ecef[1], ecef[2]], target_frame.origin_ecef)
+        } else {
+            [ecef[0], ecef[1], ecef[2]]
+        };
+        [
+            dot3(
+                [
+                    target_transform[0],
+                    target_transform[1],
+                    target_transform[2],
+                ],
+                target_input,
+            ),
+            dot3(
+                [
+                    target_transform[4],
+                    target_transform[5],
+                    target_transform[6],
+                ],
+                target_input,
+            ),
+            dot3(
+                [
+                    target_transform[8],
+                    target_transform[9],
+                    target_transform[10],
+                ],
+                target_input,
+            ),
+        ]
+    }
+
     #[test]
     fn source_frame_origin_and_enu_transform_are_consistent() {
         let frame = fixture_frame();
@@ -2296,6 +2315,33 @@ mod tests {
         assert!(dot3(east, up).abs() < 1.0e-12);
         assert!(dot3(north, up).abs() < 1.0e-12);
         assert!((dot3(cross3(east, north), up) - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn precomputed_local_frame_transform_matches_ecef_basis_change() {
+        let source_frame = MeshFrame::from_geodetic_origin(5.0, 50.0, -2.0);
+        let target_frame = MeshFrame::from_geodetic_origin(5.73, 50.41, 12.0);
+        let frame_transform = LocalFrameTransform::between(source_frame, target_frame);
+
+        for position in [
+            [0.0, 0.0, 0.0],
+            [12.25, -4.5, 8.75],
+            [-2_500.0, 4_000.0, 150.0],
+        ] {
+            let expected = transform_local_via_ecef(position, source_frame, target_frame, true);
+            let actual = frame_transform.transform_position(position);
+            for component in 0..3 {
+                assert!((actual[component] - expected[component]).abs() < 1.0e-8);
+            }
+        }
+
+        for vector in [[1.0, 0.0, 0.0], [0.25, -0.5, 0.75]] {
+            let expected = transform_local_via_ecef(vector, source_frame, target_frame, false);
+            let actual = frame_transform.transform_vector(vector);
+            for component in 0..3 {
+                assert!((actual[component] - expected[component]).abs() < 1.0e-12);
+            }
+        }
     }
 
     #[test]
@@ -2655,6 +2701,72 @@ mod tests {
     }
 
     #[test]
+    fn native_surface_tile_clip_reuses_vertices_for_contained_polygon() {
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.002, 50.002, 20.0],
+                [5.005, 50.002, 20.0],
+                [5.005, 50.008, 20.0],
+                [5.002, 50.008, 20.0],
+                [5.002, 50.002, 20.0],
+            ]),
+            interiors: Vec::new(),
+        });
+        let source_frame = fixture_frame();
+        let tile_frame = MeshFrame::from_geodetic_origin(5.0025, 50.005, 0.0);
+        let full = surface_geometry_z_to_mesh(&geometry, source_frame).expect("full surface");
+        let contained = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            source_frame,
+            tile_frame,
+            surface_clip(5.0, 50.0, 5.005, 50.01, false, true),
+        )
+        .expect("contained clip")
+        .expect("contained polygon");
+
+        assert_eq!(contained.vertices.len(), 4);
+        assert_eq!(contained.indices.len(), 6);
+        assert!((mesh_area(&full) - mesh_area(&contained)).abs() / mesh_area(&full) < 1.0e-6);
+        assert_unit_normals(&contained);
+    }
+
+    #[test]
+    fn native_surface_tile_clip_reuses_contained_hole_indices() {
+        let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
+            exterior: ring3(&[
+                [5.002, 50.002, 20.0],
+                [5.005, 50.002, 20.0],
+                [5.005, 50.005, 20.0],
+                [5.002, 50.005, 20.0],
+                [5.002, 50.002, 20.0],
+            ]),
+            interiors: vec![ring3(&[
+                [5.003, 50.003, 20.0],
+                [5.004, 50.003, 20.0],
+                [5.004, 50.004, 20.0],
+                [5.003, 50.004, 20.0],
+                [5.003, 50.003, 20.0],
+            ])],
+        });
+        let source_frame = fixture_frame();
+        let tile_frame = MeshFrame::from_geodetic_origin(5.0035, 50.0035, 0.0);
+        let full = surface_geometry_z_to_mesh(&geometry, source_frame).expect("full surface");
+        let contained = surface_geometry_z_to_tile_mesh(
+            &geometry,
+            source_frame,
+            tile_frame,
+            surface_clip(5.0, 50.0, 5.01, 50.01, true, true),
+        )
+        .expect("contained hole clip")
+        .expect("contained polygon with a hole");
+
+        assert_eq!(contained.vertices.len(), 8);
+        assert_eq!(contained.indices.len(), 24);
+        assert!((mesh_area(&full) - mesh_area(&contained)).abs() / mesh_area(&full) < 1.0e-6);
+        assert_unit_normals(&contained);
+    }
+
+    #[test]
     fn native_surface_tile_clip_conserves_area_and_shares_a_seam() {
         let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
             exterior: ring3(&[
@@ -2713,11 +2825,8 @@ mod tests {
 
         let full_normal = full.vertices[0].normal.map(f64::from);
         for (mesh, frame) in [(&west, west_frame), (&east, east_frame)] {
-            let source_normal = transform_local_vector_between_frames(
-                mesh.vertices[0].normal.map(f64::from),
-                frame,
-                source_frame,
-            );
+            let source_normal = LocalFrameTransform::between(frame, source_frame)
+                .transform_vector(mesh.vertices[0].normal.map(f64::from));
             assert!(dot3(source_normal, full_normal) > 0.999_999);
         }
     }

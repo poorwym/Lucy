@@ -75,12 +75,14 @@ area. The YIMO-127 acceptance target additionally calls for the
 official Khronos glTF Validator against a GLB fetched from the surface content
 route.
 
-That external validator command is not yet wired into this repository. Until a
-pinned `gltf-validator` dependency and script are added, do not describe the
-GLB as externally validated. When added, the gate should require zero core
-errors and warnings and explicitly account for the validator's lack of full
-validation for `EXT_mesh_features` and `EXT_structural_metadata`; those vendor
-extensions still require Lucy's structural tests and Cesium coverage.
+That external validator command is not yet wired into this repository. A
+one-off full-output run with the official 3D Tiles Validator is recorded in the
+[`nl_lod12_3d` comparison report](benchmarks/yimo-127-sibbe.md), but it is not a
+repeatable CI gate. When a pinned dependency and script are added, the gate
+should require zero core errors and warnings and explicitly account for the
+validator's lack of full validation for `EXT_mesh_features` and
+`EXT_structural_metadata`; those extensions still require Lucy's structural
+tests and Cesium coverage.
 
 ## Cesium Smoke Test
 

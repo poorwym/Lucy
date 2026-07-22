@@ -1,4 +1,6 @@
 default_source: poc_buildings
+validation:
+  startup: metadata
 sources:
   poc_buildings:
     connection: ${DATABASE_URL}

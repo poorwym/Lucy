@@ -159,15 +159,41 @@ contract, not an optional accuracy improvement.
 
 ## Source Validation
 
-Startup validation checks the relation and required columns, non-null,
-non-empty, unique feature IDs, non-null/non-empty geometry, configured SRID,
-the actual geometry type profile, Z dimension, finite XYZ values, and
-transformation availability. Footprints use a source-SRID/4326 round-trip
-probe; surfaces use their configured 3D operation. For non-empty
-native-surface sources validation also
-computes the transformed vertex extent and rejects configurations whose
-content would fall outside the advertised root EPSG:4979 region or height
-interval.
+Catalog-level `validation.startup` selects `metadata` (the default), `full`, or
+`none`. Metadata startup validation is bounded independently of relation size:
+it checks the relation, required columns, SELECT permissions, declared PostGIS
+geometry typmod, available ID/NULL constraints, and transformation capability.
+Footprints use a source-SRID/4326 round-trip probe; surfaces use their
+configured 3D operation. Generic typmods or missing constraints are reported
+as warnings because metadata alone cannot prove the contents of every row.
+
+Full validation additionally scans the relation for non-null, non-empty,
+unique feature IDs, non-null/non-empty geometry, actual SRID/type/Z profiles,
+and finite coordinates. For non-empty native-surface sources it transforms all
+vertices, computes their exact EPSG:4979 extent, and rejects content outside
+the advertised root region or height interval. Configure `startup: full` only
+when that scan should gate readiness, or run it explicitly without changing
+the configured startup policy:
+
+```sh
+cargo run -p lucy-poc -- validate config/sources.yaml [source_id]
+```
+
+`startup: none` skips PostGIS startup probes but does not disable request-time
+geometry decoding and mesh validation. Bounds remain an operator-provided
+source contract in metadata mode; exact extent verification belongs to full
+validation. Validation never modifies source relations.
+
+`surface_subtree_envelope_shortcut: true` is a separate, opt-in operator
+assertion for large, audited `surface_geometry_z` relations. It states that
+every non-empty row already satisfies Lucy's decode, topology, planarity, and
+triangulation contract, allowing subtree generation to treat a feature
+envelope wholly covered by a conservative inner tile as renderable content
+without reading that geometry again. Neither metadata nor full startup
+validation automatically certifies this stronger assertion. Re-audit the
+relation before keeping the shortcut enabled after inserts, updates, table
+replacement, or changes to Lucy's mesh contract. Content requests continue to
+decode and validate every geometry they actually render.
 
 The surface strategy does not use `ST_IsValid`. GEOS applies polygon validity
 rules in XY; a legitimate vertical wall has a line-shaped XY projection and is

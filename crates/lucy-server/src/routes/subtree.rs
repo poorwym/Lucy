@@ -1,8 +1,8 @@
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use tokio_postgres::NoTls;
-use tracing::{debug, error};
+use tokio_postgres::IsolationLevel;
+use tracing::debug;
 
 use lucy_core::source::SourceConfig;
 use lucy_core::subtree::generate_subtree_bytes_with_availability;
@@ -23,6 +23,7 @@ pub(crate) async fn source_subtree(
 ) -> Result<Response, RouteError> {
     let source = state.source(&source_id)?;
     subtree_response(
+        &state,
         &source_id,
         &source,
         parse_tile_path(&level, &x, &y_file, ".subtree")?,
@@ -36,6 +37,7 @@ pub(crate) async fn default_subtree(
 ) -> Result<Response, RouteError> {
     let source = state.default_source()?;
     subtree_response(
+        &state,
         state.default_source_id(),
         &source,
         parse_tile_path(&level, &x, &y_file, ".subtree")?,
@@ -45,10 +47,11 @@ pub(crate) async fn default_subtree(
 
 #[tracing::instrument(
     name = "subtree",
-    skip(source),
+    skip(state, source),
     fields(tile.level = tile.level, tile.x = tile.x, tile.y = tile.y)
 )]
 async fn subtree_response(
+    state: &AppState,
     source_id: &str,
     source: &SourceConfig,
     tile: TileCoord,
@@ -57,19 +60,26 @@ async fn subtree_response(
     ensure_subtree_root(source, tile)?;
 
     let connection = resolve_connection_string(&source.connection)?;
+    let mut client = state.postgres_client(source_id, &connection).await?;
+    // A cancelled request drops this lease while it is marked for discard,
+    // closing any query that PostgreSQL may still be executing.
+    client.discard();
     let started = Instant::now();
-    let (client, connection_task) = tokio_postgres::connect(&connection, NoTls).await?;
-    debug!(
-        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        "PostGIS connection established"
-    );
-    tokio::spawn(async move {
-        if let Err(error) = connection_task.await {
-            error!(error = %error, "PostGIS connection task failed");
-        }
-    });
-    let started = Instant::now();
-    let availability = query_subtree_availability(&client, source, tile).await?;
+    // Surface availability carries a conservative contained-feature count
+    // from the broad phase into an exact fringe query. A repeatable-read
+    // snapshot prevents concurrent source changes from moving a feature
+    // between those two sets and making the combined count inconsistent.
+    let transaction = client
+        .client_mut()
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let availability = query_subtree_availability(&transaction, source, tile).await?;
+    transaction.commit().await?;
+    client.reuse();
+    drop(client);
     debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         available_tile_count = availability.tile.iter().filter(|&&value| value).count(),

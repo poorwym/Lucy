@@ -1,9 +1,11 @@
 FROM postgis/postgis:18-3.6
 
-# RDNAPTRANS2018 resources published through the PROJ datum-grid CDN. The
-# files are CC BY 4.0; see https://cdn.proj.org/nl_nsgi_README.txt.
+# RDNAPTRANS2018 and FIN2023N2000 resources published through the PROJ
+# datum-grid CDN. The files are CC BY 4.0; see the nl_nsgi and fi_nls README
+# files at https://cdn.proj.org/.
 ARG RDNAP_HORIZONTAL_GRID_SHA256=7653831191b424e715a906468962fc60071cfb71a3186b2a58f098bab8bf41de
 ARG RDNAP_VERTICAL_GRID_SHA256=f8e32c56bf8940fc3fefbc0e413eb4546633ed598b669c63856cddf8328992c0
+ARG FIN2023N2000_GRID_SHA256=82ce62ed36910a61fc79010702b3e48fdb45cdfc90a248114ac90a7cb5e30cf7
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -13,13 +15,19 @@ RUN apt-get update \
     && curl --fail --show-error --silent --location \
         --output /usr/share/proj/nl_nsgi_nlgeo2018.tif \
         https://cdn.proj.org/nl_nsgi_nlgeo2018.tif \
+    && curl --fail --show-error --silent --location \
+        --output /usr/share/proj/fi_nls_fin2023n2000.tif \
+        https://cdn.proj.org/fi_nls_fin2023n2000.tif \
     && echo "${RDNAP_HORIZONTAL_GRID_SHA256}  /usr/share/proj/nl_nsgi_rdtrans2018.tif" \
         | sha256sum --check --strict \
     && echo "${RDNAP_VERTICAL_GRID_SHA256}  /usr/share/proj/nl_nsgi_nlgeo2018.tif" \
         | sha256sum --check --strict \
+    && echo "${FIN2023N2000_GRID_SHA256}  /usr/share/proj/fi_nls_fin2023n2000.tif" \
+        | sha256sum --check --strict \
     && chmod 0644 \
         /usr/share/proj/nl_nsgi_rdtrans2018.tif \
         /usr/share/proj/nl_nsgi_nlgeo2018.tif \
+        /usr/share/proj/fi_nls_fin2023n2000.tif \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
