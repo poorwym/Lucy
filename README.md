@@ -68,8 +68,19 @@ Maintainers can publish immutable version and commit tags to GHCR with:
 just docker-publish 0.1.0
 ```
 
-The recipe intentionally does not move `latest`; release automation owns that
-stable-channel decision.
+The manual recipe intentionally does not move `latest`. After the release
+workflow is present on `main`, every subsequently merged pull request publishes
+the current workspace version as:
+
+- `ghcr.io/poorwym/lucy:<version>`;
+- `ghcr.io/poorwym/lucy:sha-<commit>`;
+- `ghcr.io/poorwym/lucy:latest`;
+- a matching Git tag and GitHub Release.
+
+After a successful release, the workflow commits the next patch version to
+`Cargo.toml` and `Cargo.lock`. For example, releasing `0.1.0` prepares `0.1.1`.
+The workflow uses the repository `GITHUB_TOKEN`; it does not require a personal
+GHCR token.
 
 ## More documentation
 

@@ -96,6 +96,13 @@ deployment also updates its mount, port, and health-check wiring consistently.
 Images are immutable at full SemVer and `sha-<commit>` tags. The `latest` tag
 may move only for a stable release. Release candidates must not move it.
 
+Merging a pull request into `main` starts the stable release workflow. The
+workflow tests the Rust workspace, publishes the `linux/amd64` and `linux/arm64`
+image under the current workspace version, commit, and `latest` tags, creates
+the matching GitHub Release, and then advances the workspace patch version.
+Manual `just docker-publish` releases remain immutable and do not move
+`latest`.
+
 ## Standalone platforms
 
 The v0.1 standalone archive matrix is:
