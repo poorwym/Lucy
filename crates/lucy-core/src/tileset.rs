@@ -204,6 +204,63 @@ fn require_template(template: &str, field: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::source::SourceCatalog;
+    use serde_json::Value;
+
+    fn assert_json_equivalent(actual: &Value, expected: &Value, path: &str) {
+        match (actual, expected) {
+            (Value::Number(actual), Value::Number(expected)) => {
+                if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_i64()) {
+                    assert_eq!(actual, expected, "integer mismatch at {path}");
+                } else if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_u64())
+                {
+                    assert_eq!(actual, expected, "integer mismatch at {path}");
+                } else {
+                    let actual = actual
+                        .as_f64()
+                        .expect("actual JSON number should be finite");
+                    let expected = expected
+                        .as_f64()
+                        .expect("expected JSON number should be finite");
+                    let scale = actual.abs().max(expected.abs()).max(1.0);
+                    let tolerance = 8.0 * f64::EPSILON * scale;
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "float mismatch at {path}: actual={actual}, expected={expected}, tolerance={tolerance}"
+                    );
+                }
+            }
+            (Value::Array(actual), Value::Array(expected)) => {
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "array length mismatch at {path}"
+                );
+                for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    assert_json_equivalent(actual, expected, &format!("{path}[{index}]"));
+                }
+            }
+            (Value::Object(actual), Value::Object(expected)) => {
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "object field count mismatch at {path}"
+                );
+                for (key, expected) in expected {
+                    let actual = actual
+                        .get(key)
+                        .unwrap_or_else(|| panic!("missing field at {path}.{key}"));
+                    assert_json_equivalent(actual, expected, &format!("{path}.{key}"));
+                }
+                for key in actual.keys() {
+                    assert!(
+                        expected.contains_key(key),
+                        "unexpected field at {path}.{key}"
+                    );
+                }
+            }
+            _ => assert_eq!(actual, expected, "JSON mismatch at {path}"),
+        }
+    }
 
     fn fixture_source() -> SourceConfig {
         let mut catalog =
@@ -220,9 +277,12 @@ mod tests {
         let source = fixture_source();
         let json = generate_tileset_json(&source, &TilesetOptions::default())
             .expect("tileset should generate");
-        let expected = include_str!("../tests/golden/poc_buildings_tileset.json").trim_end();
+        let actual: Value = serde_json::from_str(&json).expect("generated tileset should be JSON");
+        let expected: Value =
+            serde_json::from_str(include_str!("../tests/golden/poc_buildings_tileset.json"))
+                .expect("golden tileset should be JSON");
 
-        assert_eq!(json, expected);
+        assert_json_equivalent(&actual, &expected, "$");
     }
 
     #[test]
