@@ -122,8 +122,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=lucy-release
+          cache-to: type=gha,scope=lucy-release,mode=min,ignore-error=true
 
       - name: Create GitHub release
         if: steps.version.outputs.publish == 'true'
