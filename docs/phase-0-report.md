@@ -24,8 +24,8 @@ Start PostGIS, load the fixture, and run the POC server:
 
 ```sh
 just up
-just load-poc-fixture
-DATABASE_URL=postgres://lucy:lucy@localhost:5432/lucy cargo run -p lucy-poc -- serve config/poc-sources.yaml 127.0.0.1:8080
+just load-sample-fixture
+DATABASE_URL=postgres://lucy:lucy@localhost:5432/lucy cargo run -p lucy -- serve --config config/poc-sources.yaml --bind 127.0.0.1:8080
 ```
 
 Routes:
@@ -103,7 +103,7 @@ does not embed inline HTML.
 Local verification:
 
 ```sh
-cargo test -p lucy-poc
+cargo test -p lucy
 ```
 
 The tests cover:

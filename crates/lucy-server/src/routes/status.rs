@@ -6,7 +6,8 @@ use crate::state::AppState;
 
 pub(crate) async fn root_status(State(state): State<AppState>) -> Json<RootStatusBody> {
     Json(RootStatusBody {
-        name: "lucy-server",
+        name: "lucy",
+        version: env!("CARGO_PKG_VERSION"),
         default_source_id: state.default_source_id().to_string(),
         source_count: state.source_count(),
         routes: vec![
@@ -37,6 +38,7 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Json<MetricsBody> 
 #[derive(Serialize)]
 pub(crate) struct RootStatusBody {
     name: &'static str,
+    version: &'static str,
     default_source_id: String,
     source_count: usize,
     routes: Vec<&'static str>,

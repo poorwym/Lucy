@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+target
+frontend
+config
+docs
+fixtures
+scripts
+docker
+docker-compose*.yml
+*.md

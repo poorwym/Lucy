@@ -29,5 +29,8 @@ target
 /prompt.md
 /AGENTS.override.md
 /tmp.md
+/lucy.yaml
+/.env
+/.env.*
 /frontend/7-1024-1008.b3dm
 /frontend/temp.b3dm

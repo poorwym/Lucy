@@ -19,9 +19,6 @@ pub use server::{
 pub use settings::ServerSettings;
 pub use state::AppState;
 
-pub const DEFAULT_POC_ADDR: &str = DEFAULT_ADDR;
-pub type PocServerError = ServerError;
-
 pub fn load_source_catalog(path: impl AsRef<Path>) -> Result<SourceCatalog, ConfigLoadError> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path).map_err(|source| ConfigLoadError::Read {

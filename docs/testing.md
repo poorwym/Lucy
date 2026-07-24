@@ -28,7 +28,7 @@ grid sentinel and fixture shape, and run the server suite with a real database:
 ```sh
 just up
 just test-postgis
-just fixture-server
+just server config/fixture-sources.yaml
 ```
 
 `just test-postgis` performs these prerequisites:

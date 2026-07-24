@@ -94,7 +94,7 @@ just load-helsinki-kalasatama /path/to/Helsinki3D_CityGML_Kalasatama_20190326.zi
 Run Lucy with the dedicated catalog:
 
 ```sh
-just poc-server config/helsinki-kalasatama-lod2.yaml
+just server config/helsinki-kalasatama-lod2.yaml
 ```
 
 The configured region is a safely outward-rounded EPSG:4979 extent:

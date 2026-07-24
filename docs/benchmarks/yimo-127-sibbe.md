@@ -128,7 +128,7 @@ SHA-256 和导入命令没有保存在仓库或数据库中。因此：
 ### Lucy release build
 
 ```bash
-cargo build --release -p lucy-poc
+cargo build --release -p lucy
 ```
 
 构建完成后再开始正式计时。本次构建耗时 5.60 s，不计入下表。
@@ -155,7 +155,7 @@ tiling、quadtree、GLB、double-sided、`ADD`。
 ```bash
 DATABASE_URL='postgres://<user>:<password>@localhost:5432/lucy' \
 /usr/bin/time -lp python3 scripts/benchmarks/materialize_lucy.py \
-  --server-binary target/release/lucy-poc \
+  --server-binary target/release/lucy \
   --config config/benchmark-nl-lod12.yaml \
   --address 127.0.0.1:18080 \
   --source nl_lod12_3d \

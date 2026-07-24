@@ -176,7 +176,7 @@ when that scan should gate readiness, or run it explicitly without changing
 the configured startup policy:
 
 ```sh
-cargo run -p lucy-poc -- validate config/sources.yaml [source_id]
+cargo run -p lucy -- validate --config config/sources.yaml [source_id]
 ```
 
 `startup: none` skips PostGIS startup probes but does not disable request-time

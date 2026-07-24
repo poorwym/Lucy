@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Lucy generates 3D Tiles from PostGIS data. Rust code is split into `crates/lucy-core` (domain logic), `crates/lucy-server` (HTTP and database services), and `crates/lucy-poc` (POC executable). Configuration lives in `config/`, SQL fixtures in `fixtures/postgis/`, and design notes in `docs/`. The React/TypeScript Cesium demo and its assets are under `frontend/src/`. `target/` and `frontend/dist/` are generated.
+Lucy generates 3D Tiles from PostGIS data. Rust code is split into `crates/lucy-core` (domain logic), `crates/lucy-server` (HTTP and database services), and `crates/lucy` (the public executable). Configuration lives in `config/`, SQL fixtures in `fixtures/postgis/`, and design notes in `docs/`. The React/TypeScript Cesium demo and its assets are under `frontend/src/`. `target/` and `frontend/dist/` are generated.
 
 ## Build, Test, and Development Commands
 
@@ -11,8 +11,10 @@ Lucy generates 3D Tiles from PostGIS data. Rust code is split into `crates/lucy-
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo clippy --workspace --all-targets --all-features`: run Rust lints.
 - `just up` / `just down`: start or stop the local PostGIS container.
-- `just load-poc-fixture`: load `fixtures/postgis/poc_buildings.sql`.
-- `just poc-server`: run the server using `config/poc-sources.yaml` at `127.0.0.1:8080`.
+- `just load-sample-fixture`: load the deterministic local building fixture.
+- `just server`: run the server using `config/development.yaml` at `127.0.0.1:8080`.
+- `just dev`: run the source-mounted development image with hot reload.
+- `just docker-build` / `just docker-test`: build and smoke-test the production image.
 - `cd frontend && bun install && bun run dev`: install dependencies and start Vite.
 - `cd frontend && bun run build && bun run lint`: build and lint the demo.
 
@@ -22,7 +24,7 @@ Use `rustfmt` output (four-space indentation) and resolve Clippy warnings. Follo
 
 ## Testing Guidelines
 
-Place Rust unit tests beside their modules using `#[cfg(test)]`; put public API integration tests in a crate's `tests/` directory. Use behavioral names such as `rejects_invalid_tile_level`. Run `cargo test --workspace` before submitting. The frontend has no test runner, so run its lint and build scripts and manually verify UI changes with Vite and the POC server.
+Place Rust unit tests beside their modules using `#[cfg(test)]`; put public API integration tests in a crate's `tests/` directory. Use behavioral names such as `rejects_invalid_tile_level`. Run `cargo test --workspace` before submitting. The frontend has no test runner, so run its lint and build scripts and manually verify UI changes with Vite and the Lucy server.
 
 ## Commit & Pull Request Guidelines
 

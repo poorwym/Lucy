@@ -1,11 +1,11 @@
 [package]
-name = "lucy-poc"
+name = "lucy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 lucy-core = { path = "../lucy-core" }

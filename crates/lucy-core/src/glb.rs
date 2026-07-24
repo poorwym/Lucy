@@ -257,7 +257,7 @@ pub fn encode_feature_content_tile_glb(
     let document = json!({
         "asset": {
             "version": "2.0",
-            "generator": "lucy-poc"
+            "generator": "lucy"
         },
         "extensionsUsed": ["EXT_mesh_features", "EXT_structural_metadata"],
         "extensions": {
@@ -413,7 +413,7 @@ fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
     let document = json!({
         "asset": {
             "version": "2.0",
-            "generator": "lucy-poc"
+            "generator": "lucy"
         },
         "scene": 0,
         "scenes": [
