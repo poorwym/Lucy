@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - closed
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/poorwym/lucy
+
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --no-self-update
+          rustup override set 1.94.1
+
+      - name: Determine release version
+        id: version
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq --raw-output '.packages[] | select(.name == "lucy") | .version'
+          )"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Workspace version must be a stable SemVer, got '${version}'"
+            exit 1
+          fi
+
+          IFS=. read -r major minor patch <<<"$version"
+          next_version="${major}.${minor}.$((patch + 1))"
+          latest_tag="$(
+            git tag --list 'v*' --sort=-v:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1 || true
+          )"
+
+          publish=true
+          needs_bump=true
+          if [[ -n "$latest_tag" ]] &&
+             git merge-base --is-ancestor "$SOURCE_SHA" "${latest_tag}^{commit}"; then
+            publish=false
+            if [[ "$latest_tag" != "v${version}" ]]; then
+              needs_bump=false
+            fi
+          elif git rev-parse --verify --quiet "refs/tags/v${version}" >/dev/null; then
+            echo "::error::v${version} already exists but does not contain ${SOURCE_SHA}; the workspace version was not advanced"
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "next_version=${next_version}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "publish=${publish}"
+            echo "needs_bump=${needs_bump}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Run workspace tests
+        if: steps.version.outputs.publish == 'true'
+        run: cargo test --workspace --locked
+
+      - name: Set up QEMU
+        if: steps.version.outputs.publish == 'true'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        if: steps.version.outputs.publish == 'true'
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        if: steps.version.outputs.publish == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: docker/lucy/Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            REVISION=${{ steps.version.outputs.revision }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:sha-${{ steps.version.outputs.revision }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ steps.version.outputs.revision }}
+        run: |
+          gh release create "v${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${REVISION}" \
+            --title "Lucy v${VERSION}" \
+            --generate-notes
+
+      - name: Prepare next patch version
+        if: steps.version.outputs.needs_bump == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git switch --force-create release-version-bump origin/main
+
+          remote_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq --raw-output '.packages[] | select(.name == "lucy") | .version'
+          )"
+          if [[ "$remote_version" == "$NEXT_VERSION" ]]; then
+            echo "main already targets v${NEXT_VERSION}"
+            exit 0
+          fi
+          if [[ "$remote_version" != "$VERSION" ]]; then
+            echo "::error::Expected main at v${VERSION} or v${NEXT_VERSION}, got v${remote_version}"
+            exit 1
+          fi
+
+          python3 - "$VERSION" "$NEXT_VERSION" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          current, next_version = sys.argv[1:]
+          path = Path("Cargo.toml")
+          lines = path.read_text().splitlines(keepends=True)
+          in_workspace_package = False
+          replacements = 0
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped == "[workspace.package]":
+                  in_workspace_package = True
+                  continue
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  in_workspace_package = False
+              if in_workspace_package and re.fullmatch(
+                  rf'version\s*=\s*"{re.escape(current)}"\s*', stripped
+              ):
+                  newline = "\n" if line.endswith("\n") else ""
+                  lines[index] = f'version = "{next_version}"{newline}'
+                  replacements += 1
+
+          if replacements != 1:
+              raise SystemExit(
+                  f"expected one workspace version {current}, replaced {replacements}"
+              )
+          path.write_text("".join(lines))
+          PY
+
+          cargo check --workspace
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): prepare v${NEXT_VERSION}"
+          git pull --rebase origin main
+          git push origin HEAD:main

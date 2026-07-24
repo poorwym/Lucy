@@ -61,7 +61,8 @@ mod tests {
             Some(&HeaderValue::from_static("*"))
         );
         let root = body_json(root).await;
-        assert_eq!(root["name"], "lucy-server");
+        assert_eq!(root["name"], "lucy");
+        assert_eq!(root["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(root["default_source_id"], "poc_buildings");
 
         let health = request("/health").await;

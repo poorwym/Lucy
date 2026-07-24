@@ -1,82 +1,92 @@
 # Lucy
-A middleware layer for dynamically generating 3D tiles from a PostGIS database.
 
-## POC Workspace
+Lucy is server-only middleware that dynamically generates 3D Tiles from
+PostGIS. Its v0.1 public CLI, HTTP, configuration, container, and platform
+guarantees are defined in the
+[v0.1 distribution contract](docs/distribution-v0.1.md).
 
-Lucy keeps the original extruded-footprint POC and also supports native
-`PolygonZ` / `MultiPolygonZ` surface sources. The two geometry strategies and
-their coordinate contracts are documented in
-[`docs/source-geometry-model.md`](docs/source-geometry-model.md). The original
-footprint assumptions remain documented in
-[`docs/poc-source-contract.md`](docs/poc-source-contract.md) and the standards
-validation report in [`docs/phase-0-report.md`](docs/phase-0-report.md).
+## Run the CLI
 
-Run the POC config loader:
+Copy the example catalog, inject the database URL at runtime, then validate and
+serve it:
 
 ```sh
-cargo run -p lucy-poc -- config/poc-sources.yaml
+cp config/lucy.example.yaml lucy.yaml
+export DATABASE_URL='postgres://user:password@localhost:5432/database'
+cargo run -p lucy -- validate
+cargo run -p lucy -- serve
 ```
 
-Check the workspace:
+The standalone defaults are `lucy.yaml` and `127.0.0.1:8080`. Use
+`lucy serve --help` for explicit configuration and bind options.
+
+## Develop with Docker hot reload
+
+The local PostGIS image under `docker/postgis/` is development infrastructure,
+not a Lucy distribution. Start it together with the source-mounted development
+image using:
 
 ```sh
-cargo check
+just dev
 ```
 
-Run the POC HTTP server:
+The repository is mounted at `/workspace`; edits under `crates/` or to
+`config/development.yaml` automatically rebuild and restart `lucy`. Stop the
+stack with `just dev-down`.
+
+To run directly on the host instead:
 
 ```sh
 just up
-just load-fixtures
-just verify-rdnap-grids
-just fixture-server
+just load-sample-fixture
+just server
 ```
 
-Server startup uses bounded metadata validation by default. Run an explicit
-full source scan separately when auditing imported data:
+## Build and verify the production image
+
+The final image contains only the release `lucy` binary and runs as a non-root
+user. It does not contain the Rust toolchain, source tree, fixtures, Cesium, or
+frontend assets.
 
 ```sh
-DATABASE_URL=postgres://lucy:lucy@localhost:5432/lucy \
-  cargo run -p lucy-poc -- validate config/fixture-sources.yaml surface_buildings_7415
+just docker-build
+just docker-test
 ```
 
-The optional final argument selects one source; omitting it validates every
-configured source.
-
-`just up` builds a local PostGIS image containing checksum-pinned
-RDNAPTRANS2018 and FIN2023N2000 grids. They support the Netherlands fixture and
-the separately downloaded Helsinki CityGML source without confusing NAP or
-N2000 gravity-related heights with EPSG:4979 ellipsoidal height. Runtime PROJ
-networking stays off.
-
-The configured native-surface sample is available at:
-
-```text
-http://127.0.0.1:8080/sources/surface_buildings_7415/tileset.json
-```
-
-`config/fixture-sources.yaml` contains the two deterministic tables created by
-`just load-fixtures` plus the separately managed `nl_lod12_3d` benchmark;
-`poc_buildings` is explicitly its default source for legacy routes.
-The completed pg2b3dm/Lucy full-materialization comparison is documented in
-[`docs/benchmarks/yimo-127-sibbe.md`](docs/benchmarks/yimo-127-sibbe.md).
-The independent Helsinki Kalasatama LoD2 dataset, its reproducible importer,
-3D coordinate conversion, and full-materialization results are documented in
-[`docs/datasets/helsinki-kalasatama.md`](docs/datasets/helsinki-kalasatama.md).
-The existing `just poc-server` command continues to use
-`config/poc-sources.yaml`, including the separately managed
-`controlled_airspace` source.
-
-Run the frontend demo separately:
+Run it with a read-only catalog and a runtime secret:
 
 ```sh
-cd frontend
-bun run dev
+docker run --rm -p 8080:8080 \
+  --env DATABASE_URL='postgres://user:password@host.docker.internal:5432/database' \
+  --mount type=bind,src="$PWD/lucy.yaml",dst=/etc/lucy/config.yaml,readonly \
+  lucy:local
 ```
 
-Open the Vite URL and keep the Rust server running on `127.0.0.1:8080`.
-For the offline native-surface smoke URL and camera parameters, see
-[`docs/testing.md`](docs/testing.md#cesium-smoke-test).
+Maintainers can publish immutable version and commit tags to GHCR with:
 
-See [`docs/testing.md`](docs/testing.md) for unit, PostGIS, validator, and
-Cesium verification status and commands.
+```sh
+just docker-publish 0.1.0
+```
+
+The manual recipe intentionally does not move `latest`. After the release
+workflow is present on `main`, every subsequently merged pull request publishes
+the current workspace version as:
+
+- `ghcr.io/poorwym/lucy:<version>`;
+- `ghcr.io/poorwym/lucy:sha-<commit>`;
+- `ghcr.io/poorwym/lucy:latest`;
+- a matching Git tag and GitHub Release.
+
+After a successful release, the workflow commits the next patch version to
+`Cargo.toml` and `Cargo.lock`. For example, releasing `0.1.0` prepares `0.1.1`.
+The workflow uses the repository `GITHUB_TOKEN`; it does not require a personal
+GHCR token.
+
+## More documentation
+
+The geometry strategies and coordinate contracts are documented in
+[`docs/source-geometry-model.md`](docs/source-geometry-model.md). Historical
+Phase 0 behavior is retained in [`docs/phase-0-report.md`](docs/phase-0-report.md),
+while current verification commands live in [`docs/testing.md`](docs/testing.md).
+The separately hosted Cesium demo under `frontend/` is a consumer of Lucy's
+HTTP API and is never bundled with Lucy distributions.

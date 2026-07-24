@@ -428,7 +428,7 @@ Start PostGIS and load the known source:
 
 ```sh
 just up
-just load-poc-fixture
+just load-sample-fixture
 ```
 
 Use this database URL for local POC runs:
@@ -450,7 +450,7 @@ MultiPolygonZ closed shell with vertical faces. Load it with:
 ```sh
 just load-surface-fixture
 just verify-rdnap-grids
-just fixture-server
+just server config/fixture-sources.yaml
 ```
 
 The deterministic catalog sets this surface source to `max_level: 2`. PostGIS

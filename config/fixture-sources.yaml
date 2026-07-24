@@ -156,3 +156,40 @@ sources:
       - polygon_count
     material:
       default_base_color: [0.76, 0.72, 0.65, 1.0]
+  controlled_airspace:
+    connection: ${DATABASE_URL}
+    schema: public
+    table: controlledairspace
+    geometry_column: geom
+    id_column: id
+    srid: 4326
+    source_model: extruded_footprint
+    base_height_column: base_height_m # Zero if this field is not present in the source table
+    height_column: height_m
+    geometry_types:
+      - Polygon
+      - MultiPolygon
+    bounds:
+      west: -180
+      # south: -90
+      south: -89.999
+      east: 180
+      # north: 90
+      north: 89.999
+      min_height_m: 0.0
+      max_height_m: 50000
+    min_level: 0
+    max_level: 7
+    subtree_levels: 4
+    max_features_per_tile: 5000
+    tileset:
+      content_start_level: 6
+      # root_geometric_error_m: 512.0
+      root_geometric_error_m: 20000000.0
+      content_uri_template: "content/{level}/{x}/{y}.glb"
+      subtree_uri_template: "subtrees/{level}/{x}/{y}.subtree"
+    attributes:
+      - base_height_m
+      - height_m
+    material:
+      default_base_color: [0.72, 0.70, 0.65, 0.5]

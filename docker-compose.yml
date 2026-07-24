@@ -5,14 +5,13 @@ services:
       dockerfile: docker/postgis/Dockerfile
     image: lucy-postgis:18-3.6-rdnaptrans2018
     platform: linux/amd64
-    container_name: lucy-postgres
     environment:
       POSTGRES_DB: lucy
       POSTGRES_USER: lucy
       POSTGRES_PASSWORD: lucy
       PROJ_NETWORK: "OFF"
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
@@ -22,5 +21,72 @@ services:
       retries: 5
       start_period: 10s
 
+  lucy:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: docker/lucy/Dockerfile
+      target: development
+    image: lucy:development
+    init: true
+    working_dir: /workspace
+    command:
+      - cargo
+      - watch
+      - --watch
+      - crates
+      - --watch
+      - Cargo.toml
+      - --watch
+      - Cargo.lock
+      - --watch
+      - config/development.yaml
+      - --exec
+      - run --locked -p lucy -- serve --config config/development.yaml --bind 0.0.0.0:8080
+    environment:
+      DATABASE_URL: postgres://lucy:lucy@postgres:5432/lucy
+      RUST_LOG: ${RUST_LOG:-lucy=info,lucy_server=info}
+    ports:
+      - "${LUCY_PORT:-8080}:8080"
+    volumes:
+      - .:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - lucy_target:/workspace/target
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/workspace/target/debug/lucy", "__healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    stop_grace_period: 30s
+
+  lucy-release:
+    profiles: ["release"]
+    build:
+      context: .
+      dockerfile: docker/lucy/Dockerfile
+      target: runtime
+      args:
+        VERSION: ${LUCY_VERSION:-0.1.0-dev}
+        REVISION: ${LUCY_REVISION:-local}
+    image: ${LUCY_IMAGE:-lucy:local}
+    environment:
+      DATABASE_URL: postgres://lucy:lucy@postgres:5432/lucy
+    ports:
+      - "${LUCY_PORT:-8080}:8080"
+    volumes:
+      - ./config/development.yaml:/etc/lucy/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 30s
+
 volumes:
   postgres_data:
+  cargo_registry:
+  cargo_git:
+  lucy_target:

@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::tile::MAX_TILE_LEVEL;
 
-pub const DEFAULT_CONFIG_PATH: &str = "config/poc-sources.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "lucy.yaml";
 pub const DEFAULT_BASE_HEIGHT_M: f32 = 0.0;
 pub const DEFAULT_CONTENT_URI_TEMPLATE: &str = "content/{level}/{x}/{y}.glb";
 pub const DEFAULT_CONTENT_START_LEVEL: u8 = 0;
