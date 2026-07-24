@@ -6,6 +6,7 @@ db_name := env("POSTGRES_DB", "lucy")
 database_url := env("DATABASE_URL", "postgres://lucy:lucy@localhost:5432/lucy")
 lucy_addr := env("LUCY_BIND", "127.0.0.1:8080")
 image_repository := env("LUCY_IMAGE_REPOSITORY", "ghcr.io/poorwym/lucy")
+buildx_builder := env("LUCY_BUILDX_BUILDER", "lucy-multiarch")
 revision := `git rev-parse HEAD`
 rdnap_pipeline := "+proj=pipeline +step +inv +proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel +step +proj=hgridshift +grids=nl_nsgi_rdtrans2018.tif +step +proj=vgridshift +grids=nl_nsgi_nlgeo2018.tif +multiplier=1 +step +proj=cart +ellps=GRS80 +step +proj=helmert +x=0 +y=0 +z=0 +step +inv +proj=cart +ellps=WGS84 +step +proj=unitconvert +xy_in=rad +xy_out=deg"
 fin2023_pipeline := "+proj=pipeline +step +inv +proj=tmerc +lat_0=0 +lon_0=25 +k=1 +x_0=25500000 +y_0=0 +ellps=GRS80 +step +proj=vgridshift +grids=fi_nls_fin2023n2000.tif +multiplier=1 +step +proj=cart +ellps=GRS80 +step +proj=helmert +x=0 +y=0 +z=0 +step +inv +proj=cart +ellps=WGS84 +step +proj=unitconvert +xy_in=rad +xy_out=deg"
@@ -99,15 +100,24 @@ server config="config/fixture-sources.yaml" addr=lucy_addr:
 
 # Build the production, server-only image locally.
 docker-build image="lucy:local" version="0.1.0-dev":
-    docker build --target runtime --build-arg VERSION={{ version }} --build-arg REVISION={{ revision }} --tag {{ image }} .
+    docker build --file docker/lucy/Dockerfile --target runtime --build-arg VERSION={{ version }} --build-arg REVISION={{ revision }} --tag {{ image }} .
 
 # Exercise startup, health, tileset, subtree, and GLB responses.
 docker-test:
     sh scripts/docker-smoke.sh
 
+# Ensure releases use a Buildx driver that can publish multi-platform manifests.
+docker-builder:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker buildx inspect '{{ buildx_builder }}' >/dev/null 2>&1; then
+        docker buildx create --name '{{ buildx_builder }}' --driver docker-container
+    fi
+    docker buildx inspect --bootstrap '{{ buildx_builder }}' >/dev/null
+
 # Publish immutable multi-platform version and commit tags. This does not move latest.
-docker-publish version image=image_repository platforms="linux/amd64,linux/arm64":
-    docker buildx build --target runtime --platform {{ platforms }} --build-arg VERSION={{ version }} --build-arg REVISION={{ revision }} --tag {{ image }}:{{ version }} --tag {{ image }}:sha-{{ revision }} --push .
+docker-publish version image=image_repository platforms="linux/amd64,linux/arm64": docker-builder
+    docker buildx build --builder {{ buildx_builder }} --file docker/lucy/Dockerfile --target runtime --platform {{ platforms }} --build-arg VERSION={{ version }} --build-arg REVISION={{ revision }} --tag {{ image }}:{{ version }} --tag {{ image }}:sha-{{ revision }} --push .
 
 # Stop services and delete volumes.
 clean:

@@ -25,6 +25,7 @@ services:
     profiles: ["dev"]
     build:
       context: .
+      dockerfile: docker/lucy/Dockerfile
       target: development
     image: lucy:development
     init: true
@@ -67,6 +68,7 @@ services:
     profiles: ["release"]
     build:
       context: .
+      dockerfile: docker/lucy/Dockerfile
       target: runtime
       args:
         VERSION: ${LUCY_VERSION:-0.1.0-dev}
