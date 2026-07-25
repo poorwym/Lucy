@@ -1,14 +1,65 @@
 # Lucy
 
-Lucy is server-only middleware that dynamically generates 3D Tiles from
-PostGIS. Its v0.1 public CLI, HTTP, configuration, container, and platform
-guarantees are defined in the
-[v0.1 distribution contract](docs/distribution-v0.1.md).
+Lucy is a server-only service that turns PostGIS geometry into streamable
+[3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) resources on demand.
+PostGIS remains the source of truth; Lucy queries, transforms, tiles, and
+encodes the data when a client requests it.
 
-## Run the CLI
+Lucy ships a CLI and a production container. It does not bundle Cesium, the
+demo frontend, a database, or sample data.
 
-Copy the example catalog, inject the database URL at runtime, then validate and
-serve it:
+## Quick start
+
+The fastest repository-based development path needs Docker and
+[just](https://github.com/casey/just):
+
+```sh
+just dev
+```
+
+This starts PostGIS, loads the deterministic sample buildings, and runs Lucy
+in a source-mounted development container with automatic Rust rebuilds.
+
+Verify the service:
+
+```sh
+curl --fail http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/tileset.json
+curl --fail --output /tmp/lucy-root.glb \
+  http://127.0.0.1:8080/content/0/0/0.glb
+```
+
+Stop the development stack with:
+
+```sh
+just dev-down
+```
+
+## Run the published image
+
+Lucy `v0.1.0` is public on GHCR for `linux/amd64` and `linux/arm64`:
+
+```sh
+docker pull ghcr.io/poorwym/lucy:0.1.0
+cp config/lucy.example.yaml lucy.yaml
+```
+
+Edit `lucy.yaml` so the table, columns, SRID, geometry model, and bounds match
+your PostGIS source. Then inject the database URL at runtime:
+
+```sh
+docker run --rm -p 8080:8080 \
+  --env DATABASE_URL='postgres://user:password@database-host:5432/database' \
+  --mount type=bind,src="$PWD/lucy.yaml",dst=/etc/lucy/config.yaml,readonly \
+  ghcr.io/poorwym/lucy:0.1.0
+```
+
+The database hostname must be reachable from the container; container-local
+`localhost` does not refer to the host machine.
+
+## CLI
+
+Build or run the CLI from the workspace:
 
 ```sh
 cp config/lucy.example.yaml lucy.yaml
@@ -17,76 +68,38 @@ cargo run -p lucy -- validate
 cargo run -p lucy -- serve
 ```
 
-The standalone defaults are `lucy.yaml` and `127.0.0.1:8080`. Use
-`lucy serve --help` for explicit configuration and bind options.
+The public commands are:
 
-## Develop with Docker hot reload
-
-The local PostGIS image under `docker/postgis/` is development infrastructure,
-not a Lucy distribution. Start it together with the source-mounted development
-image using:
-
-```sh
-just dev
+```text
+lucy serve [--config <PATH>] [--bind <ADDRESS>]
+lucy validate [--config <PATH>] [SOURCE_ID]
+lucy --help
+lucy --version
 ```
 
-The repository is mounted at `/workspace`; edits under `crates/` or to
-`config/development.yaml` automatically rebuild and restart `lucy`. Stop the
-stack with `just dev-down`.
-
-To run directly on the host instead:
+## Development checks
 
 ```sh
-just up
-just load-sample-fixture
-just server
-```
-
-## Build and verify the production image
-
-The final image contains only the release `lucy` binary and runs as a non-root
-user. It does not contain the Rust toolchain, source tree, fixtures, Cesium, or
-frontend assets.
-
-```sh
-just docker-build
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 just docker-test
 ```
 
-Run it with a read-only catalog and a runtime secret:
+The optional React/Cesium application under `frontend/` is an independent API
+consumer for manual compatibility checks. It is never included in Lucy
+release artifacts.
 
-```sh
-docker run --rm -p 8080:8080 \
-  --env DATABASE_URL='postgres://user:password@host.docker.internal:5432/database' \
-  --mount type=bind,src="$PWD/lucy.yaml",dst=/etc/lucy/config.yaml,readonly \
-  lucy:local
-```
+## Documentation
 
-Maintainers can publish immutable version and commit tags to GHCR with:
+The project documentation has three stable entry points:
 
-```sh
-just docker-publish 0.1.0
-```
+| Document | Use it for |
+| --- | --- |
+| [User guide](docs/user-guide.md) | Installation, configuration, CLI, HTTP routes, containers, and operations. |
+| [Architecture](docs/architecture.md) | Geometry models, coordinate handling, tiling, validation, and GLB encoding. |
+| [Development](docs/development.md) | Local workflows, tests, fixtures, the Cesium demo, and dataset reproduction. |
 
-The manual recipe intentionally does not move `latest`. After the release
-workflow is present on `main`, every subsequently merged pull request publishes
-the current workspace version as:
-
-- `ghcr.io/poorwym/lucy:<version>`;
-- `ghcr.io/poorwym/lucy:sha-<commit>`;
-- `ghcr.io/poorwym/lucy:latest`;
-- a matching Git tag and GitHub Release.
-
-After a successful release, the workflow commits the next patch version to
-`Cargo.toml` and `Cargo.lock`. For example, releasing `0.1.0` prepares `0.1.1`.
-The workflow uses the repository `GITHUB_TOKEN`; it does not require a personal
-GHCR token.
-
-## More documentation
-
-The geometry strategies and coordinate contracts are documented in
-[`docs/source-geometry-model.md`](docs/source-geometry-model.md). Historical
-Phase 0 behavior is retained in [`docs/phase-0-report.md`](docs/phase-0-report.md),
-while current verification commands live in [`docs/testing.md`](docs/testing.md).
-The separately hosted Cesium demo under `frontend/` is a consumer of Lucy's
-HTTP API and is never bundled with Lucy distributions.
+Configuration examples live in `config/`, deterministic SQL fixtures in
+`fixtures/postgis/`, and the production image definition in
+`docker/lucy/Dockerfile`.
