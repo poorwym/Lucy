@@ -2,7 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Lucy generates 3D Tiles from PostGIS data. Rust code is split into `crates/lucy-core` (domain logic), `crates/lucy-server` (HTTP and database services), and `crates/lucy` (the public executable). Configuration lives in `config/`, SQL fixtures in `fixtures/postgis/`, and design notes in `docs/`. The React/TypeScript Cesium demo and its assets are under `frontend/src/`. `target/` and `frontend/dist/` are generated.
+Lucy generates 3D Tiles from PostGIS data. Rust code is split into
+`crates/lucy-core` (domain logic), `crates/lucy-server` (HTTP and database
+services), and `crates/lucy` (the public CLI and executable). Configuration
+lives in `config/`, SQL fixtures in `fixtures/postgis/`, and maintained guides
+in `docs/`. The React/TypeScript Cesium demo and its assets are under
+`frontend/src/`. `target/` and `frontend/dist/` are generated.
 
 ## Build, Test, and Development Commands
 
@@ -10,10 +15,14 @@ Lucy generates 3D Tiles from PostGIS data. Rust code is split into `crates/lucy-
 - `cargo test --workspace`: run all Rust tests.
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo clippy --workspace --all-targets --all-features`: run Rust lints.
+- `just dev` / `just dev-down`: run or stop PostGIS and the hot-reload Lucy
+  development container.
 - `just up` / `just down`: start or stop the local PostGIS container.
 - `just load-sample-fixture`: load the deterministic local building fixture.
-- `just server`: run the server using `config/development.yaml` at `127.0.0.1:8080`.
-- `just dev`: run the source-mounted development image with hot reload.
+- `just load-surface-fixture`: load the deterministic native-XYZ fixture.
+- `just server`: run Lucy using `config/fixture-sources.yaml` at
+  `127.0.0.1:8080`.
+- `just test-postgis`: run the database-backed integration suite.
 - `just docker-build` / `just docker-test`: build and smoke-test the production image.
 - `cd frontend && bun install && bun run dev`: install dependencies and start Vite.
 - `cd frontend && bun run build && bun run lint`: build and lint the demo.
@@ -33,7 +42,3 @@ History favors scoped Conventional Commits with an optional issue key, for examp
 ## Configuration & Security
 
 Do not commit credentials or local `.env` files. Configure database access through `DATABASE_URL`; defaults in the `justfile` are intended only for local development. Review fixture and configuration changes for sensitive production data before committing.
-
-## Postgres URL
-
-postgresql://lucy:lucy@localhost:5432/lucy
