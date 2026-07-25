@@ -254,8 +254,17 @@ just docker-publish 0.1.1
 
 The recipe publishes immutable SemVer and commit tags but does not move
 `latest`. The GitHub release workflow runs after a pull request is merged into
-`main` or when manually dispatched. It publishes SemVer, SHA, and `latest`
-tags, creates the matching GitHub Release, and prepares the next patch version.
+`main` or when manually dispatched. Before publishing, native runners build
+and execute the four contracted GNU/Linux and macOS targets. Each executable
+must report the workspace version and serve `/health`, `/`, and
+`/tileset.json` from the credential-free sample configuration.
+
+The workflow packages each binary with `LICENSE`, the standalone README, and
+`lucy.example.yaml`. It verifies per-archive SHA-256 files, combines them into
+the released `SHA256SUMS`, publishes SemVer, SHA, and `latest` image tags,
+attaches all four archives to the matching GitHub Release, and prepares the
+next patch version. Artifact filenames, the Git tag, and `lucy --version` all
+derive from the same workspace version.
 
 The workflow uses the repository `GITHUB_TOKEN`; maintainers do not need a
 personal GHCR token. GHCR package visibility is configured separately in the

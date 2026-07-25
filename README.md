@@ -35,12 +35,30 @@ Stop the development stack with:
 just dev-down
 ```
 
-## Run the published image
+## Download the CLI
 
-Lucy `v0.1.0` is public on GHCR for `linux/amd64` and `linux/arm64`:
+Versioned standalone archives are published for x86-64 and ARM64 on GNU/Linux
+and macOS. Download the matching
+[GitHub Release](https://github.com/poorwym/Lucy/releases), verify it against
+the attached `SHA256SUMS`, and run:
 
 ```sh
-docker pull ghcr.io/poorwym/lucy:0.1.0
+tar -xzf lucy-v0.1.1-aarch64-apple-darwin.tar.gz
+cd lucy-v0.1.1-aarch64-apple-darwin
+./lucy --version
+cp lucy.example.yaml lucy.yaml
+```
+
+The [user guide](docs/user-guide.md#standalone-archive) lists every supported
+target, native runtime requirements, checksum commands, and service startup
+steps. Windows and musl Linux users should use the container.
+
+## Run the published image
+
+Lucy `v0.1.1` is public on GHCR for `linux/amd64` and `linux/arm64`:
+
+```sh
+docker pull ghcr.io/poorwym/lucy:0.1.1
 cp config/lucy.example.yaml lucy.yaml
 ```
 
@@ -51,7 +69,7 @@ your PostGIS source. Then inject the database URL at runtime:
 docker run --rm -p 8080:8080 \
   --env DATABASE_URL='postgres://user:password@database-host:5432/database' \
   --mount type=bind,src="$PWD/lucy.yaml",dst=/etc/lucy/config.yaml,readonly \
-  ghcr.io/poorwym/lucy:0.1.0
+  ghcr.io/poorwym/lucy:0.1.1
 ```
 
 The database hostname must be reachable from the container; container-local

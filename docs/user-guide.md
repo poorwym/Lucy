@@ -20,23 +20,59 @@ Any 3D Tiles client can consume Lucy's public HTTP routes independently.
 
 ## Installation
 
+### Standalone archive
+
+Each GitHub Release publishes `lucy` archives for this v0.1 matrix:
+
+| Archive target | Native runtime |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | 64-bit x86 GNU/Linux with glibc 2.35 or newer. |
+| `aarch64-unknown-linux-gnu` | 64-bit ARM GNU/Linux with glibc 2.35 or newer. |
+| `x86_64-apple-darwin` | Intel Mac with macOS 10.12 or newer. |
+| `aarch64-apple-darwin` | Apple Silicon Mac with macOS 11 or newer. |
+
+Choose a full SemVer and the target matching the host. For example:
+
+```sh
+VERSION=0.1.1
+TARGET=aarch64-apple-darwin
+ARCHIVE="lucy-v${VERSION}-${TARGET}.tar.gz"
+BASE_URL="https://github.com/poorwym/Lucy/releases/download/v${VERSION}"
+
+curl --fail --location --remote-name "${BASE_URL}/${ARCHIVE}"
+curl --fail --location --remote-name "${BASE_URL}/SHA256SUMS"
+grep "  ${ARCHIVE}$" SHA256SUMS >"${ARCHIVE}.sha256"
+shasum -a 256 --check "${ARCHIVE}.sha256"
+tar -xzf "${ARCHIVE}"
+cd "lucy-v${VERSION}-${TARGET}"
+./lucy --version
+```
+
+On GNU/Linux, use `sha256sum --check "${ARCHIVE}.sha256"` instead of
+`shasum`. Every archive contains the executable, MIT license, concise
+installation instructions, and `lucy.example.yaml`. Rust and PostgreSQL client
+libraries are not required; Lucy connects directly to a separately operated
+PostgreSQL database with PostGIS.
+
+Windows, musl-based Linux distributions, 32-bit systems, and target triples
+outside the table are unsupported in v0.1. Use the production container on
+those hosts. macOS may require the usual first-run approval for an unsigned
+downloaded executable.
+
 ### Production container
 
 The public image is:
 
 ```text
-ghcr.io/poorwym/lucy:0.1.0
+ghcr.io/poorwym/lucy:0.1.1
 ```
 
 It supports `linux/amd64` and `linux/arm64`. Use a full SemVer tag in
 deployments; `latest` is movable.
 
 ```sh
-docker pull ghcr.io/poorwym/lucy:0.1.0
+docker pull ghcr.io/poorwym/lucy:0.1.1
 ```
-
-Standalone release archives are not currently attached to the GitHub Release.
-Until they are published, use the container or build the CLI from source.
 
 ### Build from source
 
