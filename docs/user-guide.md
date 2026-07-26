@@ -49,7 +49,7 @@ cd "lucy-v${VERSION}-${TARGET}"
 ```
 
 On GNU/Linux, use `sha256sum --check "${ARCHIVE}.sha256"` instead of
-`shasum`. Every archive contains the executable, MIT license, concise
+`shasum`. Every archive contains the executable, Apache 2.0 license, concise
 installation instructions, and `lucy.example.yaml`. Rust and PostgreSQL client
 libraries are not required; Lucy connects directly to a separately operated
 PostgreSQL database with PostGIS.
