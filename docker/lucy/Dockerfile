@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.title="Lucy" \
       org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="Apache-2.0"
 
 RUN groupadd --gid 10001 lucy \
     && useradd --uid 10001 --gid lucy --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin lucy \

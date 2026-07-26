@@ -20,7 +20,10 @@ const SURFACE_CLIP_HEIGHT_EPSILON_M: f64 = 1.0e-9;
 const PROJECTED_EPSILON: f64 = 1.0e-9;
 const NORMAL_EPSILON: f64 = 1.0e-12;
 const MAX_TRIANGULATION_DEVIATION: f64 = 1.0e-8;
-pub const DEFAULT_MAX_NON_PLANAR_DISTANCE_M: f64 = 0.01;
+// The version-pinned official 3DBAG LoD 2.2 relation contains compound faces
+// with metre-scale fitting residuals. Triangulation preserves every original
+// 3D vertex, so this threshold only rejects severely warped source members.
+pub const DEFAULT_MAX_NON_PLANAR_DISTANCE_M: f64 = 5.0;
 
 /// Column-major axis conversion from glTF Y-up `[east, up, -north]` to Lucy
 /// ENU `[east, north, up]`.
@@ -436,25 +439,61 @@ pub fn prepare_surface_geometry_z_with_options(
     if geometry.polygons().is_empty() {
         return Err(MeshError::EmptyGeometry);
     }
-    let polygons = geometry
-        .polygons()
-        .iter()
-        .enumerate()
-        .map(|(polygon_index, polygon)| {
-            prepare_surface_polygon(polygon, source_frame, options, polygon_index)
-        })
-        .collect::<Result<_, _>>()?;
+    let mut polygons = Vec::with_capacity(geometry.polygons().len());
+    for (polygon_index, polygon) in geometry.polygons().iter().enumerate() {
+        match prepare_surface_polygon(polygon, source_frame, options, polygon_index) {
+            Ok(prepared) => polygons.push(prepared),
+            Err(error) if ignorable_surface_member_error(&error) => {
+                tracing::debug!(
+                    polygon_index,
+                    error = %error,
+                    "skipping unrenderable native-surface member"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
     Ok(PreparedSurfaceGeometryZ {
         source_frame,
         polygons,
     })
 }
 
+fn ignorable_surface_member_error(error: &MeshError) -> bool {
+    matches!(
+        error,
+        MeshError::RingTooShort { .. }
+            | MeshError::RingNotClosed { .. }
+            | MeshError::DegenerateRing { .. }
+            | MeshError::SelfIntersectingRing { .. }
+            | MeshError::HoleOutsideExterior { .. }
+            | MeshError::IntersectingInteriorRings { .. }
+            | MeshError::DegenerateEdge { .. }
+            | MeshError::DegenerateTriangle { .. }
+            | MeshError::TriangulationFailed { .. }
+            | MeshError::TriangulationDeviation { .. }
+    )
+}
+
 impl PreparedSurfaceGeometryZ {
     pub fn to_mesh(&self) -> Result<TriangleMesh, MeshError> {
         let mut mesh = TriangleMesh::new();
         for (polygon_index, polygon) in self.polygons.iter().enumerate() {
-            append_prepared_surface_polygon(&mut mesh, polygon, polygon_index)?;
+            let vertex_count = mesh.vertices.len();
+            let index_count = mesh.indices.len();
+            if let Err(error) = append_prepared_surface_polygon(&mut mesh, polygon, polygon_index) {
+                if ignorable_surface_member_error(&error) {
+                    mesh.vertices.truncate(vertex_count);
+                    mesh.indices.truncate(index_count);
+                    tracing::debug!(
+                        polygon_index,
+                        error = %error,
+                        "skipping unrenderable native-surface member during mesh emission"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
         }
         ensure_nonempty_mesh(mesh, "native surface")
     }
@@ -469,13 +508,27 @@ impl PreparedSurfaceGeometryZ {
         let frame_transform = LocalFrameTransform::between(self.source_frame, tile_frame);
         let mut mesh = TriangleMesh::new();
         for (polygon_index, polygon) in self.polygons.iter().enumerate() {
-            append_clipped_surface_polygon(
+            let vertex_count = mesh.vertices.len();
+            let index_count = mesh.indices.len();
+            if let Err(error) = append_clipped_surface_polygon(
                 &mut mesh,
                 polygon,
                 &frame_transform,
                 clip,
                 polygon_index,
-            )?;
+            ) {
+                if ignorable_surface_member_error(&error) {
+                    mesh.vertices.truncate(vertex_count);
+                    mesh.indices.truncate(index_count);
+                    tracing::debug!(
+                        polygon_index,
+                        error = %error,
+                        "skipping unrenderable native-surface member during tile clipping"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
         }
 
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
@@ -500,10 +553,17 @@ impl PreparedSurfaceGeometryZ {
         validate_surface_tile_clip(clip)?;
         for (polygon_index, polygon) in self.polygons.iter().enumerate() {
             for triangle in polygon.triangles.chunks_exact(3) {
-                if !clip_prepared_surface_triangle(polygon, triangle, clip, polygon_index)?
-                    .is_empty()
-                {
-                    return Ok(true);
+                match clip_prepared_surface_triangle(polygon, triangle, clip, polygon_index) {
+                    Ok(fragment) if !fragment.is_empty() => return Ok(true),
+                    Ok(_) => {}
+                    Err(error) if ignorable_surface_member_error(&error) => {
+                        tracing::debug!(
+                            polygon_index,
+                            error = %error,
+                            "skipping unrenderable native-surface triangle during availability"
+                        );
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -2701,6 +2761,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_area_multipolygon_members_are_ignored() {
+        let valid = Polygon3D {
+            exterior: ring3(&[
+                [5.002, 50.002, 10.0],
+                [5.003, 50.002, 10.0],
+                [5.003, 50.003, 10.0],
+                [5.002, 50.003, 10.0],
+                [5.002, 50.002, 10.0],
+            ]),
+            interiors: Vec::new(),
+        };
+        let too_short = Polygon3D {
+            exterior: ring3(&[[5.004, 50.004, 10.0], [5.004, 50.004, 10.0]]),
+            interiors: Vec::new(),
+        };
+        let geometry = SurfaceGeometryZ::MultiPolygon(vec![too_short, valid]);
+        let mesh = surface_geometry_z_to_mesh(&geometry, fixture_frame())
+            .expect("valid members should survive zero-area siblings");
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.indices.len(), 6);
+    }
+
+    #[test]
     fn native_surface_tile_clip_reuses_vertices_for_contained_polygon() {
         let geometry = SurfaceGeometryZ::Polygon(Polygon3D {
             exterior: ring3(&[
@@ -3192,7 +3275,7 @@ mod tests {
                 [5.002, 50.002, 10.0],
                 [5.006, 50.002, 10.0],
                 [5.006, 50.006, 10.0],
-                [5.002, 50.006, 11.0],
+                [5.002, 50.006, 30.0],
                 [5.002, 50.002, 10.0],
             ]),
             interiors: Vec::new(),
@@ -3216,10 +3299,7 @@ mod tests {
         });
         let error = surface_geometry_z_to_mesh(&geometry, fixture_frame())
             .expect_err("self-intersection should fail");
-        assert!(
-            matches!(error, MeshError::SelfIntersectingRing { .. }),
-            "unexpected error: {error:?}"
-        );
+        assert!(matches!(error, MeshError::MeshIsEmpty("native surface")));
     }
 
     #[test]
