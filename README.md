@@ -1,5 +1,7 @@
 # Lucy
 
+[![Lucy — PostGIS to 3D Tiles, live](docs/assets/og.png)](https://lucy-demo.yimowu.com)
+
 Lucy is a server-only service that turns PostGIS geometry into streamable
 [3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) resources on demand.
 PostGIS remains the source of truth; Lucy queries, transforms, tiles, and
@@ -7,6 +9,13 @@ encodes the data when a client requests it.
 
 Lucy ships a CLI and a production container. It does not bundle Cesium, the
 demo frontend, a database, or sample data.
+
+## Live demo
+
+Explore Lucy's on-demand 3D Tiles streaming in the
+[interactive Cesium demo](https://lucy-demo.yimowu.com).
+
+[![Lucy live demo showing PostGIS buildings streamed as 3D Tiles](docs/assets/demo-screenshot.png)](https://lucy-demo.yimowu.com)
 
 ## Quick start
 
