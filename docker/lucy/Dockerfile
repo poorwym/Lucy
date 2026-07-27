@@ -3,7 +3,13 @@
 ARG RUST_IMAGE=rust:1.94.1-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
 ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-FROM ${RUST_IMAGE} AS development
+FROM ${RUST_IMAGE} AS rust-build-base
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM rust-build-base AS development
 
 RUN cargo install --locked --version 8.5.3 cargo-watch
 
@@ -11,7 +17,7 @@ WORKDIR /workspace
 
 CMD ["cargo", "watch", "--watch", "crates", "--watch", "Cargo.toml", "--watch", "Cargo.lock", "--exec", "run --locked -p lucy -- serve"]
 
-FROM ${RUST_IMAGE} AS builder
+FROM rust-build-base AS builder
 
 WORKDIR /workspace
 

@@ -3646,7 +3646,16 @@ mod tests {
                 .expect("content glTF JSON should parse");
         assert_eq!(
             content_document["extensionsUsed"],
-            serde_json::json!(["EXT_mesh_features", "EXT_structural_metadata"])
+            serde_json::json!([
+                "EXT_mesh_features",
+                "EXT_structural_metadata",
+                "KHR_mesh_quantization",
+                "EXT_meshopt_compression"
+            ])
+        );
+        assert_eq!(
+            content_document["extensionsRequired"],
+            serde_json::json!(["KHR_mesh_quantization", "EXT_meshopt_compression"])
         );
         assert_eq!(
             content_document["meshes"][0]["primitives"][0]["attributes"]["NORMAL"],
@@ -3656,6 +3665,18 @@ mod tests {
             content_document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"],
             3
         );
+        let position_accessor = &content_document["accessors"]
+            [content_document["meshes"][0]["primitives"][0]["attributes"]["POSITION"]
+                .as_u64()
+                .expect("position accessor") as usize];
+        assert_eq!(position_accessor["componentType"], 5123);
+        assert_eq!(position_accessor["normalized"], true);
+        let normal_accessor = &content_document["accessors"]
+            [content_document["meshes"][0]["primitives"][0]["attributes"]["NORMAL"]
+                .as_u64()
+                .expect("normal accessor") as usize];
+        assert_eq!(normal_accessor["componentType"], 5120);
+        assert_eq!(normal_accessor["normalized"], true);
         assert_eq!(
             content_document["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"],
             6
@@ -3665,24 +3686,18 @@ mod tests {
                 .as_u64()
                 .expect("color accessor") as usize;
         let color_accessor = &content_document["accessors"][color_accessor_index];
+        assert_eq!(color_accessor["componentType"], 5126);
         let color_view_index = color_accessor["bufferView"].as_u64().expect("color view") as usize;
         let color_view = &content_document["bufferViews"][color_view_index];
-        let binary_start = 20 + content_json_length + 8;
-        let color_start =
-            binary_start + color_view["byteOffset"].as_u64().expect("color offset") as usize;
-        let first_color = content_body[color_start..color_start + 16]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 color")))
-            .collect::<Vec<_>>();
         assert_eq!(
-            first_color,
-            vec![
-                f32::from(0x8a_u8) / 255.0,
-                f32::from(0xa1_u8) / 255.0,
-                f32::from(0xb1_u8) / 255.0,
-                1.0
-            ]
+            color_view["extensions"]["EXT_meshopt_compression"]["mode"],
+            "ATTRIBUTES"
         );
+        assert_eq!(
+            color_view["extensions"]["EXT_meshopt_compression"]["byteStride"],
+            16
+        );
+        assert_eq!(color_view["buffer"], 1);
 
         let empty_child_index = availability
             .child_subtree
