@@ -184,6 +184,7 @@ async fn content_tile_response(
         node_transform,
         GlbEncodingOptions {
             compression: source.compression,
+            quantization: source.quantization,
         },
     )?;
     debug!(

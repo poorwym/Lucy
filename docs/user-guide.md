@@ -107,6 +107,7 @@ sources:
     srid: 4326
     source_model: extruded_footprint
     compression: meshopt
+    quantization: true
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:
@@ -147,6 +148,7 @@ Other secret-expansion forms are not supported in v0.1.
 | `srid` | Positive PostGIS SRID declared by the geometry column. |
 | `source_model` | `extruded_footprint` or `surface_geometry_z`. |
 | `compression` | Geometry compression backend: `meshopt` (default), `draco`, or `none`. |
+| `quantization` | Quantize eligible geometry attributes; defaults to `true`, set to `false` for full-width floats. |
 | `coordinate_operation` | Supported explicit 3D transform; only valid for native surfaces that are not already EPSG:4979. |
 | `base_height_column`, `height_column` | Extrusion inputs; `height_column` is required for footprints and both fields are invalid for native surfaces. |
 | `geometry_types` | Allowed `Polygon`/`MultiPolygon` or `PolygonZ`/`MultiPolygonZ` types for the selected model. |
@@ -174,9 +176,44 @@ GLB baseline. Both compressed modes make their glTF extension required, so the
 client must provide the matching meshoptimizer or Draco decoder. CesiumJS
 supports both extensions when its standard decoder assets are deployed.
 
-Compression is lossless at this layer: topology, positions, normals, colors,
-feature IDs, structural metadata, and node transforms retain their original
-semantics after decoding.
+Compression itself is lossless: topology, colors, feature IDs, structural
+metadata, and node transforms retain their original semantics after decoding.
+
+### Geometry quantization
+
+`quantization` defaults to `true` independently of the compression backend.
+Lucy stores positions as normalized unsigned 16-bit values and normals as
+normalized signed 8-bit values, and declares `KHR_mesh_quantization`. Set
+`quantization: false` to retain full-width `FLOAT` positions and normals.
+Feature IDs and structural metadata are never quantized.
+
+Position quantization uses one uniform tile-local scale based on the largest
+axis of the content bounds. The scale and origin are composed into the glTF
+node transform, so quantization cannot introduce source-wide placement drift
+and uniform scaling does not skew normals. The maximum per-axis position error
+is half of `largest_tile_extent / 65535`; Euclidean error is bounded by that
+value times `sqrt(3)`. Signed 8-bit normals have at most half a quantization
+step per component and are normalized by the renderer for lighting.
+
+All four `meshopt`/`draco` × enabled/disabled combinations are supported.
+With quantization enabled, compression operates on the already quantized
+attribute representation. With it disabled, both backends preserve the
+full-precision floating-point attributes.
+
+The regression fixture uses 256 perturbed building quads and records bytes and
+wall-clock encoding time on every test run. One debug-build run on 2026-07-27
+recorded:
+
+| Encoding | GLB bytes | Encoding time |
+| --- | ---: | ---: |
+| `none`, full precision | 60,508 | 1.70 ms |
+| `meshopt`, full precision | 21,592 | 1.48 ms |
+| `meshopt`, quantized | 16,832 | 1.41 ms |
+| `draco`, full precision | 54,340 | 2.57 ms |
+| `draco`, quantized | 34,924 | 3.29 ms |
+
+Timings are illustrative and hardware/build dependent; byte counts are kept as
+the representative comparison baseline.
 
 ### Relation requirements
 

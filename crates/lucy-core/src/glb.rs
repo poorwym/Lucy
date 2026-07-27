@@ -14,6 +14,8 @@ const GLB_MAGIC: u32 = 0x4654_6C67;
 const GLB_VERSION: u32 = 2;
 const JSON_CHUNK_TYPE: u32 = 0x4E4F_534A;
 const BIN_CHUNK_TYPE: u32 = 0x004E_4942;
+const BYTE_COMPONENT_TYPE: u32 = 5120;
+const UNSIGNED_SHORT_COMPONENT_TYPE: u32 = 5123;
 const FLOAT_COMPONENT_TYPE: u32 = 5126;
 const UNSIGNED_INT_COMPONENT_TYPE: u32 = 5125;
 const ARRAY_BUFFER_TARGET: u32 = 34962;
@@ -25,23 +27,30 @@ const CHUNK_HEADER_LEN: usize = 8;
 const INDEX_BYTE_LEN: usize = 4;
 const POSITION_COMPONENTS: usize = 3;
 const POSITION_BYTE_LEN: usize = POSITION_COMPONENTS * 4;
+const QUANTIZED_POSITION_BYTE_STRIDE: usize = 8;
 const NORMAL_BYTE_LEN: usize = POSITION_COMPONENTS * 4;
+const QUANTIZED_NORMAL_BYTE_STRIDE: usize = 4;
 const COLOR_BYTE_LEN: usize = 4 * 4;
 const FEATURE_ID_BYTE_LEN: usize = 4;
 const FEATURE_ID_PROPERTY: &str = "featureId";
 const NULL_STRING_SENTINEL: &str = "\0";
 const EXT_MESHOPT_COMPRESSION: &str = "EXT_meshopt_compression";
 const KHR_DRACO_MESH_COMPRESSION: &str = "KHR_draco_mesh_compression";
+const KHR_MESH_QUANTIZATION: &str = "KHR_mesh_quantization";
+const U16_NORMALIZATION_SCALE: f32 = u16::MAX as f32;
+const I8_NORMALIZATION_SCALE: f32 = i8::MAX as f32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlbEncodingOptions {
     pub compression: Compression,
+    pub quantization: bool,
 }
 
 impl Default for GlbEncodingOptions {
     fn default() -> Self {
         Self {
             compression: Compression::Meshopt,
+            quantization: true,
         }
     }
 }
@@ -75,6 +84,22 @@ struct GeometryAttributeStream {
     data_type: DataType,
     normalized: bool,
     packed_bytes: Vec<u8>,
+}
+
+struct EncodedAttribute {
+    buffer_view_bytes: Vec<u8>,
+    packed_bytes: Vec<u8>,
+    byte_stride: usize,
+    component_type: u32,
+    data_type: DataType,
+    normalized: bool,
+}
+
+struct EncodedPosition {
+    attribute: EncodedAttribute,
+    accessor_min: [f32; 3],
+    accessor_max: [f32; 3],
+    node_transform: [f64; 16],
 }
 
 struct DracoPayload {
@@ -224,45 +249,36 @@ pub fn encode_feature_content_tile_glb_with_options(
         mode: MeshoptMode::Triangles,
     }];
 
-    let mut position_bytes = Vec::with_capacity(tile_mesh.vertices.len() * POSITION_BYTE_LEN);
-    for vertex in &tile_mesh.vertices {
-        for component in gltf_position(vertex.position) {
-            position_bytes.extend_from_slice(&component.to_le_bytes());
-        }
-    }
+    let encoded_position =
+        encode_positions(&tile_mesh.vertices, node_transform, options.quantization)?;
     let position_view = append_buffer_view(
         &mut binary,
         &mut buffer_views,
-        &position_bytes,
+        &encoded_position.attribute.buffer_view_bytes,
         BYTE_ALIGNMENT,
         Some(ARRAY_BUFFER_TARGET),
-        Some(POSITION_BYTE_LEN),
+        Some(encoded_position.attribute.byte_stride),
     );
     geometry_views.push(GeometryBufferView {
         view_index: position_view,
         count: tile_mesh.vertices.len(),
-        byte_stride: POSITION_BYTE_LEN,
+        byte_stride: encoded_position.attribute.byte_stride,
         mode: MeshoptMode::Attributes,
     });
 
-    let mut normal_bytes = Vec::with_capacity(tile_mesh.vertices.len() * NORMAL_BYTE_LEN);
-    for vertex in &tile_mesh.vertices {
-        for component in gltf_direction(vertex.normal) {
-            normal_bytes.extend_from_slice(&component.to_le_bytes());
-        }
-    }
+    let encoded_normal = encode_normals(&tile_mesh.vertices, options.quantization);
     let normal_view = append_buffer_view(
         &mut binary,
         &mut buffer_views,
-        &normal_bytes,
+        &encoded_normal.buffer_view_bytes,
         BYTE_ALIGNMENT,
         Some(ARRAY_BUFFER_TARGET),
-        Some(NORMAL_BYTE_LEN),
+        Some(encoded_normal.byte_stride),
     );
     geometry_views.push(GeometryBufferView {
         view_index: normal_view,
         count: tile_mesh.vertices.len(),
-        byte_stride: NORMAL_BYTE_LEN,
+        byte_stride: encoded_normal.byte_stride,
         mode: MeshoptMode::Attributes,
     });
 
@@ -310,17 +326,17 @@ pub fn encode_feature_content_tile_glb_with_options(
             semantic: "POSITION",
             attribute_type: GeometryAttributeType::Position,
             components: 3,
-            data_type: DataType::Float32,
-            normalized: false,
-            packed_bytes: position_bytes,
+            data_type: encoded_position.attribute.data_type,
+            normalized: encoded_position.attribute.normalized,
+            packed_bytes: encoded_position.attribute.packed_bytes,
         },
         GeometryAttributeStream {
             semantic: "NORMAL",
             attribute_type: GeometryAttributeType::Normal,
             components: 3,
-            data_type: DataType::Float32,
-            normalized: false,
-            packed_bytes: normal_bytes,
+            data_type: encoded_normal.data_type,
+            normalized: encoded_normal.normalized,
+            packed_bytes: encoded_normal.packed_bytes,
         },
         GeometryAttributeStream {
             semantic: "COLOR_0",
@@ -384,7 +400,6 @@ pub fn encode_feature_content_tile_glb_with_options(
         );
     }
 
-    let bounds = position_bounds(&tile_mesh.vertices);
     let binary_byte_length = align_len(binary.len(), BYTE_ALIGNMENT);
     let last_feature_id = (features.len() - 1) as f32;
     let alpha_mode = if uses_blending { "BLEND" } else { "OPAQUE" };
@@ -418,7 +433,7 @@ pub fn encode_feature_content_tile_glb_with_options(
         },
         "scene": 0,
         "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0, "matrix": node_transform }],
+        "nodes": [{ "mesh": 0, "matrix": encoded_position.node_transform }],
         "materials": [
             {
                 "name": "Lucy feature colors",
@@ -470,22 +485,24 @@ pub fn encode_feature_content_tile_glb_with_options(
                 "count": tile_mesh.indices.len(),
                 "type": "SCALAR"
             },
-            {
-                "bufferView": position_view,
-                "byteOffset": 0,
-                "componentType": FLOAT_COMPONENT_TYPE,
-                "count": tile_mesh.vertices.len(),
-                "type": "VEC3",
-                "min": bounds.min,
-                "max": bounds.max
-            },
-            {
-                "bufferView": normal_view,
-                "byteOffset": 0,
-                "componentType": FLOAT_COMPONENT_TYPE,
-                "count": tile_mesh.vertices.len(),
-                "type": "VEC3"
-            },
+            attribute_accessor(
+                position_view,
+                encoded_position.attribute.component_type,
+                encoded_position.attribute.normalized,
+                tile_mesh.vertices.len(),
+                "VEC3",
+                Some(encoded_position.accessor_min),
+                Some(encoded_position.accessor_max)
+            ),
+            attribute_accessor(
+                normal_view,
+                encoded_normal.component_type,
+                encoded_normal.normalized,
+                tile_mesh.vertices.len(),
+                "VEC3",
+                None,
+                None
+            ),
             {
                 "bufferView": color_view,
                 "byteOffset": 0,
@@ -505,6 +522,10 @@ pub fn encode_feature_content_tile_glb_with_options(
         ]
     });
 
+    let mut document = document;
+    if options.quantization {
+        add_required_extension(&mut document, KHR_MESH_QUANTIZATION)?;
+    }
     let glb = encode_glb_document_with_compression(
         document,
         binary,
@@ -521,6 +542,179 @@ pub fn encode_feature_content_tile_glb_with_options(
         "feature content GLB encoded"
     );
     Ok(glb)
+}
+
+fn encode_positions(
+    vertices: &[MeshVertex],
+    node_transform: [f64; 16],
+    quantization: bool,
+) -> Result<EncodedPosition, GlbError> {
+    let bounds = position_bounds(vertices);
+    if !quantization {
+        let mut bytes = Vec::with_capacity(vertices.len() * POSITION_BYTE_LEN);
+        for vertex in vertices {
+            for component in gltf_position(vertex.position) {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        return Ok(EncodedPosition {
+            attribute: EncodedAttribute {
+                buffer_view_bytes: bytes.clone(),
+                packed_bytes: bytes,
+                byte_stride: POSITION_BYTE_LEN,
+                component_type: FLOAT_COMPONENT_TYPE,
+                data_type: DataType::Float32,
+                normalized: false,
+            },
+            accessor_min: bounds.min,
+            accessor_max: bounds.max,
+            node_transform,
+        });
+    }
+
+    let spans = [
+        f64::from(bounds.max[0] - bounds.min[0]),
+        f64::from(bounds.max[1] - bounds.min[1]),
+        f64::from(bounds.max[2] - bounds.min[2]),
+    ];
+    let largest_extent = spans.into_iter().fold(0.0_f64, f64::max);
+    let dequantization_scale = if largest_extent > 0.0 {
+        largest_extent
+    } else {
+        1.0
+    };
+    let origin = bounds.min.map(f64::from);
+    let dequantization = [
+        dequantization_scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        dequantization_scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        dequantization_scale,
+        0.0,
+        origin[0],
+        origin[1],
+        origin[2],
+        1.0,
+    ];
+    let composed_transform = multiply_column_major_matrices(node_transform, dequantization);
+    validate_node_transform(composed_transform)?;
+
+    let mut buffer_view_bytes = Vec::with_capacity(vertices.len() * QUANTIZED_POSITION_BYTE_STRIDE);
+    let mut packed_bytes = Vec::with_capacity(vertices.len() * POSITION_COMPONENTS * 2);
+    let mut quantized_min = [u16::MAX; 3];
+    let mut quantized_max = [u16::MIN; 3];
+    for vertex in vertices {
+        let position = gltf_position(vertex.position);
+        for component in 0..POSITION_COMPONENTS {
+            let normalized =
+                (f64::from(position[component]) - origin[component]) / dequantization_scale;
+            let quantized = (normalized.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16;
+            quantized_min[component] = quantized_min[component].min(quantized);
+            quantized_max[component] = quantized_max[component].max(quantized);
+            let bytes = quantized.to_le_bytes();
+            buffer_view_bytes.extend_from_slice(&bytes);
+            packed_bytes.extend_from_slice(&bytes);
+        }
+        buffer_view_bytes.extend_from_slice(&[0, 0]);
+    }
+
+    Ok(EncodedPosition {
+        attribute: EncodedAttribute {
+            buffer_view_bytes,
+            packed_bytes,
+            byte_stride: QUANTIZED_POSITION_BYTE_STRIDE,
+            component_type: UNSIGNED_SHORT_COMPONENT_TYPE,
+            data_type: DataType::Uint16,
+            normalized: true,
+        },
+        accessor_min: quantized_min.map(|value| f32::from(value) / U16_NORMALIZATION_SCALE),
+        accessor_max: quantized_max.map(|value| f32::from(value) / U16_NORMALIZATION_SCALE),
+        node_transform: composed_transform,
+    })
+}
+
+fn encode_normals(vertices: &[MeshVertex], quantization: bool) -> EncodedAttribute {
+    if !quantization {
+        let mut bytes = Vec::with_capacity(vertices.len() * NORMAL_BYTE_LEN);
+        for vertex in vertices {
+            for component in gltf_direction(vertex.normal) {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        return EncodedAttribute {
+            buffer_view_bytes: bytes.clone(),
+            packed_bytes: bytes,
+            byte_stride: NORMAL_BYTE_LEN,
+            component_type: FLOAT_COMPONENT_TYPE,
+            data_type: DataType::Float32,
+            normalized: false,
+        };
+    }
+
+    let mut buffer_view_bytes = Vec::with_capacity(vertices.len() * QUANTIZED_NORMAL_BYTE_STRIDE);
+    let mut packed_bytes = Vec::with_capacity(vertices.len() * POSITION_COMPONENTS);
+    for vertex in vertices {
+        for component in gltf_direction(vertex.normal) {
+            let quantized = (component.clamp(-1.0, 1.0) * I8_NORMALIZATION_SCALE).round() as i8;
+            buffer_view_bytes.push(quantized as u8);
+            packed_bytes.push(quantized as u8);
+        }
+        buffer_view_bytes.push(0);
+    }
+
+    EncodedAttribute {
+        buffer_view_bytes,
+        packed_bytes,
+        byte_stride: QUANTIZED_NORMAL_BYTE_STRIDE,
+        component_type: BYTE_COMPONENT_TYPE,
+        data_type: DataType::Int8,
+        normalized: true,
+    }
+}
+
+fn attribute_accessor(
+    buffer_view: usize,
+    component_type: u32,
+    normalized: bool,
+    count: usize,
+    accessor_type: &str,
+    min: Option<[f32; 3]>,
+    max: Option<[f32; 3]>,
+) -> Value {
+    let mut accessor = Map::new();
+    accessor.insert("bufferView".to_string(), json!(buffer_view));
+    accessor.insert("byteOffset".to_string(), json!(0));
+    accessor.insert("componentType".to_string(), json!(component_type));
+    if normalized {
+        accessor.insert("normalized".to_string(), json!(true));
+    }
+    accessor.insert("count".to_string(), json!(count));
+    accessor.insert("type".to_string(), json!(accessor_type));
+    if let Some(min) = min {
+        accessor.insert("min".to_string(), json!(min));
+    }
+    if let Some(max) = max {
+        accessor.insert("max".to_string(), json!(max));
+    }
+    Value::Object(accessor)
+}
+
+fn multiply_column_major_matrices(left: [f64; 16], right: [f64; 16]) -> [f64; 16] {
+    let mut result = [0.0; 16];
+    for column in 0..4 {
+        for row in 0..4 {
+            result[column * 4 + row] = (0..4)
+                .map(|component| left[component * 4 + row] * right[column * 4 + component])
+                .sum();
+        }
+    }
+    result
 }
 
 fn encode_validated_mesh_glb(mesh: &TriangleMesh) -> Result<Vec<u8>, GlbError> {
@@ -1508,6 +1702,7 @@ mod tests {
             node_transform,
             GlbEncodingOptions {
                 compression: Compression::None,
+                quantization: false,
             },
         )
         .expect("feature GLB should encode");
@@ -1574,15 +1769,23 @@ mod tests {
     }
 
     #[test]
-    fn feature_content_defaults_to_lossless_meshopt_compression() {
+    fn feature_content_meshopt_compression_is_lossless_when_quantization_is_disabled() {
         let features = fixture_content_features();
-        let compressed =
-            encode_feature_content_tile_glb(&features, identity_transform()).expect("meshopt GLB");
+        let compressed = encode_feature_content_tile_glb_with_options(
+            &features,
+            identity_transform(),
+            GlbEncodingOptions {
+                compression: Compression::Meshopt,
+                quantization: false,
+            },
+        )
+        .expect("meshopt GLB");
         let uncompressed = encode_feature_content_tile_glb_with_options(
             &features,
             identity_transform(),
             GlbEncodingOptions {
                 compression: Compression::None,
+                quantization: false,
             },
         )
         .expect("uncompressed GLB");
@@ -1644,6 +1847,7 @@ mod tests {
             identity_transform(),
             GlbEncodingOptions {
                 compression: Compression::Draco,
+                quantization: false,
             },
         )
         .expect("Draco GLB");
@@ -1698,15 +1902,176 @@ mod tests {
     }
 
     #[test]
+    fn compression_quantization_matrix_preserves_geometry_and_feature_contracts() {
+        let mut features = fixture_content_features();
+        features[0].mesh.vertices[1].position[0] += 0.123_45;
+        let normal = [
+            0.31_f32,
+            0.71_f32,
+            (1.0_f32 - 0.31_f32.powi(2) - 0.71_f32.powi(2)).sqrt(),
+        ];
+        for feature in &mut features {
+            for vertex in &mut feature.mesh.vertices {
+                vertex.normal = normal;
+            }
+        }
+
+        let expected_positions = sorted_fixture_positions(&features);
+        let expected_normal = normalize_vector(gltf_direction(normal).map(f64::from));
+        let bounds = combined_position_bounds(&features);
+        let largest_extent = (0..3)
+            .map(|component| f64::from(bounds.max[component] - bounds.min[component]))
+            .fold(0.0_f64, f64::max);
+        let quantized_position_error =
+            f64::sqrt(3.0) * largest_extent / (2.0 * f64::from(u16::MAX)) + 1.0e-6;
+
+        for compression in [Compression::None, Compression::Meshopt, Compression::Draco] {
+            for quantization in [false, true] {
+                let glb = encode_feature_content_tile_glb_with_options(
+                    &features,
+                    identity_transform(),
+                    GlbEncodingOptions {
+                        compression,
+                        quantization,
+                    },
+                )
+                .expect("compression/quantization combination should encode");
+                let parsed = parse_glb(&glb);
+                let required = parsed.document["extensionsRequired"].as_array();
+                let compression_extension = match compression {
+                    Compression::Meshopt => Some(EXT_MESHOPT_COMPRESSION),
+                    Compression::Draco => Some(KHR_DRACO_MESH_COMPRESSION),
+                    Compression::None => None,
+                };
+                assert_eq!(
+                    required.is_some_and(|required| compression_extension
+                        .is_some_and(|extension| required.iter().any(|value| value == extension))),
+                    compression_extension.is_some()
+                );
+                assert_eq!(
+                    required.is_some_and(|required| required
+                        .iter()
+                        .any(|value| value == KHR_MESH_QUANTIZATION)),
+                    quantization
+                );
+                assert_eq!(
+                    parsed.document["accessors"][1]["componentType"],
+                    if quantization {
+                        UNSIGNED_SHORT_COMPONENT_TYPE
+                    } else {
+                        FLOAT_COMPONENT_TYPE
+                    }
+                );
+                assert_eq!(
+                    parsed.document["accessors"][2]["componentType"],
+                    if quantization {
+                        BYTE_COMPONENT_TYPE
+                    } else {
+                        FLOAT_COMPONENT_TYPE
+                    }
+                );
+                assert_eq!(
+                    parsed.document["accessors"][1]["normalized"]
+                        .as_bool()
+                        .unwrap_or(false),
+                    quantization
+                );
+                assert_eq!(
+                    parsed.document["accessors"][2]["normalized"]
+                        .as_bool()
+                        .unwrap_or(false),
+                    quantization
+                );
+
+                let decoded = decoded_feature_geometry(&parsed, compression);
+                assert_eq!(decoded.triangle_count, 4);
+                assert_eq!(
+                    decoded.feature_ids,
+                    vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+                );
+                assert_eq!(decoded.positions.len(), expected_positions.len());
+                let allowed_error = if quantization {
+                    quantized_position_error
+                } else {
+                    1.0e-6
+                };
+                for (actual, expected) in decoded.positions.iter().zip(&expected_positions) {
+                    let error = actual
+                        .iter()
+                        .zip(expected)
+                        .map(|(actual, expected)| (actual - expected).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    assert!(
+                        error <= allowed_error,
+                        "{compression:?}/{quantization}: position error {error} exceeds {allowed_error}"
+                    );
+                }
+                for actual in decoded.normals {
+                    let dot = actual
+                        .iter()
+                        .zip(expected_normal)
+                        .map(|(actual, expected)| actual * expected)
+                        .sum::<f64>()
+                        .clamp(-1.0, 1.0);
+                    let angular_error_deg = dot.acos().to_degrees();
+                    assert!(
+                        angular_error_deg <= 1.0,
+                        "{compression:?}/{quantization}: normal error is {angular_error_deg} degrees"
+                    );
+                }
+                assert_eq!(
+                    read_string_property(&parsed, FEATURE_ID_PROPERTY),
+                    vec!["101", "202"]
+                );
+                assert_eq!(
+                    read_string_property(&parsed, "building_type"),
+                    vec![NULL_STRING_SENTINEL, "office"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feature_content_default_encoding_matches_explicit_meshopt_quantization() {
+        let features = fixture_content_features();
+        let default =
+            encode_feature_content_tile_glb(&features, identity_transform()).expect("default GLB");
+        let explicit = encode_feature_content_tile_glb_with_options(
+            &features,
+            identity_transform(),
+            GlbEncodingOptions {
+                compression: Compression::Meshopt,
+                quantization: true,
+            },
+        )
+        .expect("explicit default GLB");
+        assert_eq!(default, explicit);
+
+        let parsed = parse_glb(&default);
+        let required = parsed.document["extensionsRequired"]
+            .as_array()
+            .expect("required extensions");
+        assert!(
+            required
+                .iter()
+                .any(|value| value == EXT_MESHOPT_COMPRESSION)
+        );
+        assert!(required.iter().any(|value| value == KHR_MESH_QUANTIZATION));
+    }
+
+    #[test]
     fn representative_fixture_records_compression_size_and_encoding_time() {
         let mut features = Vec::new();
         for index in 0..256 {
             let mut mesh = fixture_mesh();
             let x = (index % 16) as f32 * 2.0;
             let y = (index / 16) as f32 * 2.0;
-            for vertex in &mut mesh.vertices {
-                vertex.position[0] += x;
-                vertex.position[1] += y;
+            for (vertex_index, vertex) in mesh.vertices.iter_mut().enumerate() {
+                let seed = (index * 17 + vertex_index * 31) as f32;
+                vertex.position[0] += x + (seed * 0.013_37).sin() * 0.2;
+                vertex.position[1] += y + (seed * 0.021_11).cos() * 0.2;
+                vertex.position[2] += (seed * 0.007_91).sin() * 0.1;
             }
             features.push(ContentFeature {
                 id: format!("building-{index}"),
@@ -1721,26 +2086,52 @@ mod tests {
         }
 
         let mut results = Vec::new();
-        for compression in [Compression::None, Compression::Meshopt, Compression::Draco] {
+        for (compression, quantization) in [
+            (Compression::None, false),
+            (Compression::Meshopt, false),
+            (Compression::Meshopt, true),
+            (Compression::Draco, false),
+            (Compression::Draco, true),
+        ] {
             let started = Instant::now();
             let glb = encode_feature_content_tile_glb_with_options(
                 &features,
                 identity_transform(),
-                GlbEncodingOptions { compression },
+                GlbEncodingOptions {
+                    compression,
+                    quantization,
+                },
             )
             .expect("representative fixture should encode");
-            results.push((compression, glb.len(), started.elapsed()));
+            results.push((compression, quantization, glb.len(), started.elapsed()));
         }
 
-        let baseline = results[0].1;
+        let baseline = results[0].2;
         assert!(
-            results[1].1 < baseline,
+            results[1].2 < baseline,
             "meshopt should reduce fixture size"
         );
-        assert!(results[2].1 < baseline, "Draco should reduce fixture size");
+        assert!(results[3].2 < baseline, "Draco should reduce fixture size");
         eprintln!(
-            "representative fixture: none={} bytes/{:?}, meshopt={} bytes/{:?}, draco={} bytes/{:?}",
-            results[0].1, results[0].2, results[1].1, results[1].2, results[2].1, results[2].2
+            "representative fixture: none={} bytes/{:?}, meshopt-float={} bytes/{:?}, meshopt-quantized={} bytes/{:?}, draco-float={} bytes/{:?}, draco-quantized={} bytes/{:?}",
+            results[0].2,
+            results[0].3,
+            results[1].2,
+            results[1].3,
+            results[2].2,
+            results[2].3,
+            results[3].2,
+            results[3].3,
+            results[4].2,
+            results[4].3
+        );
+        assert!(
+            results[2].2 < results[1].2,
+            "quantization should improve meshopt size"
+        );
+        assert!(
+            results[4].2 < results[3].2,
+            "quantization should improve Draco size"
         );
     }
 
@@ -1801,6 +2192,287 @@ mod tests {
         bin_chunk_type: u32,
         document: Value,
         bin: Vec<u8>,
+    }
+
+    struct DecodedFeatureGeometry {
+        positions: Vec<[f64; 3]>,
+        normals: Vec<[f64; 3]>,
+        feature_ids: Vec<f32>,
+        triangle_count: usize,
+    }
+
+    fn decoded_feature_geometry(
+        parsed: &ParsedGlb,
+        compression: Compression,
+    ) -> DecodedFeatureGeometry {
+        let transform = parsed.document["nodes"][0]["matrix"]
+            .as_array()
+            .expect("node matrix")
+            .iter()
+            .map(|value| value.as_f64().expect("matrix component"))
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("4x4 matrix");
+
+        let mut decoded = match compression {
+            Compression::Meshopt => {
+                let positions = decode_meshopt_view(parsed, 1);
+                let position_stride = parsed.document["bufferViews"][1]["extensions"]
+                    [EXT_MESHOPT_COMPRESSION]["byteStride"]
+                    .as_u64()
+                    .expect("position stride") as usize;
+                let positions = positions
+                    .chunks_exact(position_stride)
+                    .map(
+                        |bytes| match parsed.document["accessors"][1]["componentType"].as_u64() {
+                            Some(value) if value == u64::from(FLOAT_COMPONENT_TYPE) => [
+                                f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                            ],
+                            Some(value) if value == u64::from(UNSIGNED_SHORT_COMPONENT_TYPE) => [
+                                f64::from(u16::from_le_bytes(bytes[0..2].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                                f64::from(u16::from_le_bytes(bytes[2..4].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                                f64::from(u16::from_le_bytes(bytes[4..6].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                            ],
+                            other => panic!("unexpected meshopt position component type {other:?}"),
+                        },
+                    )
+                    .map(|position| transform_point(transform, position))
+                    .collect();
+
+                let normals = decode_meshopt_view(parsed, 2);
+                let normal_stride = parsed.document["bufferViews"][2]["extensions"]
+                    [EXT_MESHOPT_COMPRESSION]["byteStride"]
+                    .as_u64()
+                    .expect("normal stride") as usize;
+                let normals = normals
+                    .chunks_exact(normal_stride)
+                    .map(
+                        |bytes| match parsed.document["accessors"][2]["componentType"].as_u64() {
+                            Some(value) if value == u64::from(FLOAT_COMPONENT_TYPE) => [
+                                f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                            ],
+                            Some(value) if value == u64::from(BYTE_COMPONENT_TYPE) => [
+                                f64::from(bytes[0] as i8) / f64::from(i8::MAX),
+                                f64::from(bytes[1] as i8) / f64::from(i8::MAX),
+                                f64::from(bytes[2] as i8) / f64::from(i8::MAX),
+                            ],
+                            other => panic!("unexpected meshopt normal component type {other:?}"),
+                        },
+                    )
+                    .map(normalize_vector)
+                    .collect();
+
+                let feature_ids = decode_meshopt_view(parsed, 4)
+                    .chunks_exact(FEATURE_ID_BYTE_LEN)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                let index_count = parsed.document["accessors"][0]["count"]
+                    .as_u64()
+                    .expect("index count") as usize;
+                DecodedFeatureGeometry {
+                    positions,
+                    normals,
+                    feature_ids,
+                    triangle_count: index_count / 3,
+                }
+            }
+            Compression::Draco => {
+                let extension = &parsed.document["meshes"][0]["primitives"][0]["extensions"]
+                    [KHR_DRACO_MESH_COMPRESSION];
+                let mut mesh = DracoMesh::new();
+                MeshDecoder::new()
+                    .decode(
+                        &mut DecoderBuffer::new(buffer_view_bytes(parsed, 0)),
+                        &mut mesh,
+                    )
+                    .expect("Draco payload should decode");
+                let position = decoded_attribute(&mesh, extension, "POSITION");
+                let normal = decoded_attribute(&mesh, extension, "NORMAL");
+                let feature_id = decoded_attribute(&mesh, extension, "_FEATURE_ID_0");
+                assert_eq!(
+                    position.normalized(),
+                    parsed.document["accessors"][1]["normalized"]
+                        .as_bool()
+                        .unwrap_or(false)
+                );
+                assert_eq!(
+                    normal.normalized(),
+                    parsed.document["accessors"][2]["normalized"]
+                        .as_bool()
+                        .unwrap_or(false)
+                );
+
+                let positions = (0..mesh.num_points())
+                    .map(|point| {
+                        let point = PointIndex(point as u32);
+                        let value = match position.data_type() {
+                            DataType::Float32 => {
+                                <[f32; 3]>::try_from(read_draco_f32(position, point, 3))
+                                    .expect("three position components")
+                                    .map(f64::from)
+                            }
+                            DataType::Uint16 => read_draco_u16(position, point, 3)
+                                .map(|component| f64::from(component) / f64::from(u16::MAX)),
+                            other => panic!("unexpected Draco position type {other:?}"),
+                        };
+                        transform_point(transform, value)
+                    })
+                    .collect();
+                let normals = (0..mesh.num_points())
+                    .map(|point| {
+                        let point = PointIndex(point as u32);
+                        let value = match normal.data_type() {
+                            DataType::Float32 => {
+                                <[f32; 3]>::try_from(read_draco_f32(normal, point, 3))
+                                    .expect("three normal components")
+                                    .map(f64::from)
+                            }
+                            DataType::Int8 => read_draco_i8(normal, point, 3)
+                                .map(|component| f64::from(component) / f64::from(i8::MAX)),
+                            other => panic!("unexpected Draco normal type {other:?}"),
+                        };
+                        normalize_vector(value)
+                    })
+                    .collect();
+                let feature_ids = (0..mesh.num_points())
+                    .map(|point| read_draco_f32(feature_id, PointIndex(point as u32), 1)[0])
+                    .collect();
+                DecodedFeatureGeometry {
+                    positions,
+                    normals,
+                    feature_ids,
+                    triangle_count: mesh.num_faces(),
+                }
+            }
+            Compression::None => {
+                let position_stride = parsed.document["bufferViews"][1]["byteStride"]
+                    .as_u64()
+                    .expect("position stride") as usize;
+                let positions = buffer_view_bytes(parsed, 1)
+                    .chunks_exact(position_stride)
+                    .map(
+                        |bytes| match parsed.document["accessors"][1]["componentType"].as_u64() {
+                            Some(value) if value == u64::from(FLOAT_COMPONENT_TYPE) => [
+                                f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                            ],
+                            Some(value) if value == u64::from(UNSIGNED_SHORT_COMPONENT_TYPE) => [
+                                f64::from(u16::from_le_bytes(bytes[0..2].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                                f64::from(u16::from_le_bytes(bytes[2..4].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                                f64::from(u16::from_le_bytes(bytes[4..6].try_into().unwrap()))
+                                    / f64::from(u16::MAX),
+                            ],
+                            other => {
+                                panic!("unexpected uncompressed position component type {other:?}")
+                            }
+                        },
+                    )
+                    .map(|position| transform_point(transform, position))
+                    .collect();
+                let normal_stride = parsed.document["bufferViews"][2]["byteStride"]
+                    .as_u64()
+                    .expect("normal stride") as usize;
+                let normals = buffer_view_bytes(parsed, 2)
+                    .chunks_exact(normal_stride)
+                    .map(
+                        |bytes| match parsed.document["accessors"][2]["componentType"].as_u64() {
+                            Some(value) if value == u64::from(FLOAT_COMPONENT_TYPE) => [
+                                f64::from(f32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+                                f64::from(f32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                            ],
+                            Some(value) if value == u64::from(BYTE_COMPONENT_TYPE) => [
+                                f64::from(bytes[0] as i8) / f64::from(i8::MAX),
+                                f64::from(bytes[1] as i8) / f64::from(i8::MAX),
+                                f64::from(bytes[2] as i8) / f64::from(i8::MAX),
+                            ],
+                            other => {
+                                panic!("unexpected uncompressed normal component type {other:?}")
+                            }
+                        },
+                    )
+                    .map(normalize_vector)
+                    .collect();
+                let feature_ids = buffer_view_bytes(parsed, 4)
+                    .chunks_exact(FEATURE_ID_BYTE_LEN)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                let index_count = parsed.document["accessors"][0]["count"]
+                    .as_u64()
+                    .expect("index count") as usize;
+                DecodedFeatureGeometry {
+                    positions,
+                    normals,
+                    feature_ids,
+                    triangle_count: index_count / 3,
+                }
+            }
+        };
+        sort_positions(&mut decoded.positions);
+        decoded.feature_ids.sort_by(f32::total_cmp);
+        decoded
+    }
+
+    fn sorted_fixture_positions(features: &[ContentFeature]) -> Vec<[f64; 3]> {
+        let mut positions = features
+            .iter()
+            .flat_map(|feature| {
+                feature
+                    .mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| gltf_position(vertex.position).map(f64::from))
+            })
+            .collect::<Vec<_>>();
+        sort_positions(&mut positions);
+        positions
+    }
+
+    fn combined_position_bounds(features: &[ContentFeature]) -> PositionBounds {
+        let vertices = features
+            .iter()
+            .flat_map(|feature| feature.mesh.vertices.iter().copied())
+            .collect::<Vec<_>>();
+        position_bounds(&vertices)
+    }
+
+    fn sort_positions(positions: &mut [[f64; 3]]) {
+        positions.sort_by(|left, right| {
+            left.iter()
+                .zip(right)
+                .find_map(|(left, right)| {
+                    let order = left.total_cmp(right);
+                    (order != std::cmp::Ordering::Equal).then_some(order)
+                })
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    fn transform_point(matrix: [f64; 16], point: [f64; 3]) -> [f64; 3] {
+        [
+            matrix[0] * point[0] + matrix[4] * point[1] + matrix[8] * point[2] + matrix[12],
+            matrix[1] * point[0] + matrix[5] * point[1] + matrix[9] * point[2] + matrix[13],
+            matrix[2] * point[0] + matrix[6] * point[1] + matrix[10] * point[2] + matrix[14],
+        ]
+    }
+
+    fn normalize_vector(vector: [f64; 3]) -> [f64; 3] {
+        let length = vector
+            .iter()
+            .map(|component| component * component)
+            .sum::<f64>()
+            .sqrt();
+        vector.map(|component| component / length)
     }
 
     fn read_f32_accessor(parsed: &ParsedGlb, accessor_index: usize, components: usize) -> Vec<f32> {
@@ -1917,6 +2589,34 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
+    }
+
+    fn read_draco_u16(
+        attribute: &PointAttribute,
+        point: PointIndex,
+        components: usize,
+    ) -> [u16; 3] {
+        assert_eq!(components, 3);
+        let mapped = attribute.mapped_index(point).0 as usize;
+        let start = mapped * attribute.byte_stride() as usize;
+        attribute.buffer().data()[start..start + components * 2]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("three u16 components")
+    }
+
+    fn read_draco_i8(attribute: &PointAttribute, point: PointIndex, components: usize) -> [i8; 3] {
+        assert_eq!(components, 3);
+        let mapped = attribute.mapped_index(point).0 as usize;
+        let start = mapped * attribute.byte_stride() as usize;
+        attribute.buffer().data()[start..start + components]
+            .iter()
+            .map(|value| *value as i8)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("three i8 components")
     }
 
     fn vertex_key(position: &[f32], normal: &[f32], color: &[f32], feature_id: f32) -> Vec<u32> {
