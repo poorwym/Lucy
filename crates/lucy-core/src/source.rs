@@ -14,6 +14,15 @@ pub const DEFAULT_SUBTREE_URI_TEMPLATE: &str = "subtrees/{level}/{x}/{y}.subtree
 pub const MAX_PICKABLE_FEATURES_PER_TILE: u32 = 1 << 24;
 pub const MAX_SUBTREE_LEVELS: u8 = 8;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    #[default]
+    Meshopt,
+    Draco,
+    None,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceCatalog {
     #[serde(default)]
@@ -88,6 +97,8 @@ pub struct SourceConfig {
     pub id_column: String,
     pub srid: i32,
     pub source_model: SourceModel,
+    #[serde(default)]
+    pub compression: Compression,
     /// Allow subtree availability to treat a feature envelope wholly covered
     /// by a tile's conservative inner polygon as proven renderable content.
     /// Operators must only enable this after auditing every surface geometry
@@ -590,6 +601,7 @@ mod tests {
         assert_eq!(source.table, "poc_buildings");
         assert_eq!(source.srid, 4326);
         assert_eq!(source.source_model, SourceModel::ExtrudedFootprint);
+        assert_eq!(source.compression, Compression::Meshopt);
         assert!(!source.surface_subtree_envelope_shortcut);
         assert_eq!(source.base_height_column.as_deref(), Some("base_height_m"));
         assert_eq!(source.height_column.as_deref(), Some("height_m"));
@@ -608,6 +620,50 @@ mod tests {
             source.tileset.subtree_uri_template,
             DEFAULT_SUBTREE_URI_TEMPLATE
         );
+    }
+
+    #[test]
+    fn parses_supported_compression_backends_and_defaults_to_meshopt() {
+        let raw = include_str!("../../../config/poc-sources.yaml");
+        let default_catalog =
+            SourceCatalog::from_yaml_str(raw).expect("omitted compression should load");
+        assert!(
+            default_catalog
+                .sources
+                .values()
+                .all(|source| source.compression == Compression::Meshopt)
+        );
+
+        for (configured, expected) in [
+            ("meshopt", Compression::Meshopt),
+            ("draco", Compression::Draco),
+            ("none", Compression::None),
+        ] {
+            let configured_raw = raw.replacen(
+                "    source_model: extruded_footprint\n",
+                &format!("    source_model: extruded_footprint\n    compression: {configured}\n"),
+                1,
+            );
+            let catalog = SourceCatalog::from_yaml_str(&configured_raw)
+                .expect("supported compression backend should load");
+            assert_eq!(catalog.sources["poc_buildings"].compression, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_compression_backend() {
+        let raw = include_str!("../../../config/poc-sources.yaml").replacen(
+            "    source_model: extruded_footprint\n",
+            "    source_model: extruded_footprint\n    compression: gzip\n",
+            1,
+        );
+        let error =
+            SourceCatalog::from_yaml_str(&raw).expect_err("unsupported compression should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("compression"));
+        assert!(message.contains("meshopt"));
+        assert!(message.contains("draco"));
     }
 
     #[test]

@@ -7,7 +7,9 @@ use axum::response::Response;
 use tracing::debug;
 
 use lucy_core::geometry::NormalizedGeometry;
-use lucy_core::glb::{ContentFeature, encode_feature_content_tile_glb};
+use lucy_core::glb::{
+    ContentFeature, GlbEncodingOptions, encode_feature_content_tile_glb_with_options,
+};
 use lucy_core::mesh::{
     MeshFrame, SurfaceTileClip, TriangleMesh, footprint_fragment_to_extruded_mesh,
     surface_geometry_z_to_tile_mesh,
@@ -177,7 +179,13 @@ async fn content_tile_response(
     );
 
     let started = Instant::now();
-    let glb = encode_feature_content_tile_glb(&content_features, node_transform)?;
+    let glb = encode_feature_content_tile_glb_with_options(
+        &content_features,
+        node_transform,
+        GlbEncodingOptions {
+            compression: source.compression,
+        },
+    )?;
     debug!(
         duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         glb_bytes = glb.len(),

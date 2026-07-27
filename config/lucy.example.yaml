@@ -12,6 +12,7 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
+    compression: meshopt
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:

@@ -106,6 +106,7 @@ sources:
     id_column: id
     srid: 4326
     source_model: extruded_footprint
+    compression: meshopt
     base_height_column: base_height_m
     height_column: height_m
     geometry_types:
@@ -145,6 +146,7 @@ Other secret-expansion forms are not supported in v0.1.
 | `geometry_column`, `id_column` | Geometry and stable unique feature ID columns. |
 | `srid` | Positive PostGIS SRID declared by the geometry column. |
 | `source_model` | `extruded_footprint` or `surface_geometry_z`. |
+| `compression` | Geometry compression backend: `meshopt` (default), `draco`, or `none`. |
 | `coordinate_operation` | Supported explicit 3D transform; only valid for native surfaces that are not already EPSG:4979. |
 | `base_height_column`, `height_column` | Extrusion inputs; `height_column` is required for footprints and both fields are invalid for native surfaces. |
 | `geometry_types` | Allowed `Polygon`/`MultiPolygon` or `PolygonZ`/`MultiPolygonZ` types for the selected model. |
@@ -161,6 +163,20 @@ Other secret-expansion forms are not supported in v0.1.
 
 See [Architecture](architecture.md#source-models) for the different geometry
 semantics of the two source models.
+
+### Geometry compression
+
+`compression` is selected independently for each source. If it is omitted,
+Lucy uses `meshopt`. `compression: meshopt` emits
+`EXT_meshopt_compression`; `compression: draco` emits
+`KHR_draco_mesh_compression`; and `compression: none` keeps the uncompressed
+GLB baseline. Both compressed modes make their glTF extension required, so the
+client must provide the matching meshoptimizer or Draco decoder. CesiumJS
+supports both extensions when its standard decoder assets are deployed.
+
+Compression is lossless at this layer: topology, positions, normals, colors,
+feature IDs, structural metadata, and node transforms retain their original
+semantics after decoding.
 
 ### Relation requirements
 
