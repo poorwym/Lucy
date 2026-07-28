@@ -148,11 +148,13 @@ async fn query_normalized_features_for_bbox(
 
     let mut features = Vec::with_capacity(rows.len());
     for row in rows {
-        features.push(normalized_feature_from_row(
+        if let Some(feature) = normalized_feature_from_row_skipping_geometry_errors(
             row,
             source.source_model,
             &plan.attributes,
-        )?);
+        )? {
+            features.push(feature);
+        }
     }
 
     Ok(features)
@@ -306,9 +308,15 @@ where
 
         let processing_started = Instant::now();
         row_count += 1;
-        let feature = normalized_feature_from_row(row, source.source_model, &plan.attributes)
-            .map_err(E::from)?;
-        consumer(feature)?;
+        let feature = normalized_feature_from_row_skipping_geometry_errors(
+            row,
+            source.source_model,
+            &plan.attributes,
+        )
+        .map_err(E::from)?;
+        if let Some(feature) = feature {
+            consumer(feature)?;
+        }
         processing_duration += processing_started.elapsed();
     }
     tracing::debug!(
@@ -361,6 +369,26 @@ fn normalized_feature_from_row(
         encoded_size_bytes: geometry_wkb.len() + source_boundary_wkb.as_ref().map_or(0, Vec::len),
         attributes: decoded_attributes,
     })
+}
+
+fn normalized_feature_from_row_skipping_geometry_errors(
+    row: Row,
+    source_model: SourceModel,
+    attributes: &[String],
+) -> Result<Option<NormalizedFeature>, TileQueryError> {
+    let feature_id = row.try_get::<_, String>(0)?;
+    match normalized_feature_from_row(row, source_model, attributes) {
+        Ok(feature) => Ok(Some(feature)),
+        Err(error @ TileQueryError::SourceContract(_)) => {
+            tracing::error!(
+                feature.id = %feature_id,
+                error = %error,
+                "skipping feature with invalid normalized geometry"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn decode_normalized_geometry(
@@ -968,22 +996,45 @@ async fn populate_surface_subtree_slot_counts(
 
             let feature_id = row.try_get::<_, String>(1)?;
             let geometry_wkb = row.try_get::<_, Vec<u8>>(2)?;
-            let geometry = decode_surface_geometry_z_wkb(&geometry_wkb).map_err(|error| {
-                TileQueryError::SourceContract(format!(
-                    "feature {feature_id} did not match the adapter's normalized geometry contract: {error}"
-                ))
-            })?;
-            let prepared = prepare_surface_geometry_z(&geometry, source_frame).map_err(|error| {
-                TileQueryError::SourceContract(format!(
-                    "feature {feature_id} could not be prepared for subtree availability: {error}"
-                ))
-            })?;
+            let geometry = match decode_surface_geometry_z_wkb(&geometry_wkb) {
+                Ok(geometry) => geometry,
+                Err(error) => {
+                    tracing::error!(
+                        feature.id = %feature_id,
+                        error = %error,
+                        "skipping feature with invalid surface geometry during subtree availability"
+                    );
+                    continue;
+                }
+            };
+            let prepared = match prepare_surface_geometry_z(&geometry, source_frame) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::error!(
+                        feature.id = %feature_id,
+                        error = %error,
+                        "skipping feature that could not be prepared for subtree availability"
+                    );
+                    continue;
+                }
+            };
             let clip = surface_tile_clip(source, slots[original_slot_index].tile())?;
-            if prepared.has_tile_content(clip).map_err(|error| {
-                TileQueryError::SourceContract(format!(
-                    "feature {feature_id} could not be clipped for subtree availability: {error}"
-                ))
-            })? {
+            let has_tile_content = match prepared.has_tile_content(clip) {
+                Ok(has_tile_content) => has_tile_content,
+                Err(error) => {
+                    let tile = slots[original_slot_index].tile();
+                    tracing::error!(
+                        feature.id = %feature_id,
+                        tile.level = tile.level,
+                        tile.x = tile.x,
+                        tile.y = tile.y,
+                        error = %error,
+                        "skipping feature that could not be clipped for subtree availability"
+                    );
+                    continue;
+                }
+            };
+            if has_tile_content {
                 feature_counts[original_slot_index] += 1;
             }
         }

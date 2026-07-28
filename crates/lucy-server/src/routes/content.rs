@@ -4,7 +4,7 @@ use std::time::Instant;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use tracing::debug;
+use tracing::{debug, error};
 
 use lucy_core::geometry::NormalizedGeometry;
 use lucy_core::glb::{
@@ -236,7 +236,7 @@ fn append_pending_content_feature(
     surface_clip: SurfaceTileClip,
 ) -> Result<(), RouteError> {
     let double_sided = matches!(&feature.geometry, NormalizedGeometry::GeodeticSurface(_));
-    let mesh = match &feature.geometry {
+    let mesh_result = match &feature.geometry {
         NormalizedGeometry::GeographicFootprint(fragment) => {
             let (base_height_m, height_m) = feature_heights(source, &feature)?;
             footprint_fragment_to_extruded_mesh(
@@ -250,13 +250,19 @@ fn append_pending_content_feature(
         NormalizedGeometry::GeodeticSurface(geometry) => {
             surface_geometry_z_to_tile_mesh(geometry, source_frame, tile_frame, surface_clip)
         }
-    }
-    .map_err(|error| {
-        RouteError::from(TileQueryError::SourceContract(format!(
-            "source {source_id} feature {} could not be converted to a mesh: {error}",
-            feature.id
-        )))
-    })?;
+    };
+    let mesh = match mesh_result {
+        Ok(mesh) => mesh,
+        Err(error) => {
+            error!(
+                source.id = %source_id,
+                feature.id = %feature.id,
+                error = %error,
+                "skipping feature that could not be converted to a mesh"
+            );
+            return Ok(());
+        }
+    };
     let Some(mesh) = mesh else {
         debug!(
             feature.id,
@@ -637,6 +643,85 @@ mod tests {
         )
         .expect_err("overflow must win even when invalid metadata arrives first");
         assert!(format!("{error:?}").contains("tile contains more than 1 features"));
+    }
+
+    #[test]
+    fn surface_content_skips_geometry_errors_and_keeps_the_rest_of_the_tile() {
+        let mut source = fixture_source();
+        source.source_model = SourceModel::SurfaceGeometryZ;
+        source.base_height_column = None;
+        source.height_column = None;
+        source.bounds.west = 5.0;
+        source.bounds.south = 50.0;
+        source.bounds.east = 5.01;
+        source.bounds.north = 50.01;
+        source.bounds.min_height_m = 0.0;
+        source.bounds.max_height_m = 100.0;
+        source.max_features_per_tile = 1;
+        let source_frame = MeshFrame::from_source_bounds(&source.bounds);
+        let tile_frame = MeshFrame::from_geodetic_origin(5.005, 50.005, 0.0);
+        let clip = SurfaceTileClip {
+            west_deg: 5.0,
+            south_deg: 50.0,
+            east_deg: 5.01,
+            north_deg: 50.01,
+            include_east: true,
+            include_north: true,
+        };
+        let non_planar = surface_feature(
+            "10216096",
+            SurfaceGeometryZ::Polygon(Polygon3D {
+                exterior: Ring3D {
+                    points: vec![
+                        Point3D {
+                            x: 5.002,
+                            y: 50.002,
+                            z: 10.0,
+                        },
+                        Point3D {
+                            x: 5.006,
+                            y: 50.002,
+                            z: 10.0,
+                        },
+                        Point3D {
+                            x: 5.006,
+                            y: 50.006,
+                            z: 10.0,
+                        },
+                        Point3D {
+                            x: 5.002,
+                            y: 50.006,
+                            z: 30.0,
+                        },
+                        Point3D {
+                            x: 5.002,
+                            y: 50.002,
+                            z: 10.0,
+                        },
+                    ],
+                },
+                interiors: Vec::new(),
+            }),
+            "#ff0000",
+        );
+        let valid = surface_feature(
+            "valid",
+            SurfaceGeometryZ::Polygon(surface_polygon(5.004, 50.004, 0.001)),
+            "#8aa1b1",
+        );
+
+        let features = build_content_features(
+            "surfaces",
+            &source,
+            vec![non_planar, valid],
+            source_frame,
+            tile_frame,
+            clip,
+        )
+        .expect("a geometry error in one feature must not fail the tile");
+
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].id, "valid");
     }
 
     #[test]
